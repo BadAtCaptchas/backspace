@@ -118,7 +118,7 @@ export function JoinSpaceModal() {
     }
   };
 
-  // Phase 2: Connect to remote instance with password, then join
+  // Phase 2: Confirm the local password, connect with a generated remote secret, then join
   const handleConnect = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
@@ -276,7 +276,7 @@ export function JoinSpaceModal() {
           <div className="mb-4 space-y-2">
             <div>
               <label className="block text-xs text-txt-tertiary mb-1">
-                Enter your password to connect
+                Confirm your password to connect
               </label>
               <input
                 type="password"
@@ -289,7 +289,7 @@ export function JoinSpaceModal() {
                 autoComplete="current-password"
               />
               <div className="text-xs text-txt-tertiary mt-1">
-                Your password is verified locally, then used to create or access your account on the remote instance.
+                Your password is only verified with this instance. A separate generated secret is used for the remote account.
               </div>
             </div>
           </div>
