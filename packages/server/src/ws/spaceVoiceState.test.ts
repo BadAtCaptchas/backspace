@@ -54,6 +54,15 @@ function seedSpace(spaceId: string): void {
   }).run();
 }
 
+function seedMember(spaceId: string, userId: string): void {
+  seedUser(userId);
+  testDb.insert(schema.spaceMembers).values({
+    spaceId,
+    userId,
+    joinedAt: Date.now(),
+  }).run();
+}
+
 function seedChannel(id: string, spaceId: string, type: 'text' | 'voice'): void {
   testDb.insert(schema.channels).values({
     id,
@@ -181,6 +190,7 @@ describe('connectionManager.buildSpaceVoiceState', () => {
     seedChannel(publicCh, spaceId, 'voice');
     seedChannel(privateCh, spaceId, 'voice');
     seedDenyViewOverride(privateCh, spaceId);
+    seedMember(spaceId, 'u-viewer');
 
     cm.createRoom(publicCh, 'space', { type: 'space', spaceId });
     cm.joinRoom(publicCh, 'u-in-public');
@@ -205,6 +215,7 @@ describe('connectionManager.addUserSpace voice-state push', () => {
     seedSpace(spaceId);
     seedEveryoneRole(spaceId);
     seedChannel(voiceCh, spaceId, 'voice');
+    seedMember(spaceId, 'u-joiner');
 
     cm.createRoom(voiceCh, 'space', { type: 'space', spaceId });
     cm.joinRoom(voiceCh, 'u-already-here');

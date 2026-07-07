@@ -36,7 +36,17 @@ export function computePermissions(userId: string, spaceId: string, channelId?: 
   const userRow = db.select().from(schema.users).where(eq(schema.users.id, userId)).get();
   if (userRow?.isAdmin === 1) return ALL_PERMISSIONS;
 
-  // 2. Base permissions from @everyone role (id === spaceId)
+  // 2. Non-members do not receive @everyone permissions. Owners and instance
+  // admins have already been granted full access above.
+  const member = db.select({ userId: schema.spaceMembers.userId }).from(schema.spaceMembers)
+    .where(and(
+      eq(schema.spaceMembers.spaceId, spaceId),
+      eq(schema.spaceMembers.userId, userId),
+    ))
+    .get();
+  if (!member) return 0n;
+
+  // 3. Base permissions from @everyone role (id === spaceId)
   const everyoneRole = db.select().from(schema.roles)
     .where(and(eq(schema.roles.id, spaceId), eq(schema.roles.spaceId, spaceId)))
     .get();
@@ -159,6 +169,11 @@ export function computeCategoryPermissions(userId: string, spaceId: string, cate
 
   const userRow = db.select().from(schema.users).where(eq(schema.users.id, userId)).get();
   if (userRow?.isAdmin === 1) return ALL_PERMISSIONS;
+
+  const member = db.select({ userId: schema.spaceMembers.userId }).from(schema.spaceMembers)
+    .where(and(eq(schema.spaceMembers.spaceId, spaceId), eq(schema.spaceMembers.userId, userId)))
+    .get();
+  if (!member) return 0n;
 
   const everyoneRole = db.select().from(schema.roles)
     .where(and(eq(schema.roles.id, spaceId), eq(schema.roles.spaceId, spaceId)))
