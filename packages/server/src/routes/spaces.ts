@@ -560,6 +560,10 @@ export async function spaceRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(404).send({ error: 'Space not found', statusCode: 404 });
     }
 
+    if (!isMember(id, request.userId) && !isSpaceOwner(id, request.userId)) {
+      return reply.code(403).send({ error: 'Space membership required', statusCode: 403 });
+    }
+
     if (!hasPermission(request.userId, id, PermissionBits.CREATE_INVITE)) {
       return reply.code(403).send({ error: 'Missing CREATE_INVITE permission', statusCode: 403 });
     }
