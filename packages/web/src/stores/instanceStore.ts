@@ -336,8 +336,22 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
 
       const tempClient = createApiClient(origin, () => null);
       const cachedTokens = loadCachedTokens(currentUser.id);
-      const existingRemoteSecret = cachedTokens[origin]?.remoteSecret;
-      const remoteSecret = existingRemoteSecret || generateRemoteSecret();
+      let remoteSecret = cachedTokens[origin]?.remoteSecret;
+
+      // Generated remote credentials belong to the home identity, not this
+      // browser. Recover them before attempting login on another device.
+      if (!targetIsHome && !remoteSecret) {
+        const recovered = await api.users.getFederationCredential(origin);
+        remoteSecret = recovered.remoteSecret ?? generateRemoteSecret();
+
+        // Persist before registration. If the remote accepts registration but
+        // the client crashes before caching the response, the next attempt can
+        // still recover the exact credential that was used.
+        if (!recovered.remoteSecret) {
+          const stored = await api.users.putFederationCredential({ origin, remoteSecret });
+          remoteSecret = stored.remoteSecret;
+        }
+      }
 
       let response: AuthResponse | null = null;
       let finalUsername: string;
@@ -362,7 +376,7 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
         try {
           response = await tempClient.auth.register({
             username: finalUsername,
-            password: remoteSecret,
+            password: remoteSecret!,
             displayName: displayName || currentUser.displayName || undefined,
             homeInstance: trueHomeHost,
             homeUserId: trueHomeUserId,
@@ -382,14 +396,14 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
           try {
             response = await tempClient.auth.login({
               username: finalUsername,
-              password: remoteSecret,
+              password: remoteSecret!,
             });
           } catch {
             // Namespaced login failed — try legacy plain username as fallback
             try {
               response = await tempClient.auth.login({
                 username: bareUsername,
-                password: remoteSecret,
+                password: remoteSecret!,
               });
             } catch {
               throw new DifferentPasswordError(bareUsername);
@@ -426,7 +440,7 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
             label: instance.label,
             username: instance.username,
             pendingPasswordSync: cache[origin]?.pendingPasswordSync,
-            remoteSecret,
+            remoteSecret: remoteSecret!,
           };
           localStorage.setItem(storageKey(currentUser.id), JSON.stringify(cache));
         }

@@ -572,6 +572,47 @@ export async function userRoutes(app: FastifyInstance): Promise<void> {
   });
 
   // GET /api/users/@me/federation-registry — retrieve persistent federation registry
+  app.get<{ Querystring: { origin?: string } }>('/api/users/@me/federation-credential', { preHandler: authenticate }, async (request, reply) => {
+    const origin = request.query.origin;
+    if (!origin) return reply.code(400).send({ error: 'origin is required', statusCode: 400 });
+
+    const entry = getDb().select({ remoteSecret: schema.userFederationCredentials.remoteSecret })
+      .from(schema.userFederationCredentials)
+      .where(and(
+        eq(schema.userFederationCredentials.userId, request.userId),
+        eq(schema.userFederationCredentials.origin, origin),
+      ))
+      .get();
+    return reply.code(200).send({ remoteSecret: entry?.remoteSecret ?? null });
+  });
+
+  app.put<{ Body: { origin?: string; remoteSecret?: string } }>('/api/users/@me/federation-credential', { preHandler: authenticate }, async (request, reply) => {
+    const { origin, remoteSecret } = request.body ?? {};
+    if (!origin || typeof origin !== 'string' || !remoteSecret || typeof remoteSecret !== 'string') {
+      return reply.code(400).send({ error: 'origin and remoteSecret are required', statusCode: 400 });
+    }
+    if (remoteSecret.length > 256) {
+      return reply.code(400).send({ error: 'remoteSecret is too long', statusCode: 400 });
+    }
+
+    getDb().insert(schema.userFederationCredentials).values({
+      userId: request.userId,
+      origin,
+      remoteSecret,
+    }).onConflictDoNothing().run();
+
+    // First writer wins: concurrent fresh devices must both use the same
+    // canonical credential, rather than racing registration with two secrets.
+    const stored = getDb().select({ remoteSecret: schema.userFederationCredentials.remoteSecret })
+      .from(schema.userFederationCredentials)
+      .where(and(
+        eq(schema.userFederationCredentials.userId, request.userId),
+        eq(schema.userFederationCredentials.origin, origin),
+      ))
+      .get();
+    return reply.code(200).send({ ok: true, remoteSecret: stored!.remoteSecret });
+  });
+
   app.get('/api/users/@me/federation-registry', { preHandler: authenticate }, async (request, reply) => {
     const userId = request.userId;
     const db = getDb();
@@ -774,6 +815,13 @@ export async function userRoutes(app: FastifyInstance): Promise<void> {
             .where(and(
               eq(schema.userFederationRegistry.userId, request.userId),
               eq(schema.userFederationRegistry.origin, origin),
+            ))
+            .run();
+
+          db.delete(schema.userFederationCredentials)
+            .where(and(
+              eq(schema.userFederationCredentials.userId, request.userId),
+              eq(schema.userFederationCredentials.origin, origin),
             ))
             .run();
 

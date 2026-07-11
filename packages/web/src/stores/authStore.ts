@@ -7,7 +7,7 @@ import { useSocialStore } from './socialStore';
 import { useVoiceStore } from './voiceStore';
 import { useInstanceStore } from './instanceStore';
 import { useActivityStore } from './activityStore';
-import { changePasswordOnRemotes, deleteAccountOnRemotes, type FederationOpResult } from '../utils/federationOps';
+import { deleteAccountOnRemotes, type FederationOpResult } from '../utils/federationOps';
 import { clearSelfIds } from '../utils/identity';
 
 interface AuthState {
@@ -113,9 +113,10 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     localStorage.setItem('backspace_token', response.token);
     set({ token: response.token });
 
-    // Propagate to remote instances (best-effort)
-    const remoteResults = await changePasswordOnRemotes(newPassword);
-    return remoteResults;
+    // Federated accounts use independent generated credentials. Changing the
+    // home password must neither disclose it to remotes nor invalidate their
+    // cached credentials.
+    return [];
   },
 
   deleteAccount: async (password: string, username: string) => {
