@@ -20,14 +20,14 @@ describe('verifyAttribution', () => {
     expect(verifyAttribution('evil.net', 'https://orbit.ddns.net')).toBe(false);
   });
 
-  it('accepts homeward relay — author home matches receiving instance', () => {
-    // Author from nova (home), source is orbit → relay going HOME → accept
-    // getOurOrigin() returns 'https://nova.ddns.net' (mocked above)
-    expect(verifyAttribution('nova.ddns.net', 'https://orbit.ddns.net')).toBe(true);
+  it('rejects when author home matches only the receiving instance', () => {
+    // getOurOrigin() returns 'https://nova.ddns.net' (mocked above), but the
+    // peer signed as orbit. The peer must not be allowed to act as a local user.
+    expect(verifyAttribution('nova.ddns.net', 'https://orbit.ddns.net')).toBe(false);
   });
 
-  it('accepts homeward relay with full URL homeInstance', () => {
-    expect(verifyAttribution('https://nova.ddns.net', 'https://orbit.ddns.net')).toBe(true);
+  it('rejects receiving-instance attribution with full URL homeInstance', () => {
+    expect(verifyAttribution('https://nova.ddns.net', 'https://orbit.ddns.net')).toBe(false);
   });
 });
 
