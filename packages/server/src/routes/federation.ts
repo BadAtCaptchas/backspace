@@ -2492,6 +2492,10 @@ export async function federationRoutes(app: FastifyInstance): Promise<void> {
         return reply.code(400).send({ error: 'sourceInstance is required', statusCode: 400 });
       }
 
+      if (normalizeOriginForCompare(sourceInstance) !== normalizeOriginForCompare(peer.origin)) {
+        return reply.code(403).send({ error: 'sourceInstance does not match authenticated peer', statusCode: 403 });
+      }
+
       // 3. Process each event
       const { accepted, rejected, undeliverable } = await processRelayEvents(body.events, sourceInstance, peer.origin, db);
 
@@ -3832,22 +3836,14 @@ export function getOurIdentityDomain(): string | null {
 
 /**
  * Verify that an acting user's homeInstance is legitimate for this relay.
- *
- * Two valid cases:
- * 1. **Direct**: author is from the source instance (standard S2S — peer sends events for its own users).
- * 2. **Homeward relay**: author is from the *receiving* instance. This happens when a client-federation
- *    user (e.g., erin@nova logged into orbit) sends a message on a remote server, and the
- *    S2S relay forwards it back to the author's home instance. The trusted peer is just the messenger.
+ * The authenticated source instance may only attest to users whose home
+ * instance matches that same source. This prevents a valid peer from signing
+ * relay events that spoof another peer's users or local users.
  *
  * Both sides are normalized to bare domain before comparison.
  */
 export function verifyAttribution(actingUserHomeInstance: string, sourceInstance: string): boolean {
-  const authorDomain = extractDomain(actingUserHomeInstance);
-  // Case 1: author belongs to the source peer
-  if (authorDomain === extractDomain(sourceInstance)) return true;
-  // Case 2: homeward relay — author belongs to THIS (receiving) instance
-  if (authorDomain === extractDomain(getOurOrigin())) return true;
-  return false;
+  return extractDomain(actingUserHomeInstance) === extractDomain(sourceInstance);
 }
 
 /**

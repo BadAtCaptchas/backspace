@@ -464,6 +464,25 @@ describe('POST /api/federation/relay — fast-path epoch baseline (populate-if-n
     expect(readPeerInstanceId()).toBe('remote-epoch-A');
   });
 
+  it('rejects signed relays whose sourceInstance differs from the authenticated peer', async () => {
+    const relay = {
+      version: 1,
+      sourceInstance: 'https://victim.example',
+      events: [],
+    };
+    const body = JSON.stringify(relay);
+    const headers = buildFederationHeaders(body, PEER_SECRET, PEER_ORIGIN);
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/federation/relay',
+      headers,
+      payload: body,
+    });
+
+    expect(response.statusCode).toBe(403);
+    expect(response.json()).toMatchObject({ error: 'sourceInstance does not match authenticated peer' });
+  });
+
   it('never overwrites a non-null baseline (a valid relay cannot carry a differing epoch)', async () => {
     const first = await injectSignedRelay('remote-epoch-A');
     expect(first).toBe(200);
