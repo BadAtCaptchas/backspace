@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import Fastify, { type FastifyInstance } from 'fastify';
 import Database from 'better-sqlite3';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
+import { eq } from 'drizzle-orm';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -108,6 +109,18 @@ describe('POST /api/spaces/:id/invite', () => {
 
   it('allows a member with CREATE_INVITE to get an invite code', async () => {
     authedUserId = 'owner-1';
+
+    const res = await app.inject({ method: 'POST', url: '/api/spaces/space-1/invite' });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().inviteCode).toMatch(/^[0-9a-f]{8}$/);
+  });
+
+  it('allows an instance admin who is not a space member to get an invite code', async () => {
+    testDb.update(schema.users)
+      .set({ isAdmin: 1 })
+      .where(eq(schema.users.id, 'attacker-1'))
+      .run();
 
     const res = await app.inject({ method: 'POST', url: '/api/spaces/space-1/invite' });
 
