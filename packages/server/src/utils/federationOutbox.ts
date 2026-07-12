@@ -400,9 +400,11 @@ export function getDmParticipants(dmChannelId: string): FederationRelayParticipa
 }
 
 /**
- * Compute which peer origins need to receive events for a group DM.
- * Returns undefined for 1-on-1 DMs (broadcast to all).
- * Returns a list of origins for group DMs (participant-aware routing).
+ * Compute which peer origins need to receive DM relay events.
+ * Returns participant-derived remote origins so queueOutboxEvent can create
+ * pending placeholders for peers that do not exist yet. Returns an explicit
+ * empty list when there are no remote participants so local-only DMs are not
+ * broadcast to unrelated federation peers.
  */
 export function getGroupDmTargetOrigins(dmChannelId: string): string[] | undefined {
   const db = getDb();
@@ -426,8 +428,9 @@ export function getGroupDmTargetOrigins(dmChannelId: string): string[] | undefin
     }
   }
 
-  // No remote participants — no relay needed
-  if (origins.size === 0) return undefined;
+  // No remote participants — explicitly target no peers.
+  // `undefined` means broadcast to every federation peer in queueOutboxEvent().
+  if (origins.size === 0) return [];
 
   return Array.from(origins);
 }
