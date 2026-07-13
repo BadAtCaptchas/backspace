@@ -27,13 +27,14 @@ on:
 permissions:
   contents: read
   packages: write
+  security-events: write
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 
       # The runtime image bakes the git commit for the AGPL-3.0 § 13 source
       # offer (config.commit → GET /api/instance/info). The .git dir is not in
@@ -44,13 +45,13 @@ jobs:
         run: echo "commit=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -58,7 +59,7 @@ jobs:
 
       - name: Derive image tags and labels
         id: docker_meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
           # github.repository is "TheZwiss/backspace"; metadata-action lowercases
           # it → ghcr.io/thezwiss/backspace (GHCR requires lowercase).
@@ -76,8 +77,47 @@ jobs:
             org.opencontainers.image.licenses=AGPL-3.0-only
             org.opencontainers.image.revision=${{ github.sha }}
 
+      # Build a single-arch amd64 image and LOAD it into the runner's docker
+      # daemon so Trivy can scan the exact artifact before anything is published.
+      # A multi-arch manifest cannot be --load'ed, so scanning must happen on a
+      # single-arch build first; the multi-arch push below reuses these layers
+      # from the buildx cache, so this is cheap.
+      - name: Build amd64 image for scanning
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: backspace:scan
+          build-args: |
+            BACKSPACE_COMMIT=${{ steps.meta_commit.outputs.commit }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Trivy image scan (report-only)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        continue-on-error: true # report-only; enforcement flipped on in Plan E
+        with:
+          scan-type: image
+          image-ref: backspace:scan
+          ignore-unfixed: true
+          format: sarif
+          output: trivy-image.sarif
+          severity: HIGH,CRITICAL
+
+      - name: Upload Trivy image SARIF
+        if: always()
+        continue-on-error: true # a scanner/SARIF-emit flake must never skip the publish below
+        uses: github/codeql-action/upload-sarif@02c5e83432fe5497fd85b873b6c9f16a8578e1d9 # v3.37.0
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+      # Publish the multi-arch image. Reuses the amd64 layers built above via the
+      # gha cache. Attaches an SBOM and SLSA provenance attestation to the image.
       - name: Build and push (linux/amd64, linux/arm64)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -86,6 +126,8 @@ jobs:
           labels: ${{ steps.docker_meta.outputs.labels }}
           build-args: |
             BACKSPACE_COMMIT=${{ steps.meta_commit.outputs.commit }}
+          sbom: true
+          provenance: true
           # Cache multi-arch layers across runs via the GitHub Actions cache to
           # keep the ~1.6 GB build from re-running cold every release.
           cache-from: type=gha
