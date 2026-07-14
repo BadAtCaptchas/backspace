@@ -429,6 +429,38 @@ describe('POST /api/auth/register — federation gate split', () => {
     expect(redemptions).toHaveLength(0);
   });
 
+  it('federated registration: does not upgrade an existing replicated stub from caller-controlled identity fields', async () => {
+    testDb.insert(schema.users).values({
+      id: 'stub-local-1',
+      username: 'victim@real.example',
+      passwordHash: '!federation-replicated',
+      isAdmin: 0,
+      homeInstance: 'real.example',
+      homeUserId: 'victim-home-123',
+      createdAt: Date.now(),
+    }).run();
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/auth/register',
+      payload: {
+        username: 'attacker@evil.example',
+        password: 'password123',
+        homeInstance: 'evil.example',
+        homeUserId: 'victim-home-123',
+      },
+    });
+    expect(res.statusCode).toBe(201);
+    expect(res.json().user.id).not.toBe('stub-local-1');
+
+    const stub = testDb.select().from(schema.users)
+      .where(eq(schema.users.id, 'stub-local-1')).get();
+    expect(stub?.username).toBe('victim@real.example');
+    expect(stub?.passwordHash).toBe('!federation-replicated');
+    expect(stub?.homeInstance).toBe('real.example');
+    expect(stub?.homeUserId).toBe('victim-home-123');
+  });
+
   it('closed registration: token last-slot race → 403 (in-txn re-derive)', async () => {
     testDb.update(schema.instanceSettings)
       .set({ registrationOpen: 0 })
