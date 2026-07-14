@@ -256,4 +256,48 @@ describe('sendFederatedCallStart — undeliverable reclassification (#18)', () =
     );
     expect(undelivCalls).toHaveLength(0);
   });
+
+  it('does not relay local-only DMs to unrelated active federation peers', async () => {
+    seedLocalUser('alice', {});
+    seedLocalUser('bob', {});
+    seedDmChannel('dm-local', 'fed-local', null);
+    seedDmMember('dm-local', 'alice');
+    seedDmMember('dm-local', 'bob');
+    seedActivePeer('https://orbit.example', 'Orbit');
+
+    const { sendFederatedCallStartForTest } = await importSUT();
+    await sendFederatedCallStartForTest('dm-local', 'alice', 'Alice');
+
+    expect(sendCallRelayMock).not.toHaveBeenCalled();
+  });
+
+  it('relays only to member home peers and includes only that peer\'s member tokens', async () => {
+    seedLocalUser('alice', {});
+    seedLocalUser('bob-stub', { homeUserId: 'bob-home', homeInstance: 'https://orbit.example' });
+    seedLocalUser('carol-stub', { homeUserId: 'carol-home', homeInstance: 'https://nova.example' });
+    seedDmChannel('dm-targeted', 'fed-targeted', 'alice');
+    seedDmMember('dm-targeted', 'alice');
+    seedDmMember('dm-targeted', 'bob-stub');
+    seedDmMember('dm-targeted', 'carol-stub');
+    seedActivePeer('https://orbit.example', 'Orbit');
+    seedActivePeer('https://nova.example', 'Nova');
+    seedActivePeer('https://unrelated.example', 'Unrelated');
+
+    sendCallRelayMock.mockResolvedValue({ ok: true, undeliverable: [] });
+
+    const { sendFederatedCallStartForTest } = await importSUT();
+    await sendFederatedCallStartForTest('dm-targeted', 'alice', 'Alice');
+
+    expect(sendCallRelayMock).toHaveBeenCalledTimes(2);
+
+    const relayByOrigin = new Map(sendCallRelayMock.mock.calls.map(([origin, events]) => [
+      origin,
+      events[0] as { call: { tokens: Record<string, string> } },
+    ]));
+
+    expect(relayByOrigin.has('https://unrelated.example')).toBe(false);
+    expect(Object.keys(relayByOrigin.get('https://orbit.example')!.call.tokens)).toEqual(['bob-home']);
+    expect(Object.keys(relayByOrigin.get('https://nova.example')!.call.tokens)).toEqual(['carol-home']);
+  });
+
 });

@@ -1872,57 +1872,59 @@ async function sendFederatedCallStart(
     return;
   }
 
+  if (remoteMembers.length === 0) return;
+
   // Use the configured LiveKit URL (wss://domain/livekit from .env).
   // Previously this was `https://${config.domain}/livekit` which fails because
   // the LiveKit SDK requires a wss:// WebSocket URL, not https://.
   const livekitUrl = config.livekit.url ?? `wss://${config.domain}/livekit`;
 
-  // Build participants array (all member identities for Path B)
-  const participants = members.map(m => ({
+  const buildParticipant = (m: typeof members[number]) => ({
     homeUserId: m.homeUserId || m.userId,
     homeInstance: m.homeInstance || ourOrigin,
     displayName: m.displayName || m.username,
-  }));
-
-  // Generate tokens for ALL members upfront
-  const allTokens: Record<string, string> = {};
-  for (const m of members) {
-    const homeUserId = m.homeUserId || m.userId;
-    const name = m.displayName || m.username;
-    allTokens[homeUserId] = await generateFederatedCallToken(federatedId, homeUserId, name);
-  }
-
-  const callerHomeUserId = members.find(m => m.userId === callerId)?.homeUserId || callerId;
-
-  // Build the relay event template (reused for all peers)
-  const buildRelayEvent = () => ({
-    eventType: 'dm_call_start' as const,
-    messageId: generateSnowflake(),
-    encryptionVersion: 0 as const,
-    timestamp: Date.now(),
-    federatedId,
-    call: {
-      livekitUrl,
-      tokens: allTokens,
-      caller: {
-        homeUserId: callerHomeUserId,
-        homeInstance: ourOrigin,
-        displayName: callerName,
-      },
-      participants,
-    },
   });
 
+  const participants = members.map(buildParticipant);
+  const callerHomeUserId = members.find(m => m.userId === callerId)?.homeUserId || callerId;
+
+  const buildRelayEvent = async (recipientMembers: typeof members) => {
+    const tokens: Record<string, string> = {};
+    for (const m of recipientMembers) {
+      const homeUserId = m.homeUserId || m.userId;
+      const name = m.displayName || m.username;
+      tokens[homeUserId] = await generateFederatedCallToken(federatedId, homeUserId, name);
+    }
+
+    return {
+      eventType: 'dm_call_start' as const,
+      messageId: generateSnowflake(),
+      encryptionVersion: 0 as const,
+      timestamp: Date.now(),
+      federatedId,
+      call: {
+        livekitUrl,
+        tokens,
+        caller: {
+          homeUserId: callerHomeUserId,
+          homeInstance: ourOrigin,
+          displayName: callerName,
+        },
+        participants,
+      },
+    };
+  };
+
   // Group remote members by home instance (targeted peers)
-  const targetedPeers = new Map<string, string[]>();
+  const targetedPeers = new Map<string, typeof members>();
   for (const m of remoteMembers) {
     const origin = m.homeInstance!.startsWith('http') ? m.homeInstance! : `https://${m.homeInstance!}`;
     const bucket = targetedPeers.get(origin) ?? [];
-    bucket.push(m.userId);
+    bucket.push(m);
     targetedPeers.set(origin, bucket);
   }
 
-  // Single query for all peers — derives both active-peer list and label map
+  // Query peers once so undeliverable events can include friendly labels.
   const peerRows = db.select({
     origin: schema.federationPeers.origin,
     instanceName: schema.federationPeers.instanceName,
@@ -1930,8 +1932,6 @@ async function sendFederatedCallStart(
   })
     .from(schema.federationPeers)
     .all();
-
-  const allPeers = peerRows.filter(r => r.status === 'active');
 
   const peerLabelByOrigin = new Map<string, string>();
   for (const row of peerRows) {
@@ -1945,7 +1945,7 @@ async function sendFederatedCallStart(
   //   ok=false                                → existing failure reasons
   const targetedResults = await Promise.all(
     Array.from(targetedPeers.keys()).map(async peerOrigin => {
-      const relayEvent = buildRelayEvent();
+      const relayEvent = await buildRelayEvent(targetedPeers.get(peerOrigin) ?? []);
       const result = await sendCallRelay(peerOrigin, [relayEvent]);
       if (result.ok) {
         if (result.undeliverable.includes(relayEvent.messageId)) {
@@ -1965,16 +1965,9 @@ async function sendFederatedCallStart(
     }),
   );
 
-  // ─── All-peers broadcast: fire-and-forget; failures NOT surfaced ───────────
-  for (const peer of allPeers) {
-    if (targetedPeers.has(peer.origin)) continue;
-    if (peer.origin === ourOrigin) continue;
-    sendCallRelay(peer.origin, [buildRelayEvent()]).then(result => {
-      if (!result.ok) {
-        console.debug(`[federation] All-peers dm_call_start to ${peer.origin}: ${result.reason} ${result.error}`);
-      }
-    }).catch(err => console.warn('[federation] all-peers broadcast threw:', err));
-  }
+  // Do not broadcast call-start relays to unrelated active peers. Relay bodies
+  // contain private DM metadata and LiveKit join tokens, so each event is sent
+  // only to peers that host actual remote DM members.
 
   // ─── Aggregate failures → dm_call_undeliverable ───────────────────────────
   const failedTargeted = targetedResults.filter(
@@ -1986,7 +1979,7 @@ async function sendFederatedCallStart(
   const plausibleRecipientRemains = anyTargetedSuccess || hasConnectedLocalRingee;
 
   const failures: DmCallUndeliverableFailure[] = failedTargeted.map(r => {
-    const affectedUserIds = targetedPeers.get(r.origin) ?? [];
+    const affectedUserIds = (targetedPeers.get(r.origin) ?? []).map(m => m.userId);
     return {
       reason: r.reason,
       peerOrigin: r.origin,
