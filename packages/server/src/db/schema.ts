@@ -525,6 +525,16 @@ export const userFederationRegistry = sqliteTable('user_federation_registry', {
   pk: primaryKey({ columns: [table.userId, table.origin] }),
 }));
 
+// Home-instance-only recovery material for per-remote generated credentials.
+// Unlike the federation registry, these rows are never replicated to remotes.
+export const userFederationCredentials = sqliteTable('user_federation_credentials', {
+  userId: text('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  origin: text('origin').notNull(),
+  remoteSecret: text('remote_secret').notNull(),
+}, (table) => ({
+  pk: primaryKey({ columns: [table.userId, table.origin] }),
+}));
+
 export const inviteLinks = sqliteTable('invite_links', {
   id: text('id').primaryKey(),
   token: text('token').notNull().unique(),

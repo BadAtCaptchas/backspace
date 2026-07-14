@@ -115,6 +115,8 @@ export class BackspaceApiClient {
     getMutuals: (id: string, homeUserId?: string) => Promise<{ mutualFriends: User[]; mutualSpaces: { id: string; name: string; icon: string | null; avatarColor: string | null }[] }>;
     getFederationRegistry: () => Promise<{ registry: FederationRegistryEntry[]; updatedAt: number }>;
     putFederationRegistry: (data: { registry: FederationRegistryEntry[]; updatedAt: number }) => Promise<{ ok: boolean; updatedAt: number }>;
+    getFederationCredential: (origin: string) => Promise<{ remoteSecret: string | null }>;
+    putFederationCredential: (data: { origin: string; remoteSecret: string }) => Promise<{ ok: boolean; remoteSecret: string }>;
     deleteFederationIdentity: (data: FederationIdentityDeleteRequest) => Promise<FederationIdentityDeleteResponse>;
     reattach: (data: ReattachRequest) => Promise<ReattachResponse>;
   };
@@ -422,6 +424,12 @@ export class BackspaceApiClient {
         request<{ ok: boolean; updatedAt: number }>(
           'PUT', '/users/@me/federation-registry', data
         ),
+      getFederationCredential: (origin: string) =>
+        request<{ remoteSecret: string | null }>(
+          'GET', `/users/@me/federation-credential?origin=${encodeURIComponent(origin)}`
+        ),
+      putFederationCredential: (data: { origin: string; remoteSecret: string }) =>
+        request<{ ok: boolean; remoteSecret: string }>('PUT', '/users/@me/federation-credential', data),
       deleteFederationIdentity: (data: FederationIdentityDeleteRequest) =>
         request<FederationIdentityDeleteResponse>(
           'POST', '/users/@me/federation-identity/delete', data

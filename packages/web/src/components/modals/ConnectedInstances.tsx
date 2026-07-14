@@ -213,7 +213,7 @@ function AddInstanceFlow({ onDone }: { onDone: () => void }) {
             <input type="text" autoComplete="username" value={user?.username || ''} readOnly tabIndex={-1} className="sr-only" />
             <div>
               <label className="block text-xs text-txt-tertiary mb-1">
-                Enter your password to connect to {new URL(probeResult.origin).host}
+                Confirm your password to connect to {new URL(probeResult.origin).host}
               </label>
               <input
                 type="password"
@@ -226,7 +226,7 @@ function AddInstanceFlow({ onDone }: { onDone: () => void }) {
                 autoComplete="current-password"
               />
               <div className="text-xs text-txt-tertiary mt-1">
-                Your password is verified locally, then used to create or access your account on the remote instance.
+                Your password is only verified with this instance. A separate generated secret is used for the remote account.
               </div>
             </div>
             <button
