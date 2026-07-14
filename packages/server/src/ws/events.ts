@@ -864,6 +864,20 @@ function handleDmMessageCreate(event: Record<string, unknown>, userId: string): 
 
   const db = getDb();
 
+  if (replyToId) {
+    const replyTarget = db.select({ id: schema.dmMessages.id })
+      .from(schema.dmMessages)
+      .where(and(
+        eq(schema.dmMessages.id, replyToId),
+        eq(schema.dmMessages.dmChannelId, dmChannelId),
+      ))
+      .get();
+    if (!replyTarget) {
+      connectionManager.sendToUser(userId, { type: 'error', message: 'Invalid reply target' });
+      return;
+    }
+  }
+
   // Verify attachment ownership before linking
   if (hasAttachments) {
     for (const attId of attachmentIds) {

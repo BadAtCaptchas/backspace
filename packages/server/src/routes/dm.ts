@@ -160,7 +160,13 @@ export function getDmMessageWithUser(dmMessageId: string): DmMessageWithUser | n
 
   let replyTo: DmMessageWithUser | null = null;
   if (message.replyToId) {
-    const replyMsg = db.select().from(schema.dmMessages).where(eq(schema.dmMessages.id, message.replyToId)).get();
+    const replyMsg = db.select()
+      .from(schema.dmMessages)
+      .where(and(
+        eq(schema.dmMessages.id, message.replyToId),
+        eq(schema.dmMessages.dmChannelId, message.dmChannelId),
+      ))
+      .get();
     if (replyMsg) {
       const replyUser = db.select().from(schema.users).where(eq(schema.users.id, replyMsg.userId)).get();
       if (replyUser) {
@@ -2282,7 +2288,10 @@ export async function dmRoutes(app: FastifyInstance): Promise<void> {
     if (uniqueReplyIds.length > 0) {
       const replyMessages = db.select()
         .from(schema.dmMessages)
-        .where(inArray(schema.dmMessages.id, uniqueReplyIds))
+        .where(and(
+          inArray(schema.dmMessages.id, uniqueReplyIds),
+          eq(schema.dmMessages.dmChannelId, id),
+        ))
         .all();
       const replyUserIds = [...new Set(replyMessages.map(m => m.userId))];
       const replyUsers = replyUserIds.length > 0
@@ -2485,6 +2494,20 @@ export async function dmRoutes(app: FastifyInstance): Promise<void> {
     }
 
     const db = getDb();
+
+    if (replyToId) {
+      const replyTarget = db.select({ id: schema.dmMessages.id })
+        .from(schema.dmMessages)
+        .where(and(
+          eq(schema.dmMessages.id, replyToId),
+          eq(schema.dmMessages.dmChannelId, id),
+        ))
+        .get();
+      if (!replyTarget) {
+        return reply.code(400).send({ error: 'Invalid reply target', statusCode: 400 });
+      }
+    }
+
     const messageId = generateSnowflake();
     const now = Date.now();
 
