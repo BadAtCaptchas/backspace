@@ -90,3 +90,73 @@ describe('queueOutboxEvent — non-deliverable statuses', () => {
     expect(debugSpy.mock.calls[0]![0] as string).toContain(status);
   });
 });
+
+describe('DM target origin routing', () => {
+  beforeEach(() => {
+    const sqlite = new Database(':memory:');
+    testDb = drizzle(sqlite, { schema });
+    applyMigrations(sqlite);
+    seedSettings();
+    vi.restoreAllMocks();
+  });
+
+  function seedLocalOnlyDm(): void {
+    const now = Date.now();
+    testDb.insert(schema.users).values([
+      {
+        id: 'local-a',
+        username: 'alice',
+        passwordHash: 'x',
+        homeUserId: 'local-a',
+        homeInstance: 'https://local.example',
+        createdAt: now,
+      },
+      {
+        id: 'local-b',
+        username: 'bob',
+        passwordHash: 'x',
+        homeUserId: 'local-b',
+        homeInstance: 'https://local.example',
+        createdAt: now,
+      },
+    ]).run();
+
+    testDb.insert(schema.dmChannels).values({
+      id: 'dm-local-only',
+      ownerId: 'local-a',
+      createdAt: now,
+      name: 'Local group',
+    }).run();
+
+    testDb.insert(schema.dmMembers).values([
+      { dmChannelId: 'dm-local-only', userId: 'local-a' },
+      { dmChannelId: 'dm-local-only', userId: 'local-b' },
+    ]).run();
+  }
+
+  it('returns an explicit empty target list for local-only DMs', async () => {
+    const { getGroupDmTargetOrigins } = await import('./federationOutbox.js');
+    seedLocalOnlyDm();
+
+    expect(getGroupDmTargetOrigins('dm-local-only')).toEqual([]);
+  });
+
+  it('does not broadcast local-only DM relay payloads to unrelated federation peers', async () => {
+    const { getGroupDmTargetOrigins, queueOutboxEvent } = await import('./federationOutbox.js');
+    seedPeer('peer-unrelated', 'https://unrelated.example', 'active');
+    seedLocalOnlyDm();
+
+    const targets = getGroupDmTargetOrigins('dm-local-only');
+    queueOutboxEvent(
+      'message-local-secret',
+      'dm-local-only',
+      'create',
+      JSON.stringify({ message: { content: 'LOCAL ONLY SECRET' } }),
+      targets,
+      'dm',
+    );
+
+    expect(targets).toEqual([]);
+    expect(countOutbox('peer-unrelated')).toBe(0);
+  });
+});
