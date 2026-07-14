@@ -25,6 +25,23 @@ vi.mock('../utils/federationAuth.js', () => ({
   generateHmacSecret: () => 'test-secret',
 }));
 
+// federationOutbox.ts imports extractDomain from routes/federation.js, which in
+// turn imports connectionManager/ws. Stub that route dependency so this unit
+// test does not start the server module graph.
+vi.mock('../ws/handler.js', () => ({
+  connectionManager: {
+    sendToUser: vi.fn(),
+    sendToSpace: vi.fn(),
+    sendToDmMembers: vi.fn(),
+    sendToAdmins: vi.fn(),
+    getAllOnlineUserIds: () => [],
+    evictFederatedCallsForHost: vi.fn(),
+    federatedCalls: new Map(),
+    isUserOnline: vi.fn(),
+    lateBindFederatedCall: vi.fn(),
+  },
+}));
+
 function applyMigrations(db: Database.Database): void {
   const migrationsDir = path.resolve(__dirname, '../../drizzle');
   const files = fs.readdirSync(migrationsDir).filter(f => f.endsWith('.sql')).sort();
@@ -71,6 +88,21 @@ describe('queueOutboxEvent — non-deliverable statuses', () => {
     applyMigrations(sqlite);
     seedSettings();
     vi.restoreAllMocks();
+  });
+
+  it('does not create a pending peer placeholder for unknown targeted origins', () => {
+    const debugSpy = vi.spyOn(console, 'debug').mockImplementation(() => {});
+
+    queueOutboxEvent('entity-unknown', 'ctx-unknown', 'profile_update', '{}', ['https://attacker.example'], 'profile');
+
+    const peers = testDb.select().from(schema.federationPeers).all();
+    const outboxRows = testDb.select().from(schema.federationOutbox).all();
+
+    expect(peers).toHaveLength(0);
+    expect(outboxRows).toHaveLength(0);
+    expect(debugSpy).toHaveBeenCalledWith(
+      '[federation] queueOutboxEvent: skipping unknown peer https://attacker.example',
+    );
   });
 
   it.each([

@@ -4,7 +4,7 @@ import { eq, and, inArray } from 'drizzle-orm';
 import { generateSnowflake } from './snowflake.js';
 import crypto from 'node:crypto';
 import type { FederationRelayEvent, FederationRelayParticipant, FederationRelayAttachment, DmMessageWithUser, FederationRelayRequest, DmCallUndeliverableReason } from '@backspace/shared';
-import { getOurOrigin, buildFederationHeaders, generateHmacSecret } from './federationAuth.js';
+import { getOurOrigin, buildFederationHeaders } from './federationAuth.js';
 import { extractDomain } from '../routes/federation.js';
 import { racePeering, ensurePeered } from './federationPeering.js';
 
@@ -169,11 +169,9 @@ export function queueOutboxEvent(
       ? peers.filter(p => targetPeerOrigins.includes(p.origin))
       : peers;
 
-    // For targeted origins with no existing peer record, create pending placeholders.
-    // autoAcceptPeering controls INCOMING acceptance, not outgoing initiation —
-    // when a local user sends a DM requiring relay, the server creates the placeholder
-    // regardless of the setting. The peer/accept gate on the REMOTE side decides
-    // whether to accept or queue our request.
+    // Targeted relay must only use existing peers. Creating a pending peer here
+    // would let user-controlled target origins masquerade as locally approved
+    // peering handshakes and bypass manual approval in /federation/peer/accept.
     if (targetPeerOrigins) {
       const matchedOrigins = new Set(matchedPeers.map(p => p.origin));
 
@@ -187,22 +185,7 @@ export function queueOutboxEvent(
           .get();
 
         if (!existingPeer) {
-          // No peer row — create pending placeholder, handshake fires on next tick
-          const peerId = generateSnowflake();
-          const now = Date.now();
-          db.insert(schema.federationPeers).values({
-            id: peerId,
-            origin,
-            hmacSecret: generateHmacSecret(),
-            status: 'pending',
-            createdAt: now,
-          }).run();
-          const newPeer = db.select().from(schema.federationPeers)
-            .where(eq(schema.federationPeers.id, peerId)).get();
-          if (newPeer) {
-            matchedPeers = [...matchedPeers, newPeer];
-            console.log(`[federation] queueOutboxEvent: created pending placeholder for ${origin}`);
-          }
+          console.debug(`[federation] queueOutboxEvent: skipping unknown peer ${origin}`);
           continue;
         }
 
