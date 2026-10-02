@@ -259,12 +259,12 @@ describe('the add-member modal names the 1-on-1 by the id of the instance it ask
 describe('the add-member modal adds to a group through home\'s copy of it', () => {
   const FID_GROUP = '0e0e0e0e-0000-4000-8000-000000000000';
   const groupRemote = wireDm({
-    id: 'dm-group-remote', federatedId: FID_GROUP, ownerId: 'alice-on-remote', createdAt: 5,
-    members: [aliceOnRemote, bobUnlinkedOnRemote],
+    id: 'dm-group-remote', federatedId: FID_GROUP, ownerId: 'alice-true', createdAt: 5,
+    members: [user('alice-true', null, null, 'alice'), bobUnlinkedOnRemote],
   });
   const groupHome = wireDm({
     id: 'dm-group-home', federatedId: FID_GROUP, ownerId: 'alice-home', createdAt: 4,
-    members: [aliceHome, bobOnHome],
+    members: [user('alice-home', 'alice-true', 'remote.example', 'alice'), bobOnHome],
   });
   const carol: TaggedFriend = { ...user('carol-home', null, null, 'carol'), _origin: '' } as TaggedFriend;
 
@@ -301,5 +301,94 @@ describe('the add-member modal adds to a group through home\'s copy of it', () =
 
     expect(await screen.findByText('Failed to add members')).toBeInTheDocument();
     expect(api.dm.addMember).not.toHaveBeenCalled();
+  });
+
+  it('closes when the transfer reaches home before the pinned remote copy', async () => {
+    useSpaceStore.getState().populateFromReady(REMOTE, [], [], [copyDm(groupRemote)]);
+    useSpaceStore.getState().populateFromReady('', [], [], [copyDm(groupHome)]);
+    useUIStore.getState().openModal('addDmMember', { dmChannelId: 'dm-group-remote' });
+    renderAt(<AddDmMemberModal />);
+    await userEvent.click(screen.getByText('carol'));
+    act(() => useSpaceStore.getState().updateDmOwner(groupHome.id, bobOnHome.id));
+    expect(useUIStore.getState().activeModal).toBeNull();
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+    expect(api.dm.addMember).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('the add-member modal enforces current group ownership', () => {
+  const group = wireDm({
+    id: 'managed-group', createdAt: 4, ownerId: aliceHome.id,
+    members: [aliceHome, bobOnHome],
+  });
+
+  beforeEach(() => {
+    useSpaceStore.getState().reset();
+    useSpaceStore.getState().upsertDmCopy('', copyDm(group), 'stated');
+    useSocialStore.setState({ friends: [
+      { ...user('carol', null, null, 'carol'), _instanceOrigin: '' } as TaggedFriend,
+      { ...user('dave', null, null, 'dave'), _instanceOrigin: '' } as TaggedFriend,
+    ] });
+    useUIStore.getState().openModal('addDmMember', { dmChannelId: group.id });
+    vi.mocked(api.dm.addMember).mockResolvedValue(copyDm(group));
+  });
+
+  it('closes a modal opened directly by a non-owner without sending a request', () => {
+    useSpaceStore.getState().updateDmOwner(group.id, bobOnHome.id);
+    renderAt(<AddDmMemberModal />);
+    expect(screen.queryByText('Add Friends to DM')).not.toBeInTheDocument();
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+    expect(useUIStore.getState().activeModal).toBeNull();
+    expect(api.dm.addMember).not.toHaveBeenCalled();
+    expect(api.dm.createGroup).not.toHaveBeenCalled();
+  });
+
+  it('allows the local owner to add a friend', async () => {
+    renderAt(<AddDmMemberModal />);
+    await userEvent.click(screen.getByText('carol'));
+    await userEvent.click(screen.getByText('Add 1 Friend'));
+    expect(api.dm.addMember).toHaveBeenCalledWith(group.id, {
+      userId: 'carol', homeUserId: undefined, homeInstance: undefined,
+    });
+    expect(useUIStore.getState().activeModal).toBeNull();
+  });
+
+  it('closes after an ownership transfer while selecting friends', async () => {
+    renderAt(<AddDmMemberModal />);
+    await userEvent.click(screen.getByText('carol'));
+    act(() => useSpaceStore.getState().updateDmOwner(group.id, bobOnHome.id));
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+    expect(useUIStore.getState().activeModal).toBeNull();
+    expect(api.dm.addMember).not.toHaveBeenCalled();
+  });
+
+  it('stops a batch if ownership changes while the first request is pending', async () => {
+    let finishFirst!: (value: DmChannel) => void;
+    vi.mocked(api.dm.addMember).mockImplementationOnce(() => new Promise((resolve) => { finishFirst = resolve; }));
+    renderAt(<AddDmMemberModal />);
+    await userEvent.click(screen.getByText('carol'));
+    await userEvent.click(screen.getByText('dave'));
+    await userEvent.click(screen.getByText('Add 2 Friends'));
+    expect(api.dm.addMember).toHaveBeenCalledTimes(1);
+    act(() => useSpaceStore.getState().updateDmOwner(group.id, bobOnHome.id));
+    await act(async () => finishFirst(copyDm(group)));
+    expect(api.dm.addMember).toHaveBeenCalledTimes(1);
+    expect(useUIStore.getState().activeModal).toBeNull();
+  });
+
+  it('does not resume an old batch after closing and reopening the modal', async () => {
+    let finishFirst!: (value: DmChannel) => void;
+    vi.mocked(api.dm.addMember).mockImplementationOnce(() => new Promise((resolve) => { finishFirst = resolve; }));
+    renderAt(<AddDmMemberModal />);
+    await userEvent.click(screen.getByText('carol'));
+    await userEvent.click(screen.getByText('dave'));
+    await userEvent.click(screen.getByText('Add 2 Friends'));
+    await userEvent.click(screen.getByRole('button', { name: 'Close' }));
+    act(() => useUIStore.getState().openModal('addDmMember', { dmChannelId: group.id }));
+    await act(async () => finishFirst(copyDm(group)));
+    expect(api.dm.addMember).toHaveBeenCalledTimes(1);
+    expect(useUIStore.getState().activeModal).toBe('addDmMember');
+    expect(screen.getByText('Select Friends')).toBeInTheDocument();
   });
 });

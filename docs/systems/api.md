@@ -193,7 +193,7 @@ POST   /dm                     { userId } | { homeUserId, homeInstance } → DmC
 POST   /dm/group               { users: [{ id, homeUserId?, homeInstance? }], fromDmChannelId? } → 201 DmChannel [2-9 users + caller; each a friend, or a member of the 1-on-1 `fromDmChannelId`]
 PATCH  /dm/:id                 { name?, icon? }                     → { id, name, icon, metadataUpdatedAt } [owner; group only]
 DELETE /dm/:id                                                      → { success } [member] (soft-close)
-POST   /dm/:id/members         { userId } | { homeUserId, homeInstance } → DmChannel [any member; group only; target must be a friend; max 10]
+POST   /dm/:id/members         { userId } | { homeUserId, homeInstance } → DmChannel [owner; group only; target must be a friend; max 10]
 DELETE /dm/:id/members                                              → { success } (leave) [group only]
 DELETE /dm/:id/members/:targetUserId  ?homeInstance=                → { success } [owner kick; cannot self-kick; group only; segment is homeUserId when ?homeInstance is set]
 POST   /dm/:id/transfer        { newOwnerId? | (homeUserId+homeInstance) } → { success } [owner; group only; resolved member must be in channel; not self]

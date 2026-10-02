@@ -178,6 +178,7 @@ function setStoreState(opts: { dmChannel: DmChannel; authUser: User | null }) {
 }
 
 beforeEach(() => {
+  useSpaceStore.setState({ channelOriginMap: new Map() });
   mockUpdateMetadata.mockReset();
   mockLeave.mockReset();
   mockKickMember.mockReset();
@@ -379,5 +380,52 @@ describe('GroupDmSettings — leave', () => {
     await user.click(confirmBtn);
 
     await waitFor(() => expect(mockLeave).toHaveBeenCalledWith('dm-1'));
+  });
+});
+
+
+describe('GroupDmSettings — adding group members', () => {
+  function openMembers(dm: DmChannel) {
+    setStoreState({ dmChannel: dm, authUser: makeUser() });
+    useUIStore.setState({ modalData: { dmChannelId: dm.id, initialTab: 'members' } });
+    renderModal();
+  }
+
+  it('hides the add-member entry point from a non-owner', () => {
+    openMembers(makeGroupDm({ ownerId: 'user-2' }));
+    expect(document.querySelector('[data-group-dm-add-member]')).toBeNull();
+    expect(screen.queryByText(/Group is full/i)).not.toBeInTheDocument();
+  });
+
+  it('lets the local owner open the add-member modal', async () => {
+    openMembers(makeGroupDm());
+    const button = document.querySelector('[data-group-dm-add-member]') as HTMLButtonElement;
+    expect(button).toBeEnabled();
+    await userEvent.click(button);
+    expect(useUIStore.getState().activeModal).toBe('addDmMember');
+    expect(useUIStore.getState().modalData.dmChannelId).toBe('dm-1');
+  });
+
+  it('recognizes the owner on a remote copy and removes the entry point after transfer', () => {
+    const dm = makeGroupDm({
+      ownerId: 'self-on-peer',
+      members: [
+        makeUser({ id: 'self-on-peer', homeUserId: 'user-self', homeInstance: window.location.host }),
+        makeUser({ id: 'user-2', username: 'alice' }),
+      ],
+    });
+    useSpaceStore.setState({ channelOriginMap: new Map([[dm.id, 'https://peer.example']]) });
+    openMembers(dm);
+    expect(document.querySelector('[data-group-dm-add-member]')).toBeEnabled();
+    act(() => useSpaceStore.setState({ dmChannels: [{ ...dm, ownerId: 'user-2' }] }));
+    expect(document.querySelector('[data-group-dm-add-member]')).toBeNull();
+  });
+
+  it('keeps the full-group hint for an owner at capacity', () => {
+    openMembers(makeGroupDm({
+      members: [makeUser(), ...Array.from({ length: 9 }, (_, index) => makeUser({ id: `member-${index}`, username: `member-${index}` }))],
+    }));
+    expect(document.querySelector('[data-group-dm-add-member]')).toBeDisabled();
+    expect(screen.getByText(/group is full/i)).toBeInTheDocument();
   });
 });

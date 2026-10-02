@@ -9,6 +9,7 @@ import { useAuthStore } from '../../stores/authStore';
 import { useSocialStore, type TaggedFriend } from '../../stores/socialStore';
 import { api } from '../../api/client';
 import { isSelf, parseFederatedUsername, deliveringHost } from '../../utils/identity';
+import { canAddDmMembers } from '../../utils/dmPermissions';
 import { useCanonicalUserView } from '../../utils/userViewLookup';
 import type { User } from '@backspace/shared';
 
@@ -93,10 +94,14 @@ export function AddDmMemberModal() {
   const navigate = useNavigate();
   const myUser = useAuthStore((s) => s.user);
   const inputRef = useRef<HTMLInputElement>(null);
+  const modalSession = useRef(0);
 
   const isOpen = activeModal === 'addDmMember';
   const dmChannelId = modalData.dmChannelId as string | undefined;
   const dmChannel = dmChannels.find(dm => dm.id === dmChannelId);
+  const homeChannel = dmChannelId ? dmCopyOnOrigin(dmChannelId, '') : undefined;
+  const canAddMembers = canAddDmMembers(dmChannel, myUser, getChannelOrigin(dmChannelId ?? ''))
+    && (!homeChannel || canAddDmMembers(homeChannel, myUser, ''));
   const currentMemberIds = useMemo(
     () => new Set(dmChannel?.members.map(m => m.id) ?? []),
     [dmChannel?.members],
@@ -119,14 +124,25 @@ export function AddDmMemberModal() {
 
   // Reset state when modal opens
   useEffect(() => {
+    modalSession.current += 1;
     if (isOpen) {
       setQuery('');
       setSelected(new Set());
       setError('');
       setIsAdding(false);
-      setTimeout(() => inputRef.current?.focus(), 100);
+      const timeout = setTimeout(() => inputRef.current?.focus(), 100);
+      return () => {
+        clearTimeout(timeout);
+        modalSession.current += 1;
+      };
     }
-  }, [isOpen]);
+  }, [isOpen, dmChannelId]);
+
+  // Ownership can change while this modal is open, including between two
+  // requests in a batch. Hide immediately and clear the stale modal state.
+  useEffect(() => {
+    if (isOpen && !canAddMembers) closeModal();
+  }, [isOpen, canAddMembers, closeModal]);
 
   const toggleFriend = (friendId: string) => {
     if (currentMemberIds.has(friendId)) return;
@@ -158,6 +174,18 @@ export function AddDmMemberModal() {
 
   const handleSubmit = async () => {
     if (!dmChannelId || !dmChannel || isAdding || selectedFriends.length === 0) return;
+    const session = modalSession.current;
+    const canStillAddMembers = () => {
+      const ui = useUIStore.getState();
+      const current = useSpaceStore.getState().dmChannels.find((dm) => dm.id === dmChannelId);
+      const home = dmCopyOnOrigin(dmChannelId, '');
+      const viewer = useAuthStore.getState().user;
+      return session === modalSession.current
+        && ui.activeModal === 'addDmMember' && ui.modalData.dmChannelId === dmChannelId
+        && canAddDmMembers(current, viewer, getChannelOrigin(dmChannelId))
+        && (!home || canAddDmMembers(home, viewer, ''));
+    };
+    if (!canStillAddMembers()) return;
     setError('');
     setIsAdding(true);
     // Both requests go to the home instance, which knows the conversation
@@ -194,8 +222,10 @@ export function AddDmMemberModal() {
         // there is none to name.
         const newChannel = await api.dm.createGroup({ users, fromDmChannelId: homeCopy?.id });
         const rowId = upsertDmCopy('', newChannel, 'stated');
-        closeModal();
-        navigate(`/channels/@me/${rowId}`);
+        if (canStillAddMembers()) {
+          closeModal();
+          navigate(`/channels/@me/${rowId}`);
+        }
       } else {
         // Existing group DM → add each friend sequentially, on home's copy.
         if (!homeCopy) {
@@ -204,18 +234,19 @@ export function AddDmMemberModal() {
           return;
         }
         for (const friend of selectedFriends) {
+          if (!canStillAddMembers()) return;
           await api.dm.addMember(homeCopy.id, {
             userId: friend.homeInstance ? undefined : friend.id,
             homeUserId: friend.homeUserId ?? undefined,
             homeInstance: friend.homeInstance ?? undefined,
           });
         }
-        closeModal();
+        if (canStillAddMembers()) closeModal();
       }
     } catch (err) {
-      setError((err as Error).message || t('dm:addMember.failed'));
+      if (canStillAddMembers()) setError((err as Error).message || t('dm:addMember.failed'));
     } finally {
-      setIsAdding(false);
+      if (session === modalSession.current) setIsAdding(false);
     }
   };
 
@@ -224,7 +255,7 @@ export function AddDmMemberModal() {
     : t('dm:addMember.addCount', { count: selectedFriends.length });
 
   return (
-    <Modal isOpen={isOpen} onClose={closeModal} title={t('dm:addMember.title')} mobileStyle="sheet">
+    <Modal isOpen={isOpen && canAddMembers} onClose={closeModal} title={t('dm:addMember.title')} mobileStyle="sheet">
       <div className="space-y-3">
         {/* Header with member count */}
         <div className="flex items-center justify-between">

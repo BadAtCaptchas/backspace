@@ -30,7 +30,7 @@ Related specs: `docs/systems/federation.md` (wire protocol, outbox worker, peer 
 |----------|-----------|----------|
 | `ownerId` | `NULL` | Creator's local user ID (never NULL) |
 | `federatedId` format | 32-char hex (SHA-256 hash) | 36-char UUID (random) |
-| Mutable membership | No (immutable pair) | Yes (any member adds, anyone leaves) |
+| Mutable membership | No (immutable pair) | Yes (owner adds, anyone leaves) |
 | Max members | 2 | 10 |
 | Friendship required | No | Yes (for new adds; exempt for existing DM members during 1-on-1 upgrade) |
 | Soft-close | Yes (`closed=1` on dm_members) | Yes (same) |
@@ -193,10 +193,11 @@ Close and reopen are relayed to all peer instances that hold a copy of the DM:
 **Validation:**
 1. Caller must be a member of the channel
 2. Channel must be a group DM (`ownerId` is not NULL)
-3. Target user must exist
-4. Caller and target must be friends
-5. Target must not already be a member
-6. Current member count must be < 10
+3. Caller must be the group owner (`ownerId`)
+4. Target user must exist
+5. Owner and target must be friends
+6. Target must not already be a member
+7. Current member count must be < 10
 
 **Lazy federation setup:**
 - If the channel lacks a `federatedId` and the new member (or any existing member) is remote:
@@ -718,15 +719,15 @@ This is the one place the rule is written; other specs point here.
 
 What decides the path is whether this instance holds a channel with the event's `federatedId` (soft-deleted or not):
 
-- **Bootstrap** (no such channel): the event must carry `group`, which must name an owner, and `attributionRefusal(group.owner, sourceInstance)` must pass: the sender speaks for the group's owner. The owner and roster are then resolved (`resolveOrCreateReplicatedUser`; tombstoned identities are dropped) and `mayRelayInto(<roster>, <owner>, sourceInstance)` must pass: the owner is in the roster and the signing peer is one of the instances the roster lives on. A missing owner or a failed roster check is `invalid_target` (terminal; the event carries everything it is judged on, so a retry cannot change the answer) and no channel is created. The roster it sends becomes this instance's copy. This is how a brand-new group, or a group this instance has never held, arrives.
+- **Bootstrap** (no such channel): the event must carry `group`, which must name an owner, and `membership.addedBy` must identify that owner (same home user id and home domain). `attributionRefusal(membership.addedBy, sourceInstance)` must pass before any channel, roster or user is created: the sender speaks for the group's owner. A missing actor is `attribution_mismatch`; an actor other than the named owner is `invalid_target`. The owner and roster are then resolved (`resolveOrCreateReplicatedUser`; tombstoned identities are dropped) and `mayRelayInto(<roster>, <owner>, sourceInstance)` must pass: the owner is in the roster and the signing peer is one of the instances the roster lives on. A missing owner or a failed roster check is `invalid_target` (terminal; the event carries everything it is judged on, so a retry cannot change the answer) and no channel is created. The roster it sends becomes this instance's copy. This is how a brand-new group, or a group this instance has never held, arrives.
 - **Incremental** (the channel exists): the add is judged against this instance's copy, mirroring `POST /api/dm/:id/members`:
   1. `attributionRefusal(membership.addedBy, sourceInstance)`, as for every relay event.
   2. The channel must be a group (`ownerId` set). A 1-on-1 has a fixed pair: else `invalid_target` (terminal).
-  3. The adder (`membership.addedBy`, required) must be a current member of this copy, matched by federated identity (`memberWithIdentity`: same home user id on the same home domain), and the signing peer one of `relayTargetOrigins(<the members before the add>)`, compared by domain (`mayRelayInto`, `federation/dmChannels.ts`, the same check "Relayed message creates" uses): else `unauthorized_source`. Nothing is added.
+  3. The adder (`membership.addedBy`, required) must be the current owner (`channel.ownerId`) and a member of this copy, matched by federated identity (`memberWithIdentity`: same home user id on the same home domain), and the signing peer one of `relayTargetOrigins(<the members before the add>)`, compared by domain (`mayRelayInto`, `federation/dmChannels.ts`, the same check "Relayed message creates" uses): else `unauthorized_source`. Nothing is added.
 
-`unauthorized_source` is retried by the sender. An add can legitimately arrive before the event that made its adder a member, when that member was added through a third instance; the retry applies it once that event has landed. The local route's friendship check is the adder's own instance's to make; the receiver cannot see that friendship.
+`unauthorized_source` is retried by the sender. An add can legitimately arrive before the ownership-transfer event that made its adder the owner; the retry applies it once that event has landed. Incremental events cannot authorize themselves by changing `group.owner`: only the recorded owner of this copy counts. The local route's friendship check is the owner's own instance's to make; the receiver cannot see that friendship.
 
-Known limit: a copy kept after all of this instance's members left keeps its roster from that time. An add by someone who joined later is refused until their own add reaches this instance, which it does not, since the group is no longer relayed here. Re-adding through the owner or any member still in that roster works.
+Known limit: a copy kept after all of this instance's members left keeps its roster and ownership from that time. An add by a later owner is refused until the missing membership and ownership-transfer events reach this instance. Re-adding through the owner still recorded in that copy works.
 
 ### Bootstrap vs Incremental Batching
 
@@ -914,6 +915,8 @@ Returns the channel's `ownerHomeInstance`. Used by all owner-only DM operations 
 
 ### Add DM Member Modal (`AddDmMemberModal.tsx`)
 
+- Existing groups expose add-member controls only to the owner, using origin-qualified home identity (`utils/dmPermissions.ts`) on desktop, mobile and the chat header. Either participant can still create a new group from a 1-on-1.
+- The modal checks both the displayed copy and its home copy. Ownership changes close a stale dialog and prevent further requests in a selected-friends batch; closing or reopening the modal also invalidates the old batch.
 - Shows the caller's friends list, filtered by search query
 - Excludes current DM members (shown as "Already in this DM")
 - Enforces 10-member cap in the UI (`remainingSlots` calculation)
@@ -977,7 +980,7 @@ const normalized = homeInstance.startsWith('http')
 | `DELETE` | `/api/dm/:id` | JWT | Soft-close DM for caller |
 | `DELETE` | `/api/dm/:id/members/:targetUserId` | JWT | Owner kicks a member from a group DM. Cannot kick self. 1-on-1 DMs reject |
 | `POST` | `/api/dm/:id/transfer` | JWT | Owner transfers ownership to another current member without leaving. Body: `{ newOwnerId }` |
-| `POST` | `/api/dm/:id/members` | JWT | Add member to group DM (any member). Accepts `{ userId }` or `{ homeUserId, homeInstance }` |
+| `POST` | `/api/dm/:id/members` | JWT | Add member to group DM (owner only). Accepts `{ userId }` or `{ homeUserId, homeInstance }` |
 | `DELETE` | `/api/dm/:id/members` | JWT | Leave group DM |
 | `GET` | `/api/dm/:id/messages` | JWT | Get messages with cursor pagination |
 | `POST` | `/api/dm/:id/messages` | JWT | Send message (rate-limited: 5/5s) |

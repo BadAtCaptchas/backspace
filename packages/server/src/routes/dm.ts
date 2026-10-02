@@ -1474,9 +1474,12 @@ export async function dmRoutes(app: FastifyInstance): Promise<void> {
     if (!dmChannel.ownerId) {
       return sendError(reply, 400, 'dm_not_group');
     }
-    // Any group DM member can add friends (not just the owner)
+    // Only the group owner can authorize expanding access to private DM history
+    if (dmChannel.ownerId !== request.userId) {
+      return sendError(reply, 403, 'dm_owner_only');
+    }
 
-    // Validate the adder and target are friends
+    // Validate the owner and target are friends
     const friendship = db.select().from(schema.friends).where(
       or(
         and(eq(schema.friends.userId, request.userId), eq(schema.friends.friendId, targetUserId)),
