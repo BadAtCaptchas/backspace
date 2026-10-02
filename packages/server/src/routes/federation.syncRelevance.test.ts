@@ -184,6 +184,49 @@ describe('POST /api/federation/sync — DM relevance filter', () => {
   });
 });
 
+describe('POST /api/federation/sync — owner-controlled group metadata', () => {
+  let app: FastifyInstance;
+  beforeEach(async () => {
+    sqlite = new Database(':memory:');
+    testDb = drizzle(sqlite, { schema });
+    applyMigrations(sqlite);
+    seedPeer();
+    testDb.insert(schema.instanceSettings).values({ id: 1, federationRelayEnabled: 1, updatedAt: 1 }).run();
+    seedUser({ id: 'alice', username: 'alice', passwordHash: 'real-hash', homeInstance: null });
+    seedUser({ id: 'bob', username: 'bob@orbit.test', homeInstance: 'orbit.test', homeUserId: 'bob-home' });
+    seedDmWithMessage('ch-live', ['alice', 'bob'], 'alice', 100);
+    testDb.update(schema.dmChannels).set({ ownerId: 'alice', ownerHomeUserId: 'alice', ownerHomeInstance: 'https://home.test' })
+      .where(eq(schema.dmChannels.id, 'ch-live')).run();
+    app = await buildApp();
+  });
+
+  it.each([undefined, 'fed-ch-live'])('replays an offline permission change with its envelope (filter=%s)', async federatedId => {
+    const { queueGroupMetadataRelay } = await import('../utils/federationOutbox.js');
+    queueGroupMetadataRelay('ch-live', {
+      name: 'private group', icon: null, metadataUpdatedAt: 2000, membersCanInvite: false, iconChanged: false,
+      actor: { userId: 'alice', homeUserId: 'alice', homeInstance: 'https://home.test' },
+    });
+    const outbox = testDb.select().from(schema.federationOutbox).all();
+    expect(outbox).toHaveLength(1);
+    expect(outbox[0]!.peerId).toBe(PEER_ID);
+    const liveEvent = JSON.parse(outbox[0]!.payload);
+    expect(liveEvent.metadata.membersCanInvite).toBe(false);
+    expect(liveEvent.metadata.iconChanged).toBe(false);
+    // Model a lost/expired live event: initial sync must reconstruct it solely
+    // from the mutation log, preserving the false rather than defaulting ON.
+    testDb.delete(schema.federationOutbox).run();
+    const res = await syncPull(app, { sinceTimestamp: 100, ...(federatedId ? { federatedId } : {}) });
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.events).toHaveLength(1);
+    expect(body.events[0]).toMatchObject({
+      eventType: 'group_metadata_update', contextType: 'dm', dmChannelId: 'ch-live',
+      federatedId: 'fed-ch-live', metadata: liveEvent.metadata,
+    });
+    expect(body.events[0].metadata.membersCanInvite).toBe(false);
+  });
+});
+
 describe('POST /api/federation/sync — friend relevance filter', () => {
   let app: FastifyInstance;
 

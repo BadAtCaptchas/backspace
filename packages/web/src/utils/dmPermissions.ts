@@ -26,11 +26,25 @@ export function isDmOwner(
   });
 }
 
+/** Roster membership is proved by the user's home identity, never a display name. */
+export function isDmMember(
+  dm: DmChannel | null | undefined,
+  viewer: Viewer | null,
+  origin: string,
+): boolean {
+  if (!dm || !viewer) return false;
+  const viewerKey = canonicalUserKey({ ...viewer, homeInstance: viewer.homeInstance || deliveringHost('') });
+  return dm.members.some((member) => canonicalUserKey({
+    ...member, homeInstance: member.homeInstance || deliveringHost(origin),
+  }) === viewerKey);
+}
+
 /** Either participant may create a new group from a 1:1 conversation. */
 export function canAddDmMembers(
   dm: DmChannel | null | undefined,
   viewer: Viewer | null,
   origin: string,
 ): boolean {
-  return !!dm && !!viewer && (!dm.ownerId || isDmOwner(dm, viewer, origin));
+  return !!dm && isDmMember(dm, viewer, origin)
+    && (!dm.ownerId || isDmOwner(dm, viewer, origin) || dm.membersCanInvite !== false);
 }

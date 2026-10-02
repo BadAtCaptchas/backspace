@@ -56,3 +56,33 @@ describe('group DM membership permissions', () => {
     expect(canAddDmMembers(group(), null, '')).toBe(false);
   });
 });
+
+
+describe('member invitations', () => {
+  const other = { ...self, id: 'other' };
+  const joined = (membersCanInvite: boolean) => group({ ownerId: other.id, members: [self, other], membersCanInvite });
+
+  it('lets existing members invite when enabled, and blocks them when disabled', () => {
+    expect(canAddDmMembers(joined(true), self, '')).toBe(true);
+    expect(canAddDmMembers(joined(false), self, '')).toBe(false);
+    expect(canAddDmMembers(group({ membersCanInvite: false }), self, '')).toBe(true);
+  });
+
+  it('defaults legacy missing flags to enabled', () => {
+    const legacy: Partial<DmChannel> = joined(true);
+    delete legacy.membersCanInvite;
+    expect(canAddDmMembers(legacy as DmChannel, self, '')).toBe(true);
+  });
+
+  it('requires membership even with enabled invites or matching owner metadata', () => {
+    expect(canAddDmMembers(group({ members: [], membersCanInvite: true }), self, '')).toBe(false);
+    expect(canAddDmMembers(group({ ownerId: 'other', members: [other] }), self, '')).toBe(false);
+    expect(canAddDmMembers(wireDm({ id: 'pair', createdAt: 0, members: [other] }), self, '')).toBe(false);
+  });
+
+  it('recognizes a member alias on a remote instance without trusting equal local IDs', () => {
+    expect(canAddDmMembers(group({ ownerId: other.id, members: [ownerAlias, other] }), self, 'https://peer.example')).toBe(true);
+    expect(canAddDmMembers(joined(true), self, 'https://peer.example')).toBe(false);
+    expect(canAddDmMembers(group({ ownerId: other.id, members: [{ ...ownerAlias, homeInstance: 'unrelated.example' }, other] }), self, 'https://peer.example')).toBe(false);
+  });
+});

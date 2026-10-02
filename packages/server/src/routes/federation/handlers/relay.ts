@@ -465,7 +465,7 @@ export function registerRelayRoutes(app: FastifyInstance): void {
               AND ml.context_type = 'dm'
               AND ml.mutated_at > ?
               AND (dm.id IS NOT NULL OR ml.mutation_type IN (
-                'delete', 'member_add', 'member_remove', 'ownership_transfer',
+                'delete', 'member_add', 'member_remove', 'ownership_transfer', 'group_metadata_update',
                 'dm_close', 'dm_reopen', 'read_state_update', 'file_rejected'
               ))
             ORDER BY ml.mutated_at ASC
@@ -509,7 +509,7 @@ export function registerRelayRoutes(app: FastifyInstance): void {
               AND ml.context_type = 'dm'
               AND ml.mutated_at > ?
               AND (dm.id IS NOT NULL OR ml.mutation_type IN (
-                'delete', 'member_add', 'member_remove', 'ownership_transfer',
+                'delete', 'member_add', 'member_remove', 'ownership_transfer', 'group_metadata_update',
                 'dm_close', 'dm_reopen', 'read_state_update', 'file_rejected'
               ))
             ORDER BY ml.mutated_at ASC
@@ -549,11 +549,31 @@ export function registerRelayRoutes(app: FastifyInstance): void {
 
       for (const mutation of mutationRows) {
         const mutationType = mutation.mutation_type as 'create' | 'update' | 'delete' | 'reaction_add' | 'reaction_remove'
-          | 'member_add' | 'member_remove' | 'ownership_transfer'
+          | 'member_add' | 'member_remove' | 'ownership_transfer' | 'group_metadata_update'
           | 'friend_request_create' | 'friend_request_update' | 'friend_request_cancel'
           | 'friend_add' | 'friend_remove'
           | 'dm_close' | 'dm_reopen' | 'read_state_update' | 'file_rejected'
           | 'profile_update';
+
+        if (mutationType === 'group_metadata_update') {
+          // Unlike membership mutations, this log stores the metadata object
+          // alone. Restore its envelope and canonical conversation identity
+          // so offline peers recover permission changes as well as name/icon.
+          const federatedId = channelFederatedIdMap.get(mutation.context_id);
+          if (mutation.payload && federatedId) {
+            events.push({
+              eventType: 'group_metadata_update',
+              contextType: 'dm',
+              dmChannelId: mutation.context_id,
+              federatedId,
+              messageId: mutation.entity_id,
+              encryptionVersion: 0,
+              timestamp: mutation.mutated_at,
+              metadata: JSON.parse(mutation.payload),
+            });
+          }
+          continue;
+        }
 
         if (['member_add', 'member_remove', 'ownership_transfer',
              'friend_request_create', 'friend_request_update', 'friend_request_cancel',

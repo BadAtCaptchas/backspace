@@ -476,3 +476,19 @@ describe('copyIdOnOrigin', () => {
     expect(copyIdOnOrigin(s, 'nope', HOME)).toBeNull();
   });
 });
+
+
+describe('member invite permission wire compatibility', () => {
+  it('defaults a legacy channel to enabled and preserves explicit false on a legacy refresh', () => {
+    let state = listing(EMPTY_DM_CONVERSATIONS, REMOTE, [asListedBy161(groupOnRemote)]);
+    expect(row(state, groupOnRemote.id)?.membersCanInvite).toBe(true);
+    state = listing(state, REMOTE, [{ ...groupOnRemote, membersCanInvite: false }]);
+    expect(row(state, groupOnRemote.id)?.membersCanInvite).toBe(false);
+    state = listing(state, REMOTE, [asListedBy161(groupOnRemote)]);
+    expect(row(state, groupOnRemote.id)?.membersCanInvite).toBe(false);
+    state = upsertCopy(state, REMOTE, asListedBy161(groupOnRemote), 'stated', AT_HOME).next;
+    expect(row(state, groupOnRemote.id)?.membersCanInvite).toBe(false);
+    state = listing(state, REMOTE, [{ ...groupOnRemote, membersCanInvite: true }]);
+    expect(row(state, groupOnRemote.id)?.membersCanInvite).toBe(true);
+  });
+});

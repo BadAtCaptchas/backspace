@@ -1098,6 +1098,8 @@ export function queueGroupMetadataRelay(
     name: string | null;
     icon: string | null;        // bare filename, absolute http(s) URL, or null
     metadataUpdatedAt: number;
+    membersCanInvite?: boolean;
+    iconChanged?: boolean;
     actor: { userId: string; homeUserId: string; homeInstance: string };
   },
 ): void {
@@ -1173,6 +1175,8 @@ export function queueGroupMetadataRelay(
     name: payload.name,
     icon: wireIcon,
     metadataUpdatedAt: payload.metadataUpdatedAt,
+    ...(payload.membersCanInvite !== undefined ? { membersCanInvite: payload.membersCanInvite } : {}),
+    ...(payload.iconChanged !== undefined ? { iconChanged: payload.iconChanged } : {}),
     actor: actorParticipant,
   };
 

@@ -2,7 +2,7 @@ import { create } from 'zustand';
 import type { Space, Channel, ChannelCategory, MemberWithUser, SpaceWithChannelsAndMembers, Role, SpaceFolder, SpaceLayoutItem, DmChannel, DmMessageWithUser, User, UpdateSpaceRequest, CreateSpaceRequest, UpdateChannelRequest } from '@backspace/shared';
 import { api, BackspaceApiClient } from '../api/client';
 import { resolveAssetUrl, normalizeUserAssets } from '../utils/assetUrls';
-import { isSelf, canonicalUserKey, isDeliveryFromHome, activityKey, type PresenceSubject } from '../utils/identity';
+import { isSelf, canonicalUserKey, isDeliveryFromHome, activityKey, deliveringHost, normalizeOriginToHost, type PresenceSubject } from '../utils/identity';
 import { sortDmChannels } from '../utils/dmSorting';
 import { locateDmChannel } from '../utils/dmChannelLookup';
 import { deriveMissingOneOnOneKeys, type PeerDmChannel } from '../utils/dmConversationKey';
@@ -22,6 +22,7 @@ import {
   conversationCopyIndex,
   copyIdOnOrigin,
   copyOnOrigin,
+  findCopy,
   type DmConversations,
   type DmOperation,
   type DmPinContext,
@@ -33,6 +34,7 @@ import {
   getCachedUserIdForOrigin,
   clearMyUserIdCache,
   setOwnerInstanceForDmResolver,
+  setDmMetadataTargetResolver,
 } from '../utils/crossStoreResolvers';
 import { useAuthStore } from './authStore';
 import { useChatStore } from './chatStore';
@@ -284,7 +286,7 @@ interface SpaceState {
     newOwnerHomeUserId?: string,
     newOwnerHomeInstance?: string,
   ) => void;
-  updateDmMetadata: (dmChannelId: string, patch: { name?: string | null; icon?: string | null }) => void;
+  updateDmMetadata: (dmChannelId: string, patch: { name?: string | null; icon?: string | null; membersCanInvite?: boolean }) => void;
   closeDm: (id: string) => Promise<void>;
   leaveDm: (id: string) => Promise<void>;
   loadSpaces: () => Promise<void>;
@@ -546,8 +548,8 @@ export const useSpaceStore = create<SpaceState>((set, get) => ({
     }));
   },
 
-  // Patches the group DM's display metadata (name + icon). Idempotent: a
-  // payload with only one of `name`/`icon` leaves the other field untouched.
+  // Patches group metadata and invitation settings. Omitted fields preserve
+  // their current values, including false when a legacy server omits the flag.
   // Mirrors `updateDmOwner` shape; called by the `dm_channel_updated` WS
   // handler after a remote rename / icon change.
   updateDmMetadata: (dmChannelId, patch) => {
@@ -555,6 +557,7 @@ export const useSpaceStore = create<SpaceState>((set, get) => ({
       const next = { ...dm };
       if ('name' in patch) next.name = patch.name ?? null;
       if ('icon' in patch) next.icon = patch.icon ?? null;
+      if (patch.membersCanInvite !== undefined) next.membersCanInvite = patch.membersCanInvite;
       return next;
     }));
   },
@@ -1397,6 +1400,31 @@ export function getOwnerInstanceForDm(channelId: string): string {
 }
 
 setOwnerInstanceForDmResolver(getOwnerInstanceForDm);
+
+setDmMetadataTargetResolver((channelId) => {
+  const state = useSpaceStore.getState();
+  const found = findCopy(state.dmConversations, channelId);
+  const pinned = found?.conversation.copies.get(found.conversation.pinnedOrigin);
+  const dm = pinned?.channel ?? state.dmChannels.find((channel) => channel.id === channelId);
+  if (!dm?.ownerId) return null;
+  // Resolve the same authority from either copy id during API delegation;
+  // a lagging sibling's owner event must not redirect back to another client.
+  const servingOrigin = pinned?.origin ?? getChannelOrigin(channelId);
+  const owner = dm.members.find((member) => member.id === dm.ownerId);
+  // The roster also handles legacy owner events without home-identity fields.
+  const ownerHost = owner
+    ? normalizeOriginToHost(owner.homeInstance) || deliveringHost(servingOrigin)
+    : normalizeOriginToHost(dm.ownerHomeInstance) || deliveringHost(servingOrigin);
+  if (found) {
+    for (const copy of found.conversation.copies.values()) {
+      if (deliveringHost(copy.origin) === ownerHost) {
+        return { origin: copy.origin, channelId: copy.channel.id };
+      }
+    }
+    return null;
+  }
+  return deliveringHost(servingOrigin) === ownerHost ? { origin: servingOrigin, channelId } : null;
+});
 
 /**
  * Resolves a raw DM channel ID to its primary `dmChannels` entry ID.

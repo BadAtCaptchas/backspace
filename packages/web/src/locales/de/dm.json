@@ -126,7 +126,10 @@
     "groupFull": "Gruppe ist voll",
     "groupFullSuffix": "– Gruppe ist voll",
     "cropTitle": "Gruppensymbol zuschneiden",
-    "saveFailed": "Einstellungen konnten nicht gespeichert werden"
+    "saveFailed": "Einstellungen konnten nicht gespeichert werden",
+    "membersCanInviteLabel": "Mitgliedern erlauben, Personen einzuladen",
+    "membersCanInviteDescription": "Bestehende Mitglieder können ihre Freunde einladen. Neue Mitglieder können den bisherigen Chatverlauf sehen.",
+    "ownerUnavailable": "Verbinde dich mit der Instanz des Gruppeninhabers, um diese Einstellungen zu ändern."
   },
   "groupInfo": {
     "title": "Gruppeninfo",

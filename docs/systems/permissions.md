@@ -418,3 +418,7 @@ membership is binary so the two candidate predicates coincide.
 
 Covered by `packages/server/src/routes/messages.replyAuthorization.test.ts` and
 `packages/server/src/routes/dm.replyAuthorization.test.ts`.
+
+## Group DM invitations
+
+Group DMs have a single owner-controlled `membersCanInvite` boolean, default true. It is not a space permission bit. Only the current group owner may write it through the metadata PATCH; every add still requires membership, friendship and capacity. When disabled, only the current owner may add members. REST reads the stored setting, and federation checks its locally stored owner-authoritative copy, never a setting asserted by the invitation itself. See `dm-system.md` for compatibility, asynchronous propagation and the fresh-peer bootstrap authority boundary.

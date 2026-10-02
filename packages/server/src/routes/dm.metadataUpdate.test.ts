@@ -231,6 +231,77 @@ describe('PATCH /api/dm/:id — group metadata update', () => {
     app = await buildApp();
   });
 
+  it('owner toggles invitations, broadcasts and relays the setting without a chat system message', async () => {
+    seedGroupDm({ id: 'invites', ownerId: 'owner-A', members: ['owner-A', 'member-B', 'remote-C'], federatedId: 'fed-invites' });
+    const res = await app.inject({ method: 'PATCH', url: '/api/dm/invites', payload: { membersCanInvite: false } });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().membersCanInvite).toBe(false);
+    const row = testDb.select().from(schema.dmChannels).where(eq(schema.dmChannels.id, 'invites')).get();
+    expect(row?.membersCanInvite).toBe(false);
+    expect(connectionManager.sendToDmMembers).toHaveBeenCalledWith('invites', expect.objectContaining({ type: 'dm_channel_updated', membersCanInvite: false }));
+    const outbox = testDb.select().from(schema.federationOutbox).all();
+    expect(outbox).toHaveLength(1);
+    expect(JSON.parse(outbox[0]!.payload).metadata.membersCanInvite).toBe(false);
+    expect(JSON.parse(outbox[0]!.payload).metadata.iconChanged).toBe(false);
+    expect(testDb.select().from(schema.dmMessages).all()).toHaveLength(0);
+
+    const enabled = await app.inject({ method: 'PATCH', url: '/api/dm/invites', payload: { membersCanInvite: true } });
+    expect(enabled.json().membersCanInvite).toBe(true);
+    expect(enabled.json().metadataUpdatedAt).toBeGreaterThan(res.json().metadataUpdatedAt);
+  });
+
+  it('preserves disabled invitations on legacy metadata updates and no-op responses', async () => {
+    seedGroupDm({ id: 'legacy', ownerId: 'owner-A', members: ['owner-A', 'member-B'] });
+    await app.inject({ method: 'PATCH', url: '/api/dm/legacy', payload: { membersCanInvite: false } });
+    const renamed = await app.inject({ method: 'PATCH', url: '/api/dm/legacy', payload: { name: 'Renamed' } });
+    expect(renamed.json().membersCanInvite).toBe(false);
+    const unchanged = await app.inject({ method: 'PATCH', url: '/api/dm/legacy', payload: {} });
+    expect(unchanged.json().membersCanInvite).toBe(false);
+    const same = await app.inject({ method: 'PATCH', url: '/api/dm/legacy', payload: { membersCanInvite: false } });
+    expect(same.json().metadataUpdatedAt).toBe(renamed.json().metadataUpdatedAt);
+  });
+
+  it.each(['member-B', 'stranger-D'])('refuses a permission change by %s', async (userId) => {
+    seedGroupDm({ id: 'not-owner', ownerId: 'owner-A', members: ['owner-A', 'member-B'] });
+    currentUserId = userId;
+    const res = await app.inject({ method: 'PATCH', url: '/api/dm/not-owner', payload: { membersCanInvite: false } });
+    expect(res.statusCode).toBe(403);
+    expect(testDb.select().from(schema.dmChannels).where(eq(schema.dmChannels.id, 'not-owner')).get()?.membersCanInvite).toBe(true);
+  });
+
+  it.each([null, 0, 1, 'false', {}, []])('rejects malformed invitation permission %j', async (value) => {
+    seedGroupDm({ id: 'invalid-setting', ownerId: 'owner-A', members: ['owner-A', 'member-B'] });
+    const res = await app.inject({ method: 'PATCH', url: '/api/dm/invalid-setting', payload: { membersCanInvite: value } });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().code).toBe('validation_failed');
+  });
+
+  it('permission stays disabled through ownership transfer and only the new owner may change it', async () => {
+    seedGroupDm({ id: 'transfer-setting', ownerId: 'owner-A', members: ['owner-A', 'member-B', 'remote-C'], federatedId: 'fed-transfer-setting', name: 'Transfer group', icon: 'https://local.test/api/uploads/group.png' });
+    await app.inject({ method: 'PATCH', url: '/api/dm/transfer-setting', payload: { membersCanInvite: false } });
+    const transfer = await app.inject({ method: 'POST', url: '/api/dm/transfer-setting/transfer', payload: { newOwnerId: 'member-B' } });
+    expect(transfer.statusCode).toBe(200);
+    const transferOutbox = testDb.select().from(schema.federationOutbox).all().find(row => row.eventType === 'ownership_transfer');
+    expect(transferOutbox).toBeDefined();
+    expect(JSON.parse(transferOutbox!.payload).ownership.metadata).toMatchObject({
+      name: 'Transfer group', icon: 'https://local.test/api/uploads/group.png', membersCanInvite: false,
+      metadataUpdatedAt: expect.any(Number),
+    });
+    const oldOwner = await app.inject({ method: 'PATCH', url: '/api/dm/transfer-setting', payload: { membersCanInvite: true } });
+    expect(oldOwner.statusCode).toBe(403);
+    expect(testDb.select().from(schema.dmChannels).where(eq(schema.dmChannels.id, 'transfer-setting')).get()?.membersCanInvite).toBe(false);
+    currentUserId = 'member-B';
+    const newOwner = await app.inject({ method: 'PATCH', url: '/api/dm/transfer-setting', payload: { membersCanInvite: true } });
+    expect(newOwner.statusCode).toBe(200);
+  });
+
+  it('uses a monotonic version even when two changes share a millisecond', async () => {
+    seedGroupDm({ id: 'same-ms', ownerId: 'owner-A', members: ['owner-A', 'member-B'], metadataUpdatedAt: Date.now() + 60_000 });
+    const initial = testDb.select().from(schema.dmChannels).where(eq(schema.dmChannels.id, 'same-ms')).get()!;
+    const res = await app.inject({ method: 'PATCH', url: '/api/dm/same-ms', payload: { membersCanInvite: false } });
+    expect(res.json().metadataUpdatedAt).toBe(initial.metadataUpdatedAt + 1);
+  });
+
   it('owner rename succeeds → 200, channel updated, broadcast, system msg, outbox payload', async () => {
     seedGroupDm({
       id: 'dm-1',

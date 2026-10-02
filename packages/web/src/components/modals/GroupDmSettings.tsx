@@ -6,11 +6,11 @@ import { ImageCropModal } from '../ui/ImageCropModal';
 import { ConfirmDialog } from '../ui/ConfirmDialog';
 import { useUIStore } from '../../stores/uiStore';
 import { useSpaceStore, getChannelOrigin } from '../../stores/spaceStore';
-import { isDmOwner } from '../../utils/dmPermissions';
+import { canAddDmMembers } from '../../utils/dmPermissions';
+import { useGroupDmMetadataDraft } from '../../hooks/useGroupDmMetadataDraft';
+import { Toggle } from '../ui/Toggle';
 import { useAuthStore } from '../../stores/authStore';
 import { useSocialStore } from '../../stores/socialStore';
-import { useTransferStore } from '../../stores/transferStore';
-import { waitForTransferAttachment } from '../../utils/waitForTransfer';
 import { api } from '../../api/client';
 import { isSelf, parseFederatedUsername } from '../../utils/identity';
 import { AvatarStack } from '../ui/AvatarStack';
@@ -37,7 +37,7 @@ type Tab = 'overview' | 'members';
  *
  * Save flow:
  *   1. If an icon blob is staged, upload it via transferStore.
- *   2. Build PATCH body with ONLY changed fields (name and/or icon).
+ *   2. Build PATCH body with ONLY changed fields (name, icon and/or member invitation permission).
  *      Cleared icon → `icon: null`.
  *   3. `api.dm.updateMetadata(channelId, body)` then close the modal.
  * Cancel discards the staged blob; no upload fires.
@@ -74,21 +74,11 @@ export function GroupDmSettings() {
     }
   }, [isOpen, initialTab]);
 
-  // ── Overview state ─────────────────────────────────────────────────────
-  // `iconState`:
-  //   'unchanged' — nothing staged; current dm.icon is in effect
-  //   'cleared'   — owner clicked the X; will PATCH `icon: null`
-  //   { blob, previewUrl } — owner cropped a fresh blob; deferred upload
-  type IconState =
-    | { kind: 'unchanged' }
-    | { kind: 'cleared' }
-    | { kind: 'staged'; blob: Blob; previewUrl: string };
-
-  const [name, setName] = useState('');
-  const [iconState, setIconState] = useState<IconState>({ kind: 'unchanged' });
-  const [cropSrc, setCropSrc] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
-  const [saveError, setSaveError] = useState('');
+  const {
+    name, setName, trimmedName, membersCanInvite, setMembersCanInvite,
+    cropSrc, closeCrop, saving, saveError, isOwner, isDirty, previewIconUrl,
+    readIcon, stageIcon, clearIcon, discard, save,
+  } = useGroupDmMetadataDraft(dmChannel, isOpen, 'modal', closeModal);
   const [confirmLeave, setConfirmLeave] = useState(false);
   const [leaving, setLeaving] = useState(false);
   // Member-action confirmation state lives at the same level as the rest of
@@ -99,34 +89,15 @@ export function GroupDmSettings() {
   const [memberActionSubmitting, setMemberActionSubmitting] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Reset overview state when the modal opens or the underlying channel changes.
-  // Revoking previously-staged preview URLs prevents memory leaks across opens.
   useEffect(() => {
-    if (!isOpen || !dmChannel) return;
-    setName(dmChannel.name ?? '');
-    setIconState((prev) => {
-      if (prev.kind === 'staged') URL.revokeObjectURL(prev.previewUrl);
-      return { kind: 'unchanged' };
-    });
-    setSaveError('');
     setConfirmLeave(false);
-  }, [isOpen, dmChannel?.id, dmChannel?.name]);
-
-  // Final cleanup: revoke any lingering preview URL on unmount.
-  useEffect(() => {
-    return () => {
-      setIconState((prev) => {
-        if (prev.kind === 'staged') URL.revokeObjectURL(prev.previewUrl);
-        return prev;
-      });
-    };
-  }, []);
+    setPendingKick(null);
+    setPendingTransfer(null);
+  }, [isOpen, modalData]);
 
   if (!isOpen || !dmChannel || !dmChannelId) return null;
   // Group DMs only: this modal is meaningless for 1-on-1 conversations.
   if (!dmChannel.ownerId) return null;
-
-  const isOwner = isDmOwner(dmChannel, authUser, getChannelOrigin(dmChannel.id));
 
   const otherMembers: User[] = authUser
     ? dmChannel.members.filter((m) => !isSelf(m, authUser))
@@ -136,101 +107,23 @@ export function GroupDmSettings() {
     .map((m) => m.displayName ?? parseFederatedUsername(m.username).baseName)
     .join(', ');
 
-  const currentName = dmChannel.name ?? '';
-  const trimmedName = name.trim();
-  const nameDirty = trimmedName !== currentName.trim();
-  const iconDirty = iconState.kind !== 'unchanged';
-  const isDirty = nameDirty || iconDirty;
-
-  // What the AvatarStack should show: staged preview > cleared (=no icon) >
-  // current dm.icon. Passing `null` falls through to the member-tile layout.
-  const previewIconUrl: string | null | undefined =
-    iconState.kind === 'staged'
-      ? iconState.previewUrl
-      : iconState.kind === 'cleared'
-        ? null
-        : (dmChannel.icon ?? null);
-
   // ── Icon handlers ──────────────────────────────────────────────────────
   const handleHeroClick = () => {
-    if (!isOwner) return;
+    if (!isOwner || saving) return;
     fileInputRef.current?.click();
   };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => setCropSrc(reader.result as string);
-    reader.readAsDataURL(file);
+    readIcon(file);
     // Reset so picking the same file again re-fires onChange.
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
-  const handleCropComplete = (blob: Blob) => {
-    setIconState((prev) => {
-      if (prev.kind === 'staged') URL.revokeObjectURL(prev.previewUrl);
-      const previewUrl = URL.createObjectURL(blob);
-      return { kind: 'staged', blob, previewUrl };
-    });
-    setCropSrc(null);
-  };
-
-  const handleClearIcon = () => {
-    if (!isOwner) return;
-    setIconState((prev) => {
-      if (prev.kind === 'staged') URL.revokeObjectURL(prev.previewUrl);
-      return { kind: 'cleared' };
-    });
-  };
-
-  // ── Save / Cancel / Leave ──────────────────────────────────────────────
   const handleCancel = () => {
-    // Discard staged blob (no upload fired) and close.
-    setIconState((prev) => {
-      if (prev.kind === 'staged') URL.revokeObjectURL(prev.previewUrl);
-      return { kind: 'unchanged' };
-    });
+    discard();
     closeModal();
-  };
-
-  const handleSave = async () => {
-    if (!isOwner || !isDirty || saving) return;
-    setSaving(true);
-    setSaveError('');
-    try {
-      const body: { name?: string | null; icon?: string | null } = {};
-
-      if (nameDirty) {
-        // Trimmed, enforced to MAX_NAME_LENGTH client-side; server re-validates.
-        body.name = trimmedName.slice(0, MAX_NAME_LENGTH);
-      }
-
-      if (iconState.kind === 'cleared') {
-        body.icon = null;
-      } else if (iconState.kind === 'staged') {
-        // Defer-to-save upload: only fires when the user commits the change.
-        const file = new File([iconState.blob], 'dm-icon.webp', {
-          type: iconState.blob.type || 'image/webp',
-        });
-        const tid = await useTransferStore.getState().startUpload(file, {
-          tray: false,
-        });
-        const { filename } = await waitForTransferAttachment(tid);
-        body.icon = filename;
-      }
-
-      await api.dm.updateMetadata(dmChannelId, body);
-      // Mirror SpaceSettings save behavior: close the modal. The WS broadcast
-      // (`dm_channel_updated`) updates the open channel in-place.
-      closeModal();
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : t('dm:groupSettings.saveFailed');
-      setSaveError(msg);
-      addToast(msg, 'warning', 4000);
-    } finally {
-      setSaving(false);
-    }
   };
 
   const handleLeaveClick = () => {
@@ -258,6 +151,7 @@ export function GroupDmSettings() {
 
   const memberCount = dmChannel.members.length;
   const remainingSlots = MAX_GROUP_MEMBERS - memberCount;
+  const mayInvite = canAddDmMembers(dmChannel, authUser, getChannelOrigin(dmChannel.id));
   const canAddMembers = remainingSlots > 0;
 
   // Per-member action handler. The kebab is hidden in this view, but right-click
@@ -362,7 +256,7 @@ export function GroupDmSettings() {
           <button
             type="button"
             onClick={handleHeroClick}
-            disabled={!isOwner}
+            disabled={!isOwner || saving}
             data-group-dm-icon-hero
             aria-label={isOwner ? t('dm:groupSettings.changeIcon') : t('dm:groupSettings.icon')}
             className={`relative block rounded-full overflow-hidden group ${
@@ -394,7 +288,7 @@ export function GroupDmSettings() {
           {isOwner && previewIconUrl && (
             <button
               type="button"
-              onClick={handleClearIcon}
+              onClick={clearIcon}
               data-group-dm-icon-clear
               aria-label={t('dm:groupSettings.removeIcon')}
               className="absolute -top-1 -right-1 w-6 h-6 rounded-full bg-surface-elevated border border-border-hard flex items-center justify-center text-txt-tertiary hover:text-txt-danger hover:bg-accent-rose/10 transition-colors"
@@ -427,7 +321,7 @@ export function GroupDmSettings() {
           value={name}
           onChange={(e) => setName(e.target.value.slice(0, MAX_NAME_LENGTH))}
           placeholder={fallbackName || t('dm:names.groupFallback')}
-          disabled={!isOwner}
+          disabled={!isOwner || saving}
           maxLength={MAX_NAME_LENGTH}
           className="input-standard w-full"
           data-group-dm-name-input
@@ -438,6 +332,19 @@ export function GroupDmSettings() {
             {t('dm:groupSettings.nameCount', { current: trimmedName.length, max: MAX_NAME_LENGTH })}
           </div>
         )}
+      </div>
+
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <p className="text-sm font-medium text-txt-primary">{t('dm:groupSettings.membersCanInviteLabel')}</p>
+          <p className="mt-1 text-xs text-txt-tertiary">{t('dm:groupSettings.membersCanInviteDescription')}</p>
+        </div>
+        <Toggle
+          enabled={membersCanInvite}
+          onChange={setMembersCanInvite}
+          disabled={!isOwner || saving}
+          ariaLabel={t('dm:groupSettings.membersCanInviteLabel')}
+        />
       </div>
 
       {saveError && (
@@ -459,7 +366,7 @@ export function GroupDmSettings() {
           </button>
           <button
             type="button"
-            onClick={handleSave}
+            onClick={save}
             disabled={!isDirty || saving}
             className="px-4 py-1.5 bg-accent-primary hover:bg-accent-primary/80 text-white text-sm font-medium rounded-full transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             data-group-dm-save
@@ -524,7 +431,7 @@ export function GroupDmSettings() {
         </span>
       </div>
 
-      {isOwner && (
+      {mayInvite && (
         <button
           type="button"
           onClick={() => useUIStore.getState().openModal('addDmMember', { dmChannelId })}
@@ -571,7 +478,7 @@ export function GroupDmSettings() {
   );
 
   return (
-    <Modal isOpen={isOpen} onClose={closeModal} size="settings" mobileStyle="fullscreen">
+    <Modal isOpen={isOpen} onClose={handleCancel} size="settings" mobileStyle="fullscreen">
       <div className="flex h-full">
         {/* Desktop sidebar */}
         <div className="hidden desktop:flex w-52 flex-shrink-0 flex-col p-4 gap-3">
@@ -658,9 +565,9 @@ export function GroupDmSettings() {
       {/* Image cropper for new icons (1:1 ratio, matches space-icon convention) */}
       <ImageCropModal
         isOpen={cropSrc !== null}
-        onClose={() => setCropSrc(null)}
+        onClose={closeCrop}
         imageSrc={cropSrc ?? ''}
-        onCropComplete={handleCropComplete}
+        onCropComplete={stageIcon}
         title={t('dm:groupSettings.cropTitle')}
         cropShape="round"
         aspectRatio={1}

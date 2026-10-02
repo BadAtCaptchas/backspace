@@ -63,6 +63,8 @@ export function normalizeCategoryName(name: string): string {
 
 // ─── Group DM Constants ──────────────────────────────────────────────────────
 
+/** Maximum group size, including the owner. */
+export const GROUP_DM_MAX_MEMBERS = 10;
 export const GROUP_DM_NAME_MAX_LENGTH = 50;
 export const GROUP_DM_NAME_MIN_LENGTH = 1;
 export const GROUP_DM_ICON_MAX_BYTES = 8 * 1024 * 1024; // 8 MB

@@ -1184,8 +1184,8 @@ function handleEvent(origin: string, event: ServerEvent): void {
 
     case 'dm_channel_updated': {
       if (!isHome && !activePeerOrigins.has(origin)) break;
-      const { dmChannelId, name, icon } = event;
-      useSpaceStore.getState().updateDmMetadata(dmChannelId, { name, icon });
+      const { dmChannelId, name, icon, membersCanInvite } = event;
+      useSpaceStore.getState().updateDmMetadata(dmChannelId, { name, icon, membersCanInvite });
       break;
     }
 

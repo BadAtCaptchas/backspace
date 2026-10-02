@@ -17,6 +17,7 @@ type TestDb = ReturnType<typeof drizzle<typeof schema>>;
 let sqlite: Database.Database;
 let testDb: TestDb;
 let currentUserId = 'owner-A';
+let federationEnabled = false;
 
 vi.mock('../db/index.js', () => ({
   getDb: () => testDb,
@@ -48,7 +49,9 @@ vi.mock('../utils/federationOutbox.js', async () => {
   const actual = await vi.importActual<typeof import('../utils/federationOutbox.js')>('../utils/federationOutbox.js');
   return {
     ...actual,
-    isFederationRelayEnabled: () => false,
+    isFederationRelayEnabled: () => federationEnabled,
+    appendMutationLog: vi.fn(),
+    queueOutboxEvent: vi.fn(),
     queueDmCloseRelay: vi.fn(),
     sendTypingRelay: vi.fn(),
     queueDmRelay: vi.fn(),
@@ -104,10 +107,11 @@ function seedFriendship(a: string, b: string): void {
   }).run();
 }
 
-function seedGroupDm(id: string): void {
+function seedGroupDm(id: string, membersCanInvite = true): void {
   testDb.insert(schema.dmChannels).values({
     id,
     ownerId: 'owner-A',
+    membersCanInvite,
     ownerHomeUserId: 'owner-A',
     ownerHomeInstance: 'https://local.test',
     createdAt: Date.now(),
@@ -138,6 +142,7 @@ describe('POST /api/dm/:id/members — group DM authorization', () => {
     seedFriendship('owner-A', 'target-C');
     seedFriendship('member-B', 'target-C');
     currentUserId = 'owner-A';
+    federationEnabled = false;
     vi.clearAllMocks();
     app = await buildApp();
   });
@@ -145,10 +150,11 @@ describe('POST /api/dm/:id/members — group DM authorization', () => {
   afterEach(async () => {
     await app.close();
     sqlite.close();
+    vi.restoreAllMocks();
   });
 
   it('rejects non-owner members before they can add friends to a private group DM', async () => {
-    seedGroupDm('dm-private');
+    seedGroupDm('dm-private', false);
     currentUserId = 'member-B';
 
     const res = await app.inject({
@@ -167,8 +173,109 @@ describe('POST /api/dm/:id/members — group DM authorization', () => {
     expect(membership).toBeUndefined();
   });
 
+  it.each([true, false])('rejects outsiders regardless of membersCanInvite=%s', async (enabled) => {
+    seedGroupDm('outsider', enabled);
+    currentUserId = 'target-C';
+    const res = await app.inject({ method: 'POST', url: '/api/dm/outsider/members', payload: { userId: 'target-C' } });
+    expect(res.statusCode).toBe(403);
+    expect(res.json().code).toBe('not_dm_member');
+  });
+
+  it('allows a member to invite a friend by default and serializes the permission', async () => {
+    seedGroupDm('open-group');
+    currentUserId = 'member-B';
+    const res = await app.inject({ method: 'POST', url: '/api/dm/open-group/members', payload: { userId: 'target-C' } });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().membersCanInvite).toBe(true);
+    expect(res.json().members.map((member: { id: string }) => member.id)).toContain('target-C');
+  });
+
+  it('ignores an invitation request trying to override the stored permission', async () => {
+    seedGroupDm('closed-group', false);
+    currentUserId = 'member-B';
+    const res = await app.inject({ method: 'POST', url: '/api/dm/closed-group/members', payload: { userId: 'target-C', membersCanInvite: true } });
+    expect(res.statusCode).toBe(403);
+    expect(testDb.select().from(schema.dmChannels).where(eq(schema.dmChannels.id, 'closed-group')).get()?.membersCanInvite).toBe(false);
+  });
+
+  it('still checks friendship when member invites are enabled', async () => {
+    seedGroupDm('no-friend');
+    testDb.delete(schema.friends).run();
+    currentUserId = 'member-B';
+    const res = await app.inject({ method: 'POST', url: '/api/dm/no-friend/members', payload: { userId: 'target-C' } });
+    expect(res.statusCode).toBe(403);
+    expect(res.json().code).toBe('not_a_friend');
+  });
+
+  it('lets the owner invite while member invites are disabled', async () => {
+    seedGroupDm('owner-only', false);
+    const res = await app.inject({ method: 'POST', url: '/api/dm/owner-only/members', payload: { userId: 'target-C' } });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().membersCanInvite).toBe(false);
+  });
+
+  it.each(['permission', 'membership'])('rechecks %s after remote target resolution', async (change) => {
+    seedGroupDm('awaiting-resolution');
+    currentUserId = 'member-B';
+    const identity = await import('../utils/federationClientIdentity.js');
+    const target = testDb.select().from(schema.users).where(eq(schema.users.id, 'target-C')).get()!;
+    let resolveTarget!: (value: typeof target) => void;
+    const waiting = new Promise<typeof target>((resolve) => { resolveTarget = resolve; });
+    const resolver = vi.spyOn(identity, 'resolveRemoteIdentityForClient').mockReturnValueOnce(waiting);
+    const pending = app.inject({ method: 'POST', url: '/api/dm/awaiting-resolution/members', payload: { homeUserId: 'target-C', homeInstance: 'https://remote.test' } }).then(result => result);
+    await vi.waitFor(() => expect(resolver).toHaveBeenCalled());
+    if (change === 'permission') {
+      testDb.update(schema.dmChannels).set({ membersCanInvite: false }).where(eq(schema.dmChannels.id, 'awaiting-resolution')).run();
+    } else {
+      testDb.delete(schema.dmMembers).where(and(eq(schema.dmMembers.dmChannelId, 'awaiting-resolution'), eq(schema.dmMembers.userId, 'member-B'))).run();
+    }
+    resolveTarget(target);
+    const response = await pending;
+    expect(response.statusCode).toBe(403);
+    expect(response.json().code).toBe(change === 'permission' ? 'dm_owner_only' : 'not_dm_member');
+    expect(testDb.select().from(schema.dmMembers).where(and(eq(schema.dmMembers.dmChannelId, 'awaiting-resolution'), eq(schema.dmMembers.userId, target.id))).get()).toBeUndefined();
+  });
+
+  it('rejects a duplicate member even when members may invite', async () => {
+    seedGroupDm('duplicate');
+    testDb.insert(schema.dmMembers).values({ dmChannelId: 'duplicate', userId: 'target-C' }).run();
+    currentUserId = 'member-B';
+    const res = await app.inject({ method: 'POST', url: '/api/dm/duplicate/members', payload: { userId: 'target-C' } });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().code).toBe('already_member');
+  });
+
+  it('enforces the capacity limit for enabled member invitations', async () => {
+    seedGroupDm('full');
+    for (let i = 0; i < 8; i++) {
+      seedUser(`extra-${i}`, `extra-${i}`);
+      testDb.insert(schema.dmMembers).values({ dmChannelId: 'full', userId: `extra-${i}` }).run();
+    }
+    currentUserId = 'member-B';
+    const res = await app.inject({ method: 'POST', url: '/api/dm/full/members', payload: { userId: 'target-C' } });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().code).toBe('group_dm_too_many_members');
+  });
+
+  it('relays the actual owner when a member adds from a legacy copy without owner home fields', async () => {
+    seedGroupDm('legacy-owner');
+    federationEnabled = true;
+    currentUserId = 'member-B';
+    testDb.update(schema.dmChannels).set({ federatedId: 'group-legacy', ownerHomeUserId: null, ownerHomeInstance: null }).where(eq(schema.dmChannels.id, 'legacy-owner')).run();
+    testDb.update(schema.users).set({ homeInstance: 'https://remote.test' }).where(eq(schema.users.id, 'target-C')).run();
+    const res = await app.inject({ method: 'POST', url: '/api/dm/legacy-owner/members', payload: { userId: 'target-C' } });
+    expect(res.statusCode).toBe(200);
+    const { queueOutboxEvent } = await import('../utils/federationOutbox.js');
+    const memberAdd = vi.mocked(queueOutboxEvent).mock.calls.find(call => call[2] === 'member_add');
+    expect(memberAdd).toBeDefined();
+    const payload = JSON.parse(memberAdd![3]!);
+    expect(payload.group.owner).toEqual({ homeUserId: 'owner-A', homeInstance: 'https://local.test' });
+    expect(payload.group.membersCanInvite).toBe(true);
+    expect(payload.membership.addedBy.homeUserId).toBe('member-B');
+  });
+
   it('uses the current owner after ownership changes', async () => {
-    seedGroupDm('dm-transferred');
+    seedGroupDm('dm-transferred', false);
     testDb.update(schema.dmChannels).set({ ownerId: 'member-B' })
       .where(eq(schema.dmChannels.id, 'dm-transferred')).run();
 

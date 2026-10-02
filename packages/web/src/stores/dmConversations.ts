@@ -248,6 +248,7 @@ function completeChannel(sent: PeerDmChannel, previous: DmCopy | undefined, fede
     name: sentOr(sent.name, known?.name),
     icon: sentOr(sent.icon, known?.icon),
     lastMessage: sentOr(sent.lastMessage, known?.lastMessage),
+    membersCanInvite: sent.membersCanInvite ?? known?.membersCanInvite ?? true,
     metadataUpdatedAt: sent.metadataUpdatedAt ?? known?.metadataUpdatedAt ?? 0,
   };
 }
@@ -364,6 +365,7 @@ export function upsertUnplacedCopy(
     name: null,
     icon: null,
     metadataUpdatedAt: 0,
+    membersCanInvite: true,
     createdAt: message.createdAt,
     members: message.user ? [message.user] : [],
     lastMessage: message,
