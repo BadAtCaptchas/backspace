@@ -1194,12 +1194,12 @@ After processing all events, the relay endpoint updates the peer's `lastSeenAt` 
 
 ### member_add (`processMemberAddEvent` -- `federation.ts:1618`)
 
-**Required fields:** `event.federatedId`, `event.membership.user`
+**Required fields:** `event.federatedId`, `event.membership.user`, `event.membership.addedBy`
 
 **Two paths:**
 
 **Bootstrap path** (channel does not exist locally by `federatedId`):
-1. Requires `event.group` metadata (owner + full member roster + group metadata snapshot). The owner is required, must pass `attributionRefusal`, must be in the resolved roster, and the signing peer must be one of the roster's instances (`mayRelayInto`); else `invalid_target` and nothing is created. See `dm-system.md` "Relayed member adds"
+1. Requires `event.group` metadata (owner + full member roster + group metadata snapshot). The owner is required and must match `membership.addedBy` by home identity. The adder must pass `attributionRefusal` before any writes, the owner must be in the resolved roster, and the signing peer must be one of the roster's instances (`mayRelayInto`); else `invalid_target` and nothing is created. See `dm-system.md` "Relayed member adds"
 2. Creates `dm_channels` row with `federatedId`, `ownerId` (resolved via `resolveOrCreateReplicatedUser`), `ownerHomeUserId`, `ownerHomeInstance`, plus the bootstrap `name`, `icon`, and `metadataUpdatedAt` from `event.group`
 3. When `event.group.icon` is non-null, mirrors `processGroupMetadataUpdateEvent` and calls `downloadProfileAsset(icon, sourceInstance)` — stores the local bare filename on success or the absolute URL on failure
 4. Adds ALL roster members from `event.group.members` (each resolved via `resolveOrCreateReplicatedUser`)
@@ -1224,7 +1224,7 @@ interface FederationGroupPayload {
 Older peers that omit these fields fall back to safe defaults (null name/icon, `metadataUpdatedAt = 0`). Receivers never re-relay these fields — only the owner's home instance authors `group_metadata_update` events.
 
 **Incremental path** (channel already exists):
-1. Validates authority: `attributionRefusal` on `membership.addedBy`, then the channel must be a group (`ownerId` set; else `invalid_target`), and the adder must be a current member of this instance's copy with the signing peer one of its relay target origins before the add (`mayRelayInto`); else `unauthorized_source`. Any member may add, from any instance the group is relayed to; the owner's instance is not required. See `dm-system.md` "Relayed member adds".
+1. Validates authority: `attributionRefusal` on `membership.addedBy`, then the channel must be a group (`ownerId` set; else `invalid_target`), and the adder must be the current owner and a member of this instance's copy with the signing peer one of its relay target origins before the add (`mayRelayInto`); else `unauthorized_source`. Only the current owner may add. Existing attribution rules still permit an authenticated homeward relay from a conversation peer where that owner has proven federated presence. See `dm-system.md` "Relayed member adds".
 2. Cancels soft-delete if channel was pending GC
 3. Resolves added user via `resolveOrCreateReplicatedUser`
 4. Enforces max 10 members

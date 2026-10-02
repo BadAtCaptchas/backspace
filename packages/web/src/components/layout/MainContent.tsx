@@ -20,6 +20,7 @@ import { wsSend } from '../../hooks/useWebSocket';
 import { MemberListToggleButton } from './MemberListToggleButton';
 import { TransferIndicator } from './TransferIndicator';
 import { isSelf, isFederationGlobeApplicable, userDisplayName } from '../../utils/identity';
+import { canAddDmMembers } from '../../utils/dmPermissions';
 import { formatDmHeaderName, formatDmInputLabel, isDeletedPartnerDm } from '../../utils/dmFormatters';
 import { DmDeletedNotice } from '../chat/DmDeletedNotice';
 import { useCanonicalUserView } from '../../utils/userViewLookup';
@@ -386,15 +387,17 @@ export function MainContent() {
                 <path d="M21 6.5l-4 4V7c0-.55-.45-1-1-1H9.82L21 17.18V6.5zM3.27 2L2 3.27 4.73 6H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.21 0 .39-.08.54-.18L19.73 21 21 19.73 3.27 2z" />
               </svg>
             </button>
-            <button
-              onClick={() => openModal('addDmMember', { dmChannelId: currentChannelId })}
-              className="w-8 h-8 flex items-center justify-center text-txt-tertiary hover:text-txt-primary transition-colors rounded-[6px] hover:bg-interactive-hover"
-              title={t('spaces:main.dm.addFriends')}
-            >
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
-                <path d="M14 8.00598C14 10.211 12.206 12.006 10 12.006C7.795 12.006 6 10.211 6 8.00598C6 5.80098 7.794 4.00598 10 4.00598C12.206 4.00598 14 5.80098 14 8.00598ZM2 19.006C2 15.473 5.29 13.006 10 13.006C14.711 13.006 18 15.473 18 19.006V20.006H2V19.006ZM20 20.006H22V19.006C22 16.451 20.178 14.471 17.532 13.471C19.461 14.601 20 16.561 20 19.006V20.006Z" />
-              </svg>
-            </button>
+            {canAddDmMembers(dmChannel, authUser, getChannelOrigin(currentChannelId)) && (
+              <button
+                onClick={() => openModal('addDmMember', { dmChannelId: currentChannelId })}
+                className="w-8 h-8 flex items-center justify-center text-txt-tertiary hover:text-txt-primary transition-colors rounded-[6px] hover:bg-interactive-hover"
+                title={t('spaces:main.dm.addFriends')}
+              >
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+                  <path d="M14 8.00598C14 10.211 12.206 12.006 10 12.006C7.795 12.006 6 10.211 6 8.00598C6 5.80098 7.794 4.00598 10 4.00598C12.206 4.00598 14 5.80098 14 8.00598ZM2 19.006C2 15.473 5.29 13.006 10 13.006C14.711 13.006 18 15.473 18 19.006V20.006H2V19.006ZM20 20.006H22V19.006C22 16.451 20.178 14.471 17.532 13.471C19.461 14.601 20 16.561 20 19.006V20.006Z" />
+                </svg>
+              </button>
+            )}
             <button
               ref={searchButtonRef}
               onClick={() => setSearchOpen(!searchOpen)}

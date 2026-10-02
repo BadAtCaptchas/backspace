@@ -41,7 +41,7 @@ vi.setConfig({ testTimeout: 30_000 });
  * sender is one of the instances the roster lives on. A `member_add` for a
  * group it already holds is incremental, and is applied only when
  *   - the conversation is a group (1-on-1s have a fixed pair),
- *   - the adder is a current member of this instance's copy, and
+ *   - the adder is the current owner of this instance's copy, and
  *   - the sending instance is one this instance relays the group to, judged on
  *     the roster before the add.
  * A kick (`member_remove` with a reason other than leave) and an
@@ -196,7 +196,7 @@ describe('federation e2e — legitimate member_add events are applied', () => {
     expect(channelByFederatedId(B, groupFid)).toBeUndefined();
 
     // One event per remote member; the first finds no channel and bootstraps
-    // it from the roster, the second is an incremental add from a member.
+    // it from the roster, the second is an incremental add from the owner.
     const adds = queuedOnce(A, groupOnA, 'member_add');
     expect(adds).toHaveLength(2);
     const res = await relayToB(adds);
@@ -206,7 +206,21 @@ describe('federation e2e — legitimate member_add events are applied', () => {
     );
   });
 
-  it('a member adding someone through the sending instance is applied', async () => {
+  it('accepts bootstrap and incremental adds by an owner acting through a proven federated account', async () => {
+    const [group, fid] = await groupDelivered(A, daveOnA, [
+      { id: carol.id },
+      { id: rowFor(A, bob.id), homeUserId: bob.id, homeInstance: B.domain },
+    ], relayToB);
+    expect(channelRowOnB(onB(fid)).ownerId).toBe(dave.id);
+
+    befriend(A, daveOnA.id, [rowFor(A, erin.id)]);
+    await postAs(A, daveOnA.token, `/api/dm/${group}/members`, { userId: rowFor(A, erin.id) });
+    const add = queuedOnce(A, group, 'member_add').find(e => e.membership?.user.homeUserId === erin.id)!;
+    expect((await relayToB([add])).body?.accepted).toContain(add.messageId);
+    expect(memberIds(B, onB(fid))).toContain(erin.id);
+  });
+
+  it('the owner adding someone through the sending instance is applied', async () => {
     const add = await aliceAddsErin();
     const res = await relayToB([add]);
     expect(res.body?.accepted).toContain(add.messageId);
@@ -215,6 +229,56 @@ describe('federation e2e — legitimate member_add events are applied', () => {
 });
 
 describe('federation e2e — a member_add is refused unless the adder may add to that group', () => {
+  it('refuses a non-owner member even when the signed peer may speak for them', async () => {
+    const before = memberIds(B, onB(groupFid));
+    const event = reaimed(await aliceAddsErin(), {
+      membership: { user: identity(dave, B), addedBy: identity(carol, A) },
+      // An incremental payload cannot replace the locally recorded owner.
+      group: { ...(await aliceAddsErin()).group!, owner: identity(carol, A) },
+    });
+
+    const res = await relayToB([event]);
+    expect(rejectionReason(res, event.messageId)).toBe('unauthorized_source');
+    expect(memberIds(B, onB(groupFid))).toEqual(before);
+    expect(channelRowOnB(onB(groupFid)).ownerId).toBe(rowFor(B, alice.id));
+  });
+
+  it('does not accept an owner id attributed to a different home instance', async () => {
+    const before = memberIds(B, onB(groupFid));
+    const event = reaimed(await aliceAddsErin(), {
+      membership: { user: identity(dave, B), addedBy: { homeUserId: alice.id, homeInstance: identityOrigin(C) } },
+    });
+    expect(rejectionReason(await relayToB([event]), event.messageId)).toBe('attribution_mismatch');
+    expect(memberIds(B, onB(groupFid))).toEqual(before);
+  });
+
+  it('refuses an incremental add with no actor', async () => {
+    const before = memberIds(B, onB(groupFid));
+    const event = reaimed(await aliceAddsErin(), { membership: { user: identity(dave, B) } });
+    expect(rejectionReason(await relayToB([event]), event.messageId)).toBe('attribution_mismatch');
+    expect(memberIds(B, onB(groupFid))).toEqual(before);
+  });
+
+  it('authorizes the new owner after transfer and refuses the former owner', async () => {
+    const [group, fid] = await groupDelivered(A, alice, [
+      { id: carol.id },
+      { id: rowFor(A, bob.id), homeUserId: bob.id, homeInstance: B.domain },
+    ], relayToB);
+    await postAs(A, alice.token, `/api/dm/${group}/transfer`, { newOwnerId: carol.id });
+    const transfer = queuedOnce(A, group, 'ownership_transfer')[0]!;
+    expect((await relayToB([transfer])).body?.accepted).toContain(transfer.messageId);
+    const before = memberIds(B, onB(fid));
+    const stale = reaimed(await aliceAddsErin(), { federatedId: fid });
+    expect(rejectionReason(await relayToB([stale]), stale.messageId)).toBe('unauthorized_source');
+    expect(memberIds(B, onB(fid))).toEqual(before);
+
+    befriend(A, carol.id, [rowFor(A, erin.id)]);
+    await postAs(A, carol.token, `/api/dm/${group}/members`, { userId: rowFor(A, erin.id) });
+    const added = queuedOnce(A, group, 'member_add').find(e => e.membership?.user.homeUserId === erin.id)!;
+    expect((await relayToB([added])).body?.accepted).toContain(added.messageId);
+    expect(memberIds(B, onB(fid))).toContain(erin.id);
+  });
+
   it('refuses an add by someone who is not a member of the group, and leaves the roster as it was', async () => {
     const before = memberIds(B, onB(carolGroupFid));
     const event = reaimed(await aliceAddsErin(), {
@@ -267,6 +331,26 @@ describe('federation e2e — a member_add is refused unless the adder may add to
 });
 
 describe('federation e2e — a bootstrap is refused unless its owner is in the roster and the sender is one of its instances', () => {
+  it('refuses a bootstrap by a non-owner before creating the channel or roster', async () => {
+    const add = await aliceAddsErin();
+    const fid = freshFid('non-owner');
+    const event = reaimed(add, {
+      federatedId: fid,
+      membership: { user: identity(erin, B), addedBy: identity(carol, A) },
+    });
+    const res = await relayToB([event]);
+    expect(rejectionReason(res, event.messageId)).toBe('invalid_target');
+    expect(channelByFederatedId(B, fid)).toBeUndefined();
+  });
+
+  it('refuses a bootstrap with no actor before creating the channel or roster', async () => {
+    const add = await aliceAddsErin();
+    const fid = freshFid('no-actor');
+    const event = reaimed(add, { federatedId: fid, membership: { user: identity(erin, B) } });
+    expect(rejectionReason(await relayToB([event]), event.messageId)).toBe('attribution_mismatch');
+    expect(channelByFederatedId(B, fid)).toBeUndefined();
+  });
+
   it('refuses a bootstrap that names no owner, and creates no group', async () => {
     const add = await aliceAddsErin();
     const fid = freshFid('ownerless');

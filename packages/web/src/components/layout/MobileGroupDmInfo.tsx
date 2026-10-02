@@ -2,7 +2,8 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { DmChannel, User } from '@backspace/shared';
 import { useUIStore } from '../../stores/uiStore';
-import { useSpaceStore } from '../../stores/spaceStore';
+import { useSpaceStore, getChannelOrigin } from '../../stores/spaceStore';
+import { isDmOwner } from '../../utils/dmPermissions';
 import { useAuthStore } from '../../stores/authStore';
 import { useSocialStore } from '../../stores/socialStore';
 import { useTransferStore } from '../../stores/transferStore';
@@ -154,7 +155,7 @@ export function MobileGroupDmInfo({ params }: MobileGroupDmInfoProps) {
     );
   }
 
-  const isOwner = !!authUser && dmChannel.ownerId === authUser.id;
+  const isOwner = isDmOwner(dmChannel, authUser, getChannelOrigin(dmChannel.id));
 
   const otherMembers: User[] = authUser
     ? dmChannel.members.filter((m) => !isSelf(m, authUser))
@@ -526,23 +527,25 @@ export function MobileGroupDmInfo({ params }: MobileGroupDmInfoProps) {
         </div>
 
         {/* ACTIONS ROW ──────────────────────────────────────────────────── */}
-        <div className="px-4 py-3 border-b border-border-soft">
-          <button
-            type="button"
-            onClick={() => channelId && openModal('addDmMember', { dmChannelId: channelId })}
-            disabled={!canAddMembers}
-            data-mobile-group-add-member
-            className="w-full flex items-center justify-center gap-2 px-3 py-2.5 rounded-md bg-accent-mint/10 hover:bg-accent-mint/20 text-accent-mint text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-              <path d="M12 5v14M5 12h14" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
-            </svg>
-            {t('dm:groupSettings.addMember')}
-            {!canAddMembers && (
-              <span className="text-[11px] text-txt-tertiary">{t('dm:groupSettings.groupFullSuffix')}</span>
-            )}
-          </button>
-        </div>
+        {isOwner && (
+          <div className="px-4 py-3 border-b border-border-soft">
+            <button
+              type="button"
+              onClick={() => channelId && openModal('addDmMember', { dmChannelId: channelId })}
+              disabled={!canAddMembers}
+              data-mobile-group-add-member
+              className="w-full flex items-center justify-center gap-2 px-3 py-2.5 rounded-md bg-accent-mint/10 hover:bg-accent-mint/20 text-accent-mint text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                <path d="M12 5v14M5 12h14" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+              </svg>
+              {t('dm:groupSettings.addMember')}
+              {!canAddMembers && (
+                <span className="text-[11px] text-txt-tertiary">{t('dm:groupSettings.groupFullSuffix')}</span>
+              )}
+            </button>
+          </div>
+        )}
 
         {/* MEMBERS LIST ─────────────────────────────────────────────────── */}
         <div className="p-3">

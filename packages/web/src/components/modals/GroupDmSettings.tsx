@@ -5,7 +5,8 @@ import { Modal } from '../ui/Modal';
 import { ImageCropModal } from '../ui/ImageCropModal';
 import { ConfirmDialog } from '../ui/ConfirmDialog';
 import { useUIStore } from '../../stores/uiStore';
-import { useSpaceStore } from '../../stores/spaceStore';
+import { useSpaceStore, getChannelOrigin } from '../../stores/spaceStore';
+import { isDmOwner } from '../../utils/dmPermissions';
 import { useAuthStore } from '../../stores/authStore';
 import { useSocialStore } from '../../stores/socialStore';
 import { useTransferStore } from '../../stores/transferStore';
@@ -30,7 +31,7 @@ type Tab = 'overview' | 'members';
  * Reads its target channel from `useUIStore.modalData.dmChannelId`. Optional
  * `initialTab` selects which tab opens first.
  *
- * Owner detection: `dmChannel.ownerId === currentUser.id` — local id compare.
+ * Owner detection compares the owner's home identity across instance copies.
  * Non-owners see read-only fields (icon click is a no-op, name input disabled,
  * Save button absent). "Leave Group" is enabled for everyone.
  *
@@ -125,7 +126,7 @@ export function GroupDmSettings() {
   // Group DMs only: this modal is meaningless for 1-on-1 conversations.
   if (!dmChannel.ownerId) return null;
 
-  const isOwner = !!authUser && dmChannel.ownerId === authUser.id;
+  const isOwner = isDmOwner(dmChannel, authUser, getChannelOrigin(dmChannel.id));
 
   const otherMembers: User[] = authUser
     ? dmChannel.members.filter((m) => !isSelf(m, authUser))
@@ -523,21 +524,23 @@ export function GroupDmSettings() {
         </span>
       </div>
 
-      <button
-        type="button"
-        onClick={() => useUIStore.getState().openModal('addDmMember', { dmChannelId })}
-        disabled={!canAddMembers}
-        data-group-dm-add-member
-        className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-md bg-accent-mint/10 hover:bg-accent-mint/20 text-accent-mint text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-      >
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-          <path d="M12 5v14M5 12h14" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
-        </svg>
-        {t('dm:groupSettings.addMember')}
-        {!canAddMembers && (
-          <span className="ml-auto text-[11px] text-txt-tertiary">{t('dm:groupSettings.groupFull')}</span>
-        )}
-      </button>
+      {isOwner && (
+        <button
+          type="button"
+          onClick={() => useUIStore.getState().openModal('addDmMember', { dmChannelId })}
+          disabled={!canAddMembers}
+          data-group-dm-add-member
+          className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-md bg-accent-mint/10 hover:bg-accent-mint/20 text-accent-mint text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+            <path d="M12 5v14M5 12h14" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+          </svg>
+          {t('dm:groupSettings.addMember')}
+          {!canAddMembers && (
+            <span className="ml-auto text-[11px] text-txt-tertiary">{t('dm:groupSettings.groupFull')}</span>
+          )}
+        </button>
+      )}
 
       <div data-group-dm-member-list className="space-y-0.5">
         {ownerMember && (

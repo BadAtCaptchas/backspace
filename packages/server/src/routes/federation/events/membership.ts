@@ -9,7 +9,7 @@ import { connectionManager } from '../../../ws/handler.js';
 import { GROUP_DM_NAME_MAX_LENGTH, GROUP_DM_NAME_MIN_LENGTH } from '@backspace/shared/src/constants.js';
 import { and, eq, or } from 'drizzle-orm';
 import type { DmMessageWithUser, FederationRelayEvent } from '@backspace/shared';
-import { extractDomain, resolveOrCreateReplicatedUser, resolveRelayActor, attributionRefusal } from '../identity.js';
+import { extractDomain, resolveOrCreateReplicatedUser, resolveRelayActor, attributionRefusal, sameRelayActor } from '../identity.js';
 import { downloadProfileAsset, processProfileUpdateEvent } from '../profile.js';
 import { dmChannelMembers, mayRelayInto, memberWithIdentity } from '../dmChannels.js';
 
@@ -43,6 +43,16 @@ export async function processMemberAddEvent(
     return;
   }
 
+  // Authenticate the acting identity before bootstrap can create a channel,
+  // roster, or replicated users. A valid peer signature alone is not consent
+  // from the owner, and every add (including bootstrap) must name its actor.
+  const addedBy = event.membership.addedBy;
+  const refusal = attributionRefusal(addedBy, sourceInstance, db);
+  if (refusal || !addedBy) {
+    rejected.push({ messageId: event.messageId, reason: refusal ?? 'attribution_mismatch' });
+    return;
+  }
+
   // Look up local channel by federated_id
   let channel = db
     .select()
@@ -64,10 +74,14 @@ export async function processMemberAddEvent(
       rejected.push({ messageId: event.messageId, reason: 'invalid_target' });
       return;
     }
-    const refusal = attributionRefusal(owner, sourceInstance, db);
-    if (refusal) {
-      console.warn(`[federation] Attribution refused (${refusal}) in member_add bootstrap: owner homeInstance=${extractDomain(owner.homeInstance)} source=${extractDomain(sourceInstance)}`);
-      rejected.push({ messageId: event.messageId, reason: refusal });
+    const ownerRefusal = attributionRefusal(owner, sourceInstance, db);
+    if (ownerRefusal) {
+      rejected.push({ messageId: event.messageId, reason: ownerRefusal });
+      return;
+    }
+    if (!sameRelayActor(owner, addedBy)) {
+      console.warn(`[federation] Refused member_add bootstrap of ${event.federatedId}: the adder is not the group owner`);
+      rejected.push({ messageId: event.messageId, reason: 'invalid_target' });
       return;
     }
 
@@ -139,26 +153,9 @@ export async function processMemberAddEvent(
     return;
   }
 
-  // Authority note: any HMAC-verified peer can relay member_add events.
-  // The HMAC signature proves the event came from a trusted peer.
-  // The attribution check below still validates that addedBy belongs to the source instance.
-
-  // Attribution: adder must belong to source instance (FED-010)
-  if (event.membership.addedBy) {
-    const refusal = attributionRefusal(event.membership.addedBy, sourceInstance, db);
-    if (refusal) {
-      console.warn(`[federation] Attribution refused (${refusal}) in member_add: addedBy homeInstance=${extractDomain(event.membership.addedBy.homeInstance)} source=${extractDomain(sourceInstance)}`);
-      rejected.push({ messageId: event.messageId, reason: refusal });
-      return;
-    }
-  }
-
-  // Incremental add: this instance already holds the group, so the add is
-  // judged against its copy ("Relayed member adds" in dm-system.md). A 1-on-1
-  // has a fixed pair; otherwise, like the local add route, the adder must be a
-  // current member, and the signing peer one of the origins this copy is
-  // relayed to before the add. A bootstrap is authorized above instead, by the
-  // owner's attribution.
+  // Incremental adds are authorized against this instance's recorded owner,
+  // never the untrusted group snapshot carried by the event. Keep the roster
+  // and source checks as well: an owner acts in a copy of their own group.
   if (!bootstrapped) {
     if (!channel.ownerId) {
       console.warn(`[federation] Refused member_add into 1-on-1 ${channel.id}`);
@@ -166,9 +163,9 @@ export async function processMemberAddEvent(
       return;
     }
     const members = dmChannelMembers(channel.id, db);
-    const adder = event.membership.addedBy ? memberWithIdentity(members, event.membership.addedBy) : undefined;
-    if (!adder || !mayRelayInto(members, adder.id, sourceInstance)) {
-      console.warn(`[federation] Refused member_add in group DM ${channel.id}: the adder is not a member, or ${extractDomain(sourceInstance)} is not a peer of the conversation`);
+    const adder = memberWithIdentity(members, addedBy);
+    if (!adder || adder.id !== channel.ownerId || !mayRelayInto(members, adder.id, sourceInstance)) {
+      console.warn(`[federation] Refused member_add in group DM ${channel.id}: the adder is not the current owner, or ${extractDomain(sourceInstance)} is not a peer of the conversation`);
       rejected.push({ messageId: event.messageId, reason: 'unauthorized_source' });
       return;
     }
