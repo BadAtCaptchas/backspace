@@ -30,7 +30,7 @@ Related specs: `docs/systems/federation.md` (wire protocol, outbox worker, peer 
 |----------|-----------|----------|
 | `ownerId` | `NULL` | Creator's local user ID (never NULL) |
 | `federatedId` format | 32-char hex (SHA-256 hash) | 36-char UUID (random) |
-| Mutable membership | No (immutable pair) | Yes (owner adds, anyone leaves) |
+| Mutable membership | No (immutable pair) | Yes (owner adds; members add when permitted; anyone leaves) |
 | Max members | 2 | 10 |
 | Friendship required | No | Yes (for new adds; exempt for existing DM members during 1-on-1 upgrade) |
 | Soft-close | Yes (`closed=1` on dm_members) | Yes (same) |
@@ -193,9 +193,9 @@ Close and reopen are relayed to all peer instances that hold a copy of the DM:
 **Validation:**
 1. Caller must be a member of the channel
 2. Channel must be a group DM (`ownerId` is not NULL)
-3. Caller must be the group owner (`ownerId`)
+3. Caller must be the group owner (`ownerId`) or the stored `membersCanInvite` setting must be true
 4. Target user must exist
-5. Owner and target must be friends
+5. Caller and target must be friends
 6. Target must not already be a member
 7. Current member count must be < 10
 
@@ -218,11 +218,11 @@ Close and reopen are relayed to all peer instances that hold a copy of the DM:
 
 **Endpoint:** `PATCH /api/dm/:id` -- `dm.ts:dmRoutes`
 
-Owner-only update of the group DM's `name` and/or `icon`. 1-on-1 DMs reject with 400; non-owners reject with 403.
+Owner-only update of the group DM's `name`, `icon`, and/or `membersCanInvite`. 1-on-1 DMs reject with 400; non-owners reject with 403.
 
-**Request:** `{ name?: string | null, icon?: string | null }`
+**Request:** `{ name?: string | null, icon?: string | null, membersCanInvite?: boolean }`
 
-Either field may be omitted (no-op for that field), null (clear), or a value. Empty/whitespace `name` collapses to null. `icon` accepts a bare attachment filename (must be owned by caller, image/*, ≤ `GROUP_DM_ICON_MAX_BYTES`) or an absolute http(s) URL (used by the federated rebroadcast path). When a value is provided that equals the stored value, no-op short-circuit returns 200 with no system message and no relay.
+`name` and `icon` may be omitted (no-op for that field), null (clear), or a value. `membersCanInvite` accepts only a boolean; omission preserves the stored value. Empty/whitespace `name` collapses to null. `icon` accepts a bare attachment filename (must be owned by caller, image/*, ≤ `GROUP_DM_ICON_MAX_BYTES`) or an absolute http(s) URL (used by the federated rebroadcast path). When a value is provided that equals the stored value, no-op short-circuit returns 200 with no system message and no relay.
 
 **Validation (origin instance):**
 - 1-on-1 DM (`ownerId` is NULL) -> 400
@@ -231,15 +231,15 @@ Either field may be omitted (no-op for that field), null (clear), or a value. Em
 - `icon` (when changing to a local filename): `attachments` row exists with `uploaderId === request.userId`, `mimetype` starts with `image/`, `size <= GROUP_DM_ICON_MAX_BYTES`. Absolute URL accepted as-is. Bare filename / `/api/uploads/<filename>` is normalized to bare filename.
 
 **Transaction:**
-1. Diff against current row. If neither field changed -> return 200 with current channel; emit nothing.
-2. Capture `metadataUpdatedAt = Date.now()` inside the transaction.
-3. Update `dm_channels.name`, `icon`, `metadataUpdatedAt` in one statement.
+1. Diff against current row. If none of the fields changed -> return 200 with current channel; emit nothing.
+2. Capture `metadataUpdatedAt = Math.max(Date.now(), previousVersion + 1)` inside the transaction.
+3. Update `dm_channels.name`, `icon`, `membersCanInvite`, `metadataUpdatedAt` in one statement.
 4. Insert one or two `dm_messages` system rows: `name_changed` (`{ event, oldName, newName }`) and/or `icon_changed` (`{ event }`). Both share a single `eventMessageId` correlation root with suffix scheme: `${eventMessageId}:name`, `${eventMessageId}:icon`.
 
 **Post-transaction:**
-- Broadcast `dm_channel_updated { dmChannelId, name, icon }` via `sendToDmMembers` (members-only by construction; `metadataUpdatedAt` is intentionally omitted from the WS payload — purely a server-side version vector).
+- Broadcast `dm_channel_updated { dmChannelId, name, icon, membersCanInvite }` via `sendToDmMembers` (members-only by construction; `metadataUpdatedAt` is intentionally omitted from the WS payload — purely a server-side version vector).
 - Broadcast each new system message via `dm_message_created`.
-- Queue `group_metadata_update` outbox event with `targetOrigins = getGroupDmTargetOrigins(channelId)`.
+- Queue `group_metadata_update` outbox event with `targetOrigins = getGroupDmTargetOrigins(channelId)`. Its optional `iconChanged` edit-intent flag suppresses false icon-change messages when a permission edit carries an unchanged absolute icon URL but the receiver stores a downloaded filename. The full icon snapshot still applies for convergence; the flag is not authority or version state.
 - If old icon was a local file and changed/cleared: `deleteUploadFile(old) + deleteAttachmentByFilename(old)` (matches avatar precedent at `users.ts:463-466`).
 
 **Icon URL round-trip:**
@@ -249,7 +249,15 @@ Either field may be omitted (no-op for that field), null (clear), or a value. Em
 - **Bootstrap to a new peer** carries the absolute URL inside the extended `FederationGroupPayload` (`member_add` event); see `docs/systems/federation.md` for the bootstrap payload shape.
 
 **Clock semantics:**
-`metadataUpdatedAt = Date.now()` is captured at the moment of the DB write inside the owner-instance transaction, not at request entry. This keeps the version vector monotonic across rapid edits on the same instance. Receivers compare strictly greater (`>`) — equal or stale timestamps are silently accepted.
+`metadataUpdatedAt = Math.max(Date.now(), previousVersion + 1)` is captured at the moment of the DB write inside the owner-instance transaction, not at request entry. This keeps the version vector monotonic across rapid edits on the same instance. Receivers compare strictly greater (`>`) — equal or stale timestamps are silently accepted.
+
+### Member invitation permission
+
+`dm_channels.members_can_invite` is a non-null boolean, default **true**, for both existing rows migrated by `0021_group_dm_member_invites.sql` and newly created groups. The owner controls **Allow members to invite people** in desktop/mobile group settings. Disabling it limits additions to the current owner; it does not remove existing members. This is independent of space roles/permission bits. Invitations still require membership, friendship with the target, and room below the ten-member cap. A member-add request cannot change this setting. One-on-one conversion still creates a new group with invitations enabled.
+
+The existing owner-only metadata PATCH persists and broadcasts the setting, and the existing owner-authoritative `group_metadata_update` carries it to peers. A permission-only edit creates no chat system message. An unchanged value is a no-op. Initial federation sync replays permission metadata so a peer can recover a missed update. The value survives ownership transfer; only the new owner may change it. Ownership relay events carry an optional complete metadata snapshot (name, absolute icon URL, permission and metadata version), applied atomically with the handoff under the recorded previous owner's authority. This recovers a restriction/version even if the transfer arrives before an earlier metadata event. Older transfers without the snapshot preserve the current state. Transfer receivers retain the absolute icon URL as the supported remote reference rather than starting an asynchronous download during the handoff. The web client routes edits with the owner's instance **and that instance's channel ID**, and cancels stale saves/batched additions after authorization or modal-session changes.
+
+Backward compatibility: omitted fields on an old channel/bootstrap payload default to true. Omitted fields on a metadata update preserve the receiver's stored value, so an old rename does not re-enable disabled invitations. Older server versions do not enforce this new permission; all participating instances must support it for consistent restrictions. Replicas enforce their last received owner-authoritative state; permission changes propagate asynchronously.
 
 ### Owner Kick
 
@@ -719,15 +727,12 @@ This is the one place the rule is written; other specs point here.
 
 What decides the path is whether this instance holds a channel with the event's `federatedId` (soft-deleted or not):
 
-- **Bootstrap** (no such channel): the event must carry `group`, which must name an owner, and `membership.addedBy` must identify that owner (same home user id and home domain). `attributionRefusal(membership.addedBy, sourceInstance)` must pass before any channel, roster or user is created: the sender speaks for the group's owner. A missing actor is `attribution_mismatch`; an actor other than the named owner is `invalid_target`. The owner and roster are then resolved (`resolveOrCreateReplicatedUser`; tombstoned identities are dropped) and `mayRelayInto(<roster>, <owner>, sourceInstance)` must pass: the owner is in the roster and the signing peer is one of the instances the roster lives on. A missing owner or a failed roster check is `invalid_target` (terminal; the event carries everything it is judged on, so a retry cannot change the answer) and no channel is created. The roster it sends becomes this instance's copy. This is how a brand-new group, or a group this instance has never held, arrives.
-- **Incremental** (the channel exists): the add is judged against this instance's copy, mirroring `POST /api/dm/:id/members`:
-  1. `attributionRefusal(membership.addedBy, sourceInstance)`, as for every relay event.
-  2. The channel must be a group (`ownerId` set). A 1-on-1 has a fixed pair: else `invalid_target` (terminal).
-  3. The adder (`membership.addedBy`, required) must be the current owner (`channel.ownerId`) and a member of this copy, matched by federated identity (`memberWithIdentity`: same home user id on the same home domain), and the signing peer one of `relayTargetOrigins(<the members before the add>)`, compared by domain (`mayRelayInto`, `federation/dmChannels.ts`, the same check "Relayed message creates" uses): else `unauthorized_source`. Nothing is added.
+- **Bootstrap** (no such channel): the event carries an owner, full roster and optional `membersCanInvite` (missing means true). The adder must pass `attributionRefusal` and both owner and adder must appear in the roster. Owner-initiated adds retain the existing authenticated homeward-relay path. A non-owner may bootstrap only when invitations are enabled **and the signed source is directly the owner's home instance**; a peer's claim about a third-instance owner's setting is not authority. Malformed booleans and invalid authority/rosters are refused before any user or channel writes.
+- **Incremental** (channel exists): attribution, current membership (home user ID + home domain), group type and the signing peer's existing conversation participation are checked. The recorded `membersCanInvite` must be true, or the adder must be the recorded current owner. Incoming `group.owner` and `group.membersCanInvite` cannot override stored authority or permission.
 
-`unauthorized_source` is retried by the sender. An add can legitimately arrive before the ownership-transfer event that made its adder the owner; the retry applies it once that event has landed. Incremental events cannot authorize themselves by changing `group.owner`: only the recorded owner of this copy counts. The local route's friendship check is the owner's own instance's to make; the receiver cannot see that friendship.
+`unauthorized_source` is retryable: membership, permission or ownership updates may not have arrived yet. Friendship is validated by the adder's REST instance; the receiver cannot see that friendship.
 
-Known limit: a copy kept after all of this instance's members left keeps its roster and ownership from that time. An add by a later owner is refused until the missing membership and ownership-transfer events reach this instance. Re-adding through the owner still recorded in that copy works.
+Known bootstrap limit: a remote member cannot introduce a group to a brand-new third peer using a self-asserted owner setting. That owner-authority boundary existed before this permission; supporting the flow requires a separate owner-authorization protocol. The former homeward non-owner bootstrap edge is also refused because the signing member's peer is not authority for the receiver's owner setting. The owner can invite the new peer instead. A stale copy left after all local members depart also needs missing roster/ownership events before a later owner can add members there. Capacity is checked per instance, not serialized across peers: simultaneous member additions near the ten-member limit can each succeed locally and then be rejected by the other full copy, leaving divergent rosters. This pre-existing multi-writer limitation needs owner-mediated admission or a separate convergence design; this prototype does not claim a globally atomic cap.
 
 ### Bootstrap vs Incremental Batching
 
@@ -877,7 +882,7 @@ const isLocalMember = (u: { homeInstance?: string | null }) =>
 | `addDmMember(dmChannelId, user)` | Appends user to channel's `members` array (dedup by ID) |
 | `removeDmMember(dmChannelId, userId)` | Filters user from channel's `members` array (reused for kick) |
 | `updateDmOwner(dmChannelId, newOwnerId)` | Updates `ownerId` on the channel (reused for manual transfer) |
-| `updateDmMetadata(dmChannelId, { name, icon })` | Patches `name`/`icon` on the channel; called by the `dm_channel_updated` WS handler |
+| `updateDmMetadata(dmChannelId, { name, icon, membersCanInvite? })` | Patches `name`/`icon` on the channel; called by the `dm_channel_updated` WS handler |
 | `closeDm(id)` | Calls `api.dm.close(id)` via origin-aware API client, removes from state |
 | `leaveDm(id)` | Calls `api.dm.leave(id)` via origin-aware API client, removes from state |
 | `findExistingDmForUser(targetUser)` | Scans `dmChannels` for a 2-member DM where the other member's `homeUserId` matches the target's `homeUserId` |
@@ -890,7 +895,7 @@ const isLocalMember = (u: { homeInstance?: string | null }) =>
 export function getOwnerInstanceForDm(channelId: string): string;
 ```
 
-Returns the channel's `ownerHomeInstance`. Used by all owner-only DM operations (`updateMetadata`, `kickMember`, `transferOwnership`) to route requests via `getApiForOrigin(getOwnerInstanceForDm(channelId))`. Distinct from `getChannelOrigin`, which returns the channel's pinned serving origin (where the WS connection mirrors the channel) — these can diverge after a manual ownership transfer. Non-owner operations (message send, leave, close, typing, reactions, read-state acks) keep routing via `getChannelOrigin`. See "Historical Bugs" for the latent post-transfer routing concern this helper closes.
+Returns the channel's `ownerHomeInstance`. Kick and transfer operations use it with `getApiForOrigin`. Metadata/permission edits use `getDmMetadataTarget(channelId)` instead: it resolves the owner's connected origin and its instance-local channel ID together, then performs one raw PATCH on that client, without recursive authority re-resolution. Distinct from `getChannelOrigin`, which returns the channel's pinned serving origin (where the WS connection mirrors the channel) — these can diverge after a manual ownership transfer. Non-owner operations (message send, leave, close, typing, reactions, read-state acks) keep routing via `getChannelOrigin`. See "Historical Bugs" for the latent post-transfer routing concern this helper closes.
 
 ### WebSocket Event Handlers (`useWebSocket.ts`)
 
@@ -898,7 +903,7 @@ Returns the channel's `ownerHomeInstance`. Used by all owner-only DM operations 
 |----------|---------|
 | `dm_channel_created` | Normalize remote user assets, upsert each member into `userViews`, add the copy through the DM merge module (`upsertCopy(origin, channel, 'stated')`, `dmConversations.ts`) |
 | `dm_channel_closed` | Call `removeDmChannel(dmChannelId)` |
-| `dm_channel_updated` | Call `updateDmMetadata(dmChannelId, { name, icon })` |
+| `dm_channel_updated` | Call `updateDmMetadata(dmChannelId, { name, icon, membersCanInvite? })` |
 | `dm_member_added` | Normalize remote user assets, upsert into `userViews`, call `addDmMember(dmChannelId, user)` |
 | `dm_member_removed` | Call `removeDmMember(dmChannelId, userId)` |
 | `dm_owner_updated` | Call `updateDmOwner(dmChannelId, newOwnerId, newOwnerHomeUserId?, newOwnerHomeInstance?)` — the optional home-identity fields keep the channel's federation routing cache fresh after a manual transfer |
@@ -915,8 +920,8 @@ Returns the channel's `ownerHomeInstance`. Used by all owner-only DM operations 
 
 ### Add DM Member Modal (`AddDmMemberModal.tsx`)
 
-- Existing groups expose add-member controls only to the owner, using origin-qualified home identity (`utils/dmPermissions.ts`) on desktop, mobile and the chat header. Either participant can still create a new group from a 1-on-1.
-- The modal checks both the displayed copy and its home copy. Ownership changes close a stale dialog and prevent further requests in a selected-friends batch; closing or reopening the modal also invalidates the old batch.
+- Existing groups expose add-member controls to the owner and, when `membersCanInvite` is true, current members, using origin-qualified home identity (`utils/dmPermissions.ts`) on desktop, mobile and the chat header. Either participant can still create a new group from a 1-on-1.
+- The modal checks both the displayed copy and its home copy. Permission or membership changes close an unauthorized stale dialog and prevent further requests in a selected-friends batch; closing or reopening the modal also invalidates the old batch.
 - Shows the caller's friends list, filtered by search query
 - Excludes current DM members (shown as "Already in this DM")
 - Enforces 10-member cap in the UI (`remainingSlots` calculation)
@@ -976,11 +981,11 @@ const normalized = homeInstance.startsWith('http')
 | `POST` | `/api/dm` | JWT | Create or get existing 1-on-1 DM. Accepts `{ userId }` (local) or `{ homeUserId, homeInstance }` (federated) |
 | `POST` | `/api/dm/group` | JWT | Create group DM with multiple members |
 | `POST` | `/api/dm/space-invite` | JWT | Send a space invite card to a friend via DM (see `docs/systems/spaces.md`) |
-| `PATCH` | `/api/dm/:id` | JWT | Update group DM `name` and/or `icon` (owner-only). 1-on-1 DMs reject. See "Group Metadata Update" |
+| `PATCH` | `/api/dm/:id` | JWT | Update group DM `name`, `icon`, and/or `membersCanInvite` (owner-only). 1-on-1 DMs reject. See "Group Metadata Update" |
 | `DELETE` | `/api/dm/:id` | JWT | Soft-close DM for caller |
 | `DELETE` | `/api/dm/:id/members/:targetUserId` | JWT | Owner kicks a member from a group DM. Cannot kick self. 1-on-1 DMs reject |
 | `POST` | `/api/dm/:id/transfer` | JWT | Owner transfers ownership to another current member without leaving. Body: `{ newOwnerId }` |
-| `POST` | `/api/dm/:id/members` | JWT | Add member to group DM (owner only). Accepts `{ userId }` or `{ homeUserId, homeInstance }` |
+| `POST` | `/api/dm/:id/members` | JWT | Add member to group DM (owner, or member when invitations enabled). Accepts `{ userId }` or `{ homeUserId, homeInstance }` |
 | `DELETE` | `/api/dm/:id/members` | JWT | Leave group DM |
 | `GET` | `/api/dm/:id/messages` | JWT | Get messages with cursor pagination |
 | `POST` | `/api/dm/:id/messages` | JWT | Send message (rate-limited: 5/5s) |
@@ -996,7 +1001,7 @@ const normalized = homeInstance.startsWith('http')
 
 ### DM Channel List
 
-`GET /api/dm` returns the same entries as the `ready` payload's `dmChannels`: both call `loadOpenDmChannels()` (`utils/dmChannelWire.ts`). Every other emitter of a `DmChannel` (`dm_channel_created` on every path, the `POST /api/dm`, `POST /api/dm/group` and add-member payloads, re-attach) builds it with `loadDmChannelWire()`, which goes through the same `toDmChannelWire()`; without a message to deliver it uses the newest message's preview, so its payload equals the row's list entry. No `DmChannel` is built by hand. Every entry carries `id`, `federatedId`, `ownerId`, `ownerHomeUserId`, `ownerHomeInstance`, `createdAt`, `name`, `icon`, `metadataUpdatedAt`, `members` and `lastMessage`, with `null` (or `0` for `metadataUpdatedAt`) where the channel has no value. In the shared `DmChannel` type every field is required, nullable where the row can be null, so a payload that leaves one out does not compile. The last-message lookup is chunked by channel ids and runs as one grouped `MAX(created_at)` per chunk joined back to the rows, so any number of DMs stays under SQLite's limits and a long conversation costs one indexed pass, not one per message.
+`GET /api/dm` returns the same entries as the `ready` payload's `dmChannels`: both call `loadOpenDmChannels()` (`utils/dmChannelWire.ts`). Every other emitter of a `DmChannel` (`dm_channel_created` on every path, the `POST /api/dm`, `POST /api/dm/group` and add-member payloads, re-attach) builds it with `loadDmChannelWire()`, which goes through the same `toDmChannelWire()`; without a message to deliver it uses the newest message's preview, so its payload equals the row's list entry. No `DmChannel` is built by hand. Every entry carries `id`, `federatedId`, `ownerId`, `ownerHomeUserId`, `ownerHomeInstance`, `createdAt`, `name`, `icon`, `metadataUpdatedAt`, `membersCanInvite`, `members` and `lastMessage`, with `null` (or `0` for `metadataUpdatedAt`) where the channel has no value. In the shared `DmChannel` type every field is required, nullable where the row can be null, so a payload that leaves one out does not compile. The last-message lookup is chunked by channel ids and runs as one grouped `MAX(created_at)` per chunk joined back to the rows, so any number of DMs stays under SQLite's limits and a long conversation costs one indexed pass, not one per message.
 
 Servers up to 1.6.1 built the list by hand and left out `federatedId`, the owner identity, `name`, `icon` and `metadataUpdatedAt`. A client connected to both instances of a conversation re-reads an instance's list to place a channel id it has not seen (`reloadDmsForOrigin`), and without the key it showed that instance's mirrored copy as a second row, once per conversation the instance mirrors. `reloadDmsForOrigin` still handles peers on those versions; see `client-federation.md` "WS event routing contract".
 
@@ -1014,7 +1019,7 @@ For full wire formats, see `docs/systems/websocket.md`.
 |-------|-----------|-------------|
 | `dm_channel_created` | S->C | Group DM create and bootstrap, added member, reopen of a closed membership (including the first message of a new 1-on-1 for its recipient) |
 | `dm_channel_closed` | S->C | User closes DM, user leaves group |
-| `dm_channel_updated` | S->C | Group metadata (`name`/`icon`) updated; payload `{ dmChannelId, name, icon }` (no `metadataUpdatedAt` — server-side version vector only) |
+| `dm_channel_updated` | S->C | Group metadata/permission updated; payload `{ dmChannelId, name, icon, membersCanInvite? }` (no `metadataUpdatedAt` — server-side version vector only) |
 | `dm_member_added` | S->C | Incremental member add (not bootstrap) |
 | `dm_member_removed` | S->C | Member leave/kick |
 | `dm_owner_updated` | S->C | Ownership transfer (auto on owner-leave OR manual via `POST /api/dm/:id/transfer`). Payload: `{ dmChannelId, newOwnerId, newOwnerHomeUserId?, newOwnerHomeInstance? }` — the home-identity fields are populated on every new emission so the client can keep `dmChannel.ownerHomeInstance` (and thus `getOwnerInstanceForDm` routing) in sync without waiting for a `ready` refresh. Receivers tolerate omission for legacy senders. |

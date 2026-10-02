@@ -60,6 +60,22 @@ export function getOwnerInstanceForDm(channelId: string): string {
   return _getOwnerInstanceForDm?.(channelId) ?? '';
 }
 
+/** Both parts of a metadata write must refer to the owner's own instance copy. */
+export interface DmMetadataTarget {
+  origin: string;
+  channelId: string;
+}
+
+let _getDmMetadataTarget: ((channelId: string) => DmMetadataTarget | null) | null = null;
+
+export function setDmMetadataTargetResolver(resolver: (channelId: string) => DmMetadataTarget | null): void {
+  _getDmMetadataTarget = resolver;
+}
+
+export function getDmMetadataTarget(channelId: string): DmMetadataTarget | null {
+  return _getDmMetadataTarget?.(channelId) ?? null;
+}
+
 // ─── Hostname → origin resolution (federation) ────────────────────────────────
 // Registered by instanceStore on import; maps a federated user's `homeInstance`
 // hostname (e.g. "remote.example.com") to a full origin URL

@@ -6,10 +6,10 @@ import { sanitizeUser } from '../../../utils/sanitize.js';
 import { loadDmChannelWire } from '../../../utils/dmChannelWire.js';
 import { generateSnowflake } from '../../../utils/snowflake.js';
 import { connectionManager } from '../../../ws/handler.js';
-import { GROUP_DM_NAME_MAX_LENGTH, GROUP_DM_NAME_MIN_LENGTH } from '@backspace/shared/src/constants.js';
+import { GROUP_DM_MAX_MEMBERS, GROUP_DM_NAME_MAX_LENGTH, GROUP_DM_NAME_MIN_LENGTH } from '@backspace/shared/src/constants.js';
 import { and, eq, or } from 'drizzle-orm';
 import type { DmMessageWithUser, FederationRelayEvent } from '@backspace/shared';
-import { extractDomain, resolveOrCreateReplicatedUser, resolveRelayActor, attributionRefusal, sameRelayActor } from '../identity.js';
+import { extractDomain, resolveOrCreateReplicatedUser, resolveRelayActor, attributionRefusal, sameRelayActor, relayActorOfUser } from '../identity.js';
 import { downloadProfileAsset, processProfileUpdateEvent } from '../profile.js';
 import { dmChannelMembers, mayRelayInto, memberWithIdentity } from '../dmChannels.js';
 
@@ -79,9 +79,36 @@ export async function processMemberAddEvent(
       rejected.push({ messageId: event.messageId, reason: ownerRefusal });
       return;
     }
-    if (!sameRelayActor(owner, addedBy)) {
-      console.warn(`[federation] Refused member_add bootstrap of ${event.federatedId}: the adder is not the group owner`);
+    if (event.group.membersCanInvite !== undefined && typeof event.group.membersCanInvite !== 'boolean') {
+      rejected.push({ messageId: event.messageId, reason: 'invalid_payload' });
+      return;
+    }
+    const membersCanInvite = event.group.membersCanInvite ?? true;
+    const ownerIsAdder = sameRelayActor(owner, addedBy);
+    // A bootstrap has no trusted local setting yet. A non-owner can only
+    // carry that setting from the owner's own instance. Homeward standing
+    // proves an account exists, not that the owner authorized this setting.
+    if (!ownerIsAdder && (!membersCanInvite ||
+        extractDomain(sourceInstance).toLowerCase() !== extractDomain(owner.homeInstance).toLowerCase())) {
       rejected.push({ messageId: event.messageId, reason: 'invalid_target' });
+      return;
+    }
+    // Check both acting identities against the wire roster BEFORE creating
+    // replicated users. A malformed bootstrap must not populate our database.
+    const rosterPayload = event.group.members;
+    if (!Array.isArray(rosterPayload) || rosterPayload.some(member =>
+      !member || typeof member.homeUserId !== 'string' || !member.homeUserId ||
+      typeof member.homeInstance !== 'string' || !member.homeInstance)) {
+      rejected.push({ messageId: event.messageId, reason: 'invalid_payload' });
+      return;
+    }
+    if (!rosterPayload.some(member => sameRelayActor(member, owner)) ||
+        !rosterPayload.some(member => sameRelayActor(member, addedBy))) {
+      rejected.push({ messageId: event.messageId, reason: 'invalid_target' });
+      return;
+    }
+    if (rosterPayload.length > GROUP_DM_MAX_MEMBERS) {
+      rejected.push({ messageId: event.messageId, reason: 'max_members_exceeded' });
       return;
     }
 
@@ -93,7 +120,8 @@ export async function processMemberAddEvent(
       const rosterUser = resolveOrCreateReplicatedUser(member.homeUserId, member.homeInstance, db, { username: member.profile?.username, status: member.profile?.status, deleted: member.profile?.deleted });
       if (rosterUser && !roster.some(r => r.id === rosterUser.id)) roster.push(rosterUser);
     }
-    if (!ownerLocal || !mayRelayInto(roster, ownerLocal.id, sourceInstance)) {
+    const adderLocal = memberWithIdentity(roster, addedBy);
+    if (!ownerLocal || !adderLocal || !mayRelayInto(roster, ownerLocal.id, sourceInstance)) {
       console.warn(`[federation] Refused member_add bootstrap of ${event.federatedId}: the owner is not in the roster, or ${extractDomain(sourceInstance)} is not one of its instances`);
       rejected.push({ messageId: event.messageId, reason: 'invalid_target' });
       return;
@@ -129,6 +157,7 @@ export async function processMemberAddEvent(
         name: bootstrapName,
         icon: bootstrapResolvedIcon,
         metadataUpdatedAt: bootstrapMetadataUpdatedAt,
+        membersCanInvite,
       })
       .run();
 
@@ -153,9 +182,9 @@ export async function processMemberAddEvent(
     return;
   }
 
-  // Incremental adds are authorized against this instance's recorded owner,
-  // never the untrusted group snapshot carried by the event. Keep the roster
-  // and source checks as well: an owner acts in a copy of their own group.
+  // Incremental adds use this copy's owner-controlled permission, never a
+  // member peer's claimed group snapshot. The owner can always add; other
+  // current members can only add while this copy records inviting as enabled.
   if (!bootstrapped) {
     if (!channel.ownerId) {
       console.warn(`[federation] Refused member_add into 1-on-1 ${channel.id}`);
@@ -164,8 +193,8 @@ export async function processMemberAddEvent(
     }
     const members = dmChannelMembers(channel.id, db);
     const adder = memberWithIdentity(members, addedBy);
-    if (!adder || adder.id !== channel.ownerId || !mayRelayInto(members, adder.id, sourceInstance)) {
-      console.warn(`[federation] Refused member_add in group DM ${channel.id}: the adder is not the current owner, or ${extractDomain(sourceInstance)} is not a peer of the conversation`);
+    if (!adder || (adder.id !== channel.ownerId && !channel.membersCanInvite) || !mayRelayInto(members, adder.id, sourceInstance)) {
+      console.warn(`[federation] Refused member_add in group DM ${channel.id}: the adder lacks permission, or ${extractDomain(sourceInstance)} is not a peer of the conversation`);
       rejected.push({ messageId: event.messageId, reason: 'unauthorized_source' });
       return;
     }
@@ -192,22 +221,19 @@ export async function processMemberAddEvent(
     return;
   }
 
-  // Enforce max 10 members
-  const memberCount = db.select()
-    .from(schema.dmMembers)
-    .where(eq(schema.dmMembers.dmChannelId, channel.id))
-    .all().length;
-  if (memberCount >= 10) {
-    rejected.push({ messageId: event.messageId, reason: 'max_members_exceeded' });
-    return;
-  }
-
-  // Add member (idempotent)
+  // Existing members (including the full bootstrap roster) do not increase
+  // the count. Check capacity only for an actual insertion.
   const existingMember = db.select().from(schema.dmMembers)
     .where(and(
       eq(schema.dmMembers.dmChannelId, channel.id),
       eq(schema.dmMembers.userId, localUser.id),
     )).get();
+  const memberCount = db.select().from(schema.dmMembers)
+    .where(eq(schema.dmMembers.dmChannelId, channel.id)).all().length;
+  if (!existingMember && memberCount >= GROUP_DM_MAX_MEMBERS) {
+    rejected.push({ messageId: event.messageId, reason: 'max_members_exceeded' });
+    return;
+  }
 
   if (!existingMember) {
     db.insert(schema.dmMembers).values({
@@ -538,6 +564,40 @@ export function processOwnershipTransferEvent(
     return;
   }
 
+  const metadata = event.ownership.metadata;
+  if (metadata !== undefined && (!metadata ||
+      typeof metadata.membersCanInvite !== 'boolean' ||
+      !Number.isSafeInteger(metadata.metadataUpdatedAt) || metadata.metadataUpdatedAt < 0 ||
+      (metadata.name !== null && (typeof metadata.name !== 'string' ||
+        metadata.name.trim().length < GROUP_DM_NAME_MIN_LENGTH || metadata.name.trim().length > GROUP_DM_NAME_MAX_LENGTH)) ||
+      (metadata.icon !== null && (typeof metadata.icon !== 'string' ||
+        !(metadata.icon.startsWith('https://') || metadata.icon.startsWith('http://')))))) {
+    rejected.push({ messageId: event.messageId, reason: 'invalid_payload' });
+    return;
+  }
+  // Transfers can follow the owner's member_remove event, so authority is
+  // the recorded owner identity, not their current membership. A different
+  // user on the same signing peer cannot transfer ownership or its setting.
+  const recordedOwner = db.select().from(schema.users)
+    .where(eq(schema.users.id, channel.ownerId)).get();
+  const recordedOwnerIdentity = recordedOwner ? relayActorOfUser(recordedOwner)
+    : channel.ownerHomeUserId && channel.ownerHomeInstance
+      ? { homeUserId: channel.ownerHomeUserId, homeInstance: channel.ownerHomeInstance }
+      : null;
+  if (!event.ownership.previousOwner || !recordedOwnerIdentity ||
+      !sameRelayActor(event.ownership.previousOwner, recordedOwnerIdentity)) {
+    rejected.push({ messageId: event.messageId, reason: 'unauthorized_source' });
+    return;
+  }
+  // The handover is the authority boundary. Carry the complete last owner
+  // snapshot so a missed OFF/version cannot leave this copy stuck ON after
+  // old-owner metadata becomes unauthorized. Its absolute icon URL is a
+  // supported stored value, keeping ownership transfer synchronous/atomic.
+  const snapshot = metadata && metadata.metadataUpdatedAt >= (channel.metadataUpdatedAt ?? 0) ? metadata : null;
+  const membersCanInvite = snapshot?.membersCanInvite ?? channel.membersCanInvite;
+  const name = snapshot ? snapshot.name : channel.name;
+  const icon = snapshot ? snapshot.icon : channel.icon;
+
   // The previous owner is the attributed actor, matched on homeUserId +
   // homeInstance. Resolved before anything changes, so an id that names a local
   // user of another identity refuses the whole transfer. One not held here
@@ -579,6 +639,8 @@ export function processOwnershipTransferEvent(
       ownerId: newOwnerLocal.id,
       ownerHomeUserId: event.ownership.newOwner.homeUserId,
       ownerHomeInstance: canonicalOwnerHome,
+      membersCanInvite,
+      ...(snapshot ? { name, icon, metadataUpdatedAt: snapshot.metadataUpdatedAt } : {}),
     })
     .where(eq(schema.dmChannels.id, channel.id))
     .run();
@@ -590,6 +652,16 @@ export function processOwnershipTransferEvent(
     newOwnerHomeUserId: event.ownership.newOwner.homeUserId,
     newOwnerHomeInstance: canonicalOwnerHome,
   });
+
+  if (membersCanInvite !== channel.membersCanInvite || name !== channel.name || icon !== channel.icon) {
+    connectionManager.sendToDmMembers(channel.id, {
+      type: 'dm_channel_updated',
+      dmChannelId: channel.id,
+      name,
+      icon,
+      membersCanInvite,
+    });
+  }
 
   const ownerSysMsgId = generateSnowflake();
   const ownerSysCreatedAt = Date.now();
@@ -632,6 +704,9 @@ export function processOwnershipTransferEvent(
     } as unknown as DmMessageWithUser,
   });
 
+  if (channel.icon && channel.icon !== icon && !channel.icon.startsWith('http://') && !channel.icon.startsWith('https://')) {
+    deleteUploadFile(channel.icon);
+  }
   accepted.push(event.messageId);
 }
 
@@ -676,7 +751,7 @@ export async function processGroupMetadataUpdateEvent(
 
   // Lookup channel by federated_id. Missing → idempotent accept (this peer has
   // no replica of the channel, nothing to update).
-  const channel = db
+  let channel = db
     .select()
     .from(schema.dmChannels)
     .where(eq(schema.dmChannels.federatedId, event.federatedId))
@@ -688,7 +763,7 @@ export async function processGroupMetadataUpdateEvent(
   }
 
   // Authority: only the owner's home instance can mutate group metadata.
-  if (extractDomain(sourceInstance) !== extractDomain(channel.ownerHomeInstance ?? '')) {
+  if (!channel.ownerId || extractDomain(sourceInstance).toLowerCase() !== extractDomain(channel.ownerHomeInstance ?? '').toLowerCase()) {
     rejected.push({ messageId: event.messageId, reason: 'attribution_mismatch' });
     return;
   }
@@ -699,6 +774,25 @@ export async function processGroupMetadataUpdateEvent(
   const metadata = event.metadata;
   if (!metadata) {
     rejected.push({ messageId: event.messageId, reason: 'missing_metadata_payload' });
+    return;
+  }
+
+  if ((metadata.membersCanInvite !== undefined && typeof metadata.membersCanInvite !== 'boolean') ||
+      (metadata.iconChanged !== undefined && typeof metadata.iconChanged !== 'boolean') ||
+      !Number.isSafeInteger(metadata.metadataUpdatedAt) || metadata.metadataUpdatedAt < 0 ||
+      (metadata.name !== null && typeof metadata.name !== 'string') ||
+      (metadata.icon !== null && typeof metadata.icon !== 'string')) {
+    rejected.push({ messageId: event.messageId, reason: 'invalid_payload' });
+    return;
+  }
+  // A signature from the right instance is not permission for another user
+  // on that instance. Resolve the actor against the current owner's identity.
+  const actorRefusal = attributionRefusal(metadata.actor, sourceInstance, db);
+  const actorMember = !actorRefusal && metadata.actor
+    ? memberWithIdentity(dmChannelMembers(channel.id, db), metadata.actor)
+    : undefined;
+  if (actorRefusal || !actorMember || actorMember.id !== channel.ownerId) {
+    rejected.push({ messageId: event.messageId, reason: actorRefusal ?? 'attribution_mismatch' });
     return;
   }
 
@@ -721,10 +815,48 @@ export async function processGroupMetadataUpdateEvent(
     return;
   }
 
-  // Diff against stored row — if neither field actually changed, no-op.
+  // Icon fetching yields: another owner update/transfer can land meanwhile.
+  // Resolve the asset first, then re-read ALL authority and version state
+  // immediately before the synchronous transaction below.
+  let resolvedIcon: string | null = metadata.icon;
+  let downloadedIcon: string | null = null;
+  if (metadata.icon !== channel.icon && metadata.icon !== null) {
+    downloadedIcon = await downloadProfileAsset(metadata.icon, sourceInstance);
+    resolvedIcon = downloadedIcon ?? metadata.icon;
+  }
+  const currentChannel = db.select().from(schema.dmChannels)
+    .where(eq(schema.dmChannels.id, channel.id)).get();
+  const currentActor = currentChannel && metadata.actor
+    ? memberWithIdentity(dmChannelMembers(channel.id, db), metadata.actor)
+    : undefined;
+  if (!currentChannel || !currentChannel.ownerId || currentActor?.id !== currentChannel.ownerId ||
+      extractDomain(sourceInstance).toLowerCase() !== extractDomain(currentChannel.ownerHomeInstance ?? '').toLowerCase() ||
+      attributionRefusal(metadata.actor, sourceInstance, db)) {
+    if (downloadedIcon) deleteUploadFile(downloadedIcon);
+    rejected.push({ messageId: event.messageId, reason: 'attribution_mismatch' });
+    return;
+  }
+  channel = currentChannel;
+  if (metadata.metadataUpdatedAt <= (channel.metadataUpdatedAt ?? 0)) {
+    if (downloadedIcon) deleteUploadFile(downloadedIcon);
+    accepted.push(event.messageId);
+    return;
+  }
   const nameChanged = metadata.name !== channel.name;
-  const iconChanged = metadata.icon !== channel.icon;
-  if (!nameChanged && !iconChanged) {
+  const iconValueChanged = metadata.icon !== channel.icon;
+  // A snapshot uses an absolute URL while this copy caches a local filename.
+  // The owner's mutation hint only suppresses a false icon system message;
+  // it never suppresses hydration, cleanup, or applying the complete snapshot.
+  const iconChanged = iconValueChanged && metadata.iconChanged !== false;
+  // Omission is legacy metadata, not a request to reset a permission to ON.
+  const membersCanInvite = metadata.membersCanInvite ?? channel.membersCanInvite;
+  const membersCanInviteChanged = membersCanInvite !== channel.membersCanInvite;
+  if (!nameChanged && !iconValueChanged && !membersCanInviteChanged) {
+    // Even a no-op proves this version was observed. Without advancing it,
+    // an older OFF/ON event can later undo the owner's newest value.
+    db.update(schema.dmChannels).set({ metadataUpdatedAt: metadata.metadataUpdatedAt })
+      .where(eq(schema.dmChannels.id, channel.id)).run();
+    if (downloadedIcon) deleteUploadFile(downloadedIcon);
     accepted.push(event.messageId);
     return;
   }
@@ -758,43 +890,22 @@ export async function processGroupMetadataUpdateEvent(
   // If every changed field already has its corresponding system row, the
   // entire event has been applied — accept silently.
   if (
-    (!nameChanged || existingNameRow)
+    !membersCanInviteChanged
+    && (nameChanged || iconChanged)
+    && (!iconValueChanged || iconChanged)
+    && (!nameChanged || existingNameRow)
     && (!iconChanged || existingIconRow)
   ) {
+    db.update(schema.dmChannels).set({ metadataUpdatedAt: metadata.metadataUpdatedAt })
+      .where(eq(schema.dmChannels.id, channel.id)).run();
+    if (downloadedIcon) deleteUploadFile(downloadedIcon);
     accepted.push(event.messageId);
     return;
   }
 
-  // ── Resolve icon: download to local upload dir, fall back to absolute URL ──
-  let resolvedIcon: string | null = metadata.icon;
-  if (iconChanged && metadata.icon !== null) {
-    const localFile = await downloadProfileAsset(metadata.icon, sourceInstance);
-    resolvedIcon = localFile ?? metadata.icon;
-  }
-
-  // Resolve actor → local user id for the system-message foreign key.
-  // Falls back to channel.ownerId if the actor stub can't be created (e.g.
-  // tombstoned identity); the system message still has to render somewhere.
-  const actorParticipant = metadata.actor;
-  let actorUserId: string | null = null;
-  if (actorParticipant) {
-    const actorUser = resolveOrCreateReplicatedUser(
-      actorParticipant.homeUserId,
-      actorParticipant.homeInstance,
-      db,
-      { username: actorParticipant.profile?.username, status: actorParticipant.profile?.status, deleted: actorParticipant.profile?.deleted },
-    );
-    actorUserId = actorUser?.id ?? null;
-  }
-  if (!actorUserId) {
-    actorUserId = channel.ownerId;
-  }
-  if (!actorUserId) {
-    // No owner user row to attach a system message to — extremely unusual,
-    // bail out cleanly without persisting anything.
-    rejected.push({ messageId: event.messageId, reason: 'actor_not_found' });
-    return;
-  }
+  // The authenticated actor is already a current owner/member; never
+  // create a user from an untrusted metadata actor or fall back to the owner.
+  const actorUserId = currentActor.id;
 
   const oldName = channel.name;
   const oldIcon = channel.icon;
@@ -809,6 +920,7 @@ export async function processGroupMetadataUpdateEvent(
         name: metadata.name,
         icon: resolvedIcon,
         metadataUpdatedAt: metadata.metadataUpdatedAt,
+        membersCanInvite,
       })
       .where(eq(schema.dmChannels.id, channel.id))
       .run();
@@ -862,6 +974,7 @@ export async function processGroupMetadataUpdateEvent(
     dmChannelId: channel.id,
     name: metadata.name,
     icon: resolvedIcon,
+    membersCanInvite,
   });
 
   // ── Broadcast each new system message ──
@@ -893,7 +1006,7 @@ export async function processGroupMetadataUpdateEvent(
   // Mirrors the local PATCH precedent (dm.ts:1595): only unlink when the
   // previous icon was a bare local filename (i.e. we own the file on disk).
   // Absolute URLs point at remote files we never owned.
-  if (iconChanged && oldIcon && !oldIcon.startsWith('http://') && !oldIcon.startsWith('https://') && oldIcon !== resolvedIcon) {
+  if (iconValueChanged && oldIcon && !oldIcon.startsWith('http://') && !oldIcon.startsWith('https://') && oldIcon !== resolvedIcon) {
     deleteUploadFile(oldIcon);
   }
 

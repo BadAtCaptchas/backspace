@@ -432,3 +432,114 @@ describe('processMemberAddEvent — the bootstrap dm_channel_created', () => {
     expect(payload.lastMessage?.id).toBe(wire.lastMessage?.id);
   });
 });
+
+
+describe('processMemberAddEvent — membersCanInvite authority', () => {
+  async function deliver(event: FederationRelayEvent, source = OWNER_ORIGIN) {
+    const fed = await import('./federation.js');
+    const accepted: string[] = [];
+    const rejected: Array<{ messageId: string; reason: string }> = [];
+    await fed.processMemberAddEvent(event, source, testDb, accepted, rejected);
+    return { accepted, rejected };
+  }
+
+  function memberBootstrap(setting?: boolean): FederationRelayEvent {
+    const event = buildBootstrapEvent({});
+    event.membership!.addedBy = {
+      homeUserId: 'inviter', homeInstance: OWNER_INSTANCE, profile: { username: 'inviter' },
+    };
+    event.group!.members.push(event.membership!.addedBy);
+    if (setting !== undefined) event.group!.membersCanInvite = setting;
+    return event;
+  }
+
+  it.each([undefined, true])('allows an owner-instance member bootstrap with setting %s', async setting => {
+    const event = memberBootstrap(setting);
+    expect((await deliver(event)).rejected).toEqual([]);
+    expect(testDb.select().from(schema.dmChannels).get()?.membersCanInvite).toBe(true);
+  });
+
+  it('allows an owner bootstrap when inviting is disabled and preserves false', async () => {
+    const event = buildBootstrapEvent({});
+    event.group!.membersCanInvite = false;
+    expect((await deliver(event)).rejected).toEqual([]);
+    expect(testDb.select().from(schema.dmChannels).get()?.membersCanInvite).toBe(false);
+  });
+
+  it('rejects a disabled member bootstrap before writing users or the roster', async () => {
+    expect((await deliver(memberBootstrap(false))).rejected[0]?.reason).toBe('invalid_target');
+    expect(testDb.select().from(schema.users).all()).toHaveLength(0);
+    expect(testDb.select().from(schema.dmChannels).all()).toHaveLength(0);
+  });
+
+  it.each(['owner', 'adder'])('rejects bootstrap when the %s is outside the roster before writing users', async missing => {
+    const event = memberBootstrap(true);
+    const absent = missing === 'owner' ? event.group!.owner : event.membership!.addedBy!;
+    event.group!.members = event.group!.members.filter(m => m.homeUserId !== absent.homeUserId);
+    expect((await deliver(event)).rejected[0]?.reason).toBe('invalid_target');
+    expect(testDb.select().from(schema.users).all()).toHaveLength(0);
+    expect(testDb.select().from(schema.dmChannels).all()).toHaveLength(0);
+  });
+
+  it.each([null, 0, 'true'])('rejects malformed setting %s before bootstrap writes', async setting => {
+    const event = memberBootstrap(true);
+    Object.assign(event.group!, { membersCanInvite: setting });
+    expect((await deliver(event)).rejected[0]?.reason).toBe('invalid_payload');
+    expect(testDb.select().from(schema.users).all()).toHaveLength(0);
+  });
+
+  it('does not let a proven homeward member peer assert the owner setting', async () => {
+    testDb.insert(schema.users).values({
+      id: 'home-owner-1', username: 'owner', passwordHash: 'hash',
+      replicatedInstances: JSON.stringify([{ origin: OWNER_ORIGIN, userId: 'owner-on-peer' }]), createdAt: 1,
+    }).run();
+    const event = memberBootstrap(true);
+    event.group!.owner.homeInstance = 'https://local.test';
+    event.group!.members[0]!.homeInstance = 'https://local.test';
+    const before = testDb.select().from(schema.users).all().length;
+    expect((await deliver(event)).rejected[0]?.reason).toBe('invalid_target');
+    expect(testDb.select().from(schema.dmChannels).all()).toHaveLength(0);
+    expect(testDb.select().from(schema.users).all()).toHaveLength(before);
+  });
+
+  it('keeps owner-authorized homeward bootstrap working when inviting is disabled', async () => {
+    testDb.insert(schema.users).values({
+      id: 'home-owner-1', username: 'owner', passwordHash: 'hash',
+      replicatedInstances: JSON.stringify([{ origin: OWNER_ORIGIN, userId: 'owner-on-peer' }]), createdAt: 1,
+    }).run();
+    const event = buildBootstrapEvent({});
+    event.group!.owner.homeInstance = 'https://local.test';
+    event.group!.members[0]!.homeInstance = 'https://local.test';
+    event.membership!.addedBy!.homeInstance = 'https://local.test';
+    event.group!.membersCanInvite = false;
+    expect((await deliver(event)).rejected).toEqual([]);
+    expect(testDb.select().from(schema.dmChannels).get()?.membersCanInvite).toBe(false);
+  });
+
+  it.each([true, false])('judges incremental member adds against stored %s, ignoring the supplied snapshot', async setting => {
+    await deliver(memberBootstrap(setting ? true : undefined));
+    const channel = testDb.select().from(schema.dmChannels).get()!;
+    testDb.update(schema.dmChannels).set({ membersCanInvite: setting }).where(eq(schema.dmChannels.id, channel.id)).run();
+    const event = memberBootstrap(!setting);
+    event.messageId = 'incremental';
+    event.membership!.user = { homeUserId: 'later-target', homeInstance: OWNER_INSTANCE, profile: { username: 'later' } };
+    const result = await deliver(event);
+    expect(result.rejected).toEqual(setting ? [] : [{ messageId: 'incremental', reason: 'unauthorized_source' }]);
+    expect(testDb.select().from(schema.dmChannels).get()?.membersCanInvite).toBe(setting);
+  });
+
+  it('rejects an oversized bootstrap roster before any user or channel writes', async () => {
+    const event = buildBootstrapEvent({});
+    for (let i = 0; i < 9; i++) event.group!.members.push({ homeUserId: `member-${i}`, homeInstance: OWNER_INSTANCE });
+    expect((await deliver(event)).rejected[0]?.reason).toBe('max_members_exceeded');
+    expect(testDb.select().from(schema.users).all()).toHaveLength(0);
+    expect(testDb.select().from(schema.dmChannels).all()).toHaveLength(0);
+  });
+
+  it('bootstraps a full ten-person roster without treating the already-included target as an eleventh', async () => {
+    const event = buildBootstrapEvent({});
+    for (let i = 0; i < 8; i++) event.group!.members.push({ homeUserId: `member-${i}`, homeInstance: OWNER_INSTANCE });
+    expect((await deliver(event)).rejected).toEqual([]);
+    expect(testDb.select().from(schema.dmMembers).all()).toHaveLength(10);
+  });
+});

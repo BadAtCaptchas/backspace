@@ -325,11 +325,6 @@
       "count": 2
     }
   },
-  "packages/web/src/components/layout/MobileGroupDmInfo.tsx": {
-    "react-hooks/exhaustive-deps": {
-      "count": 1
-    }
-  },
   "packages/web/src/components/layout/MobileScreenStack.tsx": {
     "prefer-const": {
       "count": 1
@@ -366,11 +361,6 @@
     }
   },
   "packages/web/src/components/modals/DeleteAccountModal.tsx": {
-    "react-hooks/exhaustive-deps": {
-      "count": 1
-    }
-  },
-  "packages/web/src/components/modals/GroupDmSettings.tsx": {
     "react-hooks/exhaustive-deps": {
       "count": 1
     }

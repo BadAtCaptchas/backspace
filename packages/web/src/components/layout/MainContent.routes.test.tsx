@@ -91,8 +91,8 @@ describe('MainContent add-friends permissions', () => {
     expect(screen.getByTitle('Add Friends to DM')).toBeInTheDocument();
   });
 
-  it('hides the entry point from other group members', () => {
-    useSpaceStore.setState({ dmChannels: [wireDm({ id: 'dm', createdAt: 0, ownerId: other.id, members: [other, viewer] })] });
+  it('hides the entry point from other group members when invitations are disabled', () => {
+    useSpaceStore.setState({ dmChannels: [wireDm({ id: 'dm', createdAt: 0, ownerId: other.id, membersCanInvite: false, members: [other, viewer] })] });
     renderAt('/channels/@me/dm');
     expect(screen.queryByTitle('Add Friends to DM')).not.toBeInTheDocument();
   });
@@ -105,11 +105,29 @@ describe('MainContent add-friends permissions', () => {
 
   it('follows a federated owner and an ownership transfer reactively', () => {
     const alias = { ...viewer, id: 'viewer-on-peer', homeUserId: viewer.id, homeInstance: window.location.host };
-    const dm = wireDm({ id: 'dm', createdAt: 0, ownerId: alias.id, members: [alias, other] });
+    const dm = wireDm({ id: 'dm', createdAt: 0, ownerId: alias.id, membersCanInvite: false, members: [alias, other] });
     useSpaceStore.setState({ dmChannels: [dm], channelOriginMap: new Map([['dm', 'https://peer.example']]) });
     renderAt('/channels/@me/dm');
     expect(screen.getByTitle('Add Friends to DM')).toBeInTheDocument();
     act(() => useSpaceStore.setState({ dmChannels: [{ ...dm, ownerId: other.id }] }));
     expect(screen.queryByTitle('Add Friends to DM')).not.toBeInTheDocument();
   });
+
+  it('shows members the default-on entry point and follows permission changes', () => {
+    const dm = wireDm({ id: 'dm', createdAt: 0, ownerId: other.id, members: [other, viewer] });
+    useSpaceStore.setState({ dmChannels: [dm] });
+    renderAt('/channels/@me/dm');
+    expect(screen.getByTitle('Add Friends to DM')).toBeInTheDocument();
+    act(() => useSpaceStore.setState({ dmChannels: [{ ...dm, membersCanInvite: false }] }));
+    expect(screen.queryByTitle('Add Friends to DM')).not.toBeInTheDocument();
+    act(() => useSpaceStore.setState({ dmChannels: [{ ...dm, membersCanInvite: true }] }));
+    expect(screen.getByTitle('Add Friends to DM')).toBeInTheDocument();
+  });
+
+  it('hides the entry point from a non-member even when invitations are enabled', () => {
+    useSpaceStore.setState({ dmChannels: [wireDm({ id: 'dm', createdAt: 0, ownerId: other.id, members: [other] })] });
+    renderAt('/channels/@me/dm');
+    expect(screen.queryByTitle('Add Friends to DM')).not.toBeInTheDocument();
+  });
+
 });

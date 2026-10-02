@@ -126,7 +126,10 @@
     "groupFull": "Group is full",
     "groupFullSuffix": "— Group is full",
     "cropTitle": "Crop Group Icon",
-    "saveFailed": "Failed to save settings"
+    "saveFailed": "Failed to save settings",
+    "membersCanInviteLabel": "Allow members to invite people",
+    "membersCanInviteDescription": "Existing members can invite their friends. New members can see the conversation history.",
+    "ownerUnavailable": "Connect to the group owner’s instance to change these settings."
   },
   "groupInfo": {
     "title": "Group Info",

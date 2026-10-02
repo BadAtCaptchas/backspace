@@ -479,3 +479,224 @@ describe('processGroupMetadataUpdateEvent — icon clear', () => {
     expect(deleteUploadFile).toHaveBeenCalledWith('old-local.png');
   });
 });
+
+describe('processGroupMetadataUpdateEvent — invitation permission', () => {
+  async function deliver(event: FederationRelayEvent) {
+    const fed = await import('./federation.js');
+    const accepted: string[] = [];
+    const rejected: Array<{ messageId: string; reason: string }> = [];
+    await fed.processGroupMetadataUpdateEvent(event, OWNER_ORIGIN, testDb, accepted, rejected);
+    return { accepted, rejected };
+  }
+  function permissionEvent(value: boolean, version = 2000) {
+    const event = buildEvent({ messageId: `permission-${version}`, name: 'same', icon: null, metadataUpdatedAt: version });
+    event.metadata!.membersCanInvite = value;
+    return event;
+  }
+  function row() {
+    return testDb.select().from(schema.dmChannels).where(eq(schema.dmChannels.id, CHANNEL_ID)).get()!;
+  }
+
+  it.each([true, false])('persists setting %s and broadcasts a setting-only change', async setting => {
+    seedChannelAndOwner({ channelName: 'same', channelIcon: null, metadataUpdatedAt: 1000 });
+    testDb.update(schema.dmChannels).set({ membersCanInvite: !setting }).where(eq(schema.dmChannels.id, CHANNEL_ID)).run();
+    expect((await deliver(permissionEvent(setting))).rejected).toEqual([]);
+    expect(row().membersCanInvite).toBe(setting);
+    expect(row().metadataUpdatedAt).toBe(2000);
+    expect(connectionManager.sendToDmMembers).toHaveBeenCalledWith(CHANNEL_ID, expect.objectContaining({
+      type: 'dm_channel_updated', membersCanInvite: setting,
+    }));
+    expect(testDb.select().from(schema.dmMessages).all()).toHaveLength(0);
+  });
+
+  it('hydrates a permission snapshot without announcing a cached icon as an icon change', async () => {
+    seedChannelAndOwner({ channelName: 'same', channelIcon: 'cached.png', metadataUpdatedAt: 1000 });
+    vi.stubGlobal('fetch', vi.fn(async () => makeImageResponse()));
+    const event = permissionEvent(false);
+    event.metadata!.icon = `${OWNER_ORIGIN}/api/uploads/source.png`;
+    event.metadata!.iconChanged = false;
+    expect((await deliver(event)).rejected).toEqual([]);
+    expect(row().membersCanInvite).toBe(false);
+    expect(row().icon).toMatch(/\.png$/);
+    expect(row().icon).not.toBe('cached.png');
+    expect(deleteUploadFile).toHaveBeenCalledWith('cached.png');
+    expect(testDb.select().from(schema.dmMessages).all()).toHaveLength(0);
+    expect(connectionManager.sendToDmMembers).toHaveBeenCalledTimes(1);
+  });
+
+  it('still applies an icon snapshot when its earlier icon-change event was missed', async () => {
+    seedChannelAndOwner({ channelName: 'same', channelIcon: null, metadataUpdatedAt: 1000 });
+    vi.stubGlobal('fetch', vi.fn(async () => makeImageResponse()));
+    const event = permissionEvent(true);
+    event.metadata!.icon = `${OWNER_ORIGIN}/api/uploads/new-source.png`;
+    event.metadata!.iconChanged = false;
+    expect((await deliver(event)).rejected).toEqual([]);
+    expect(row().icon).toMatch(/\.png$/);
+    expect(row().metadataUpdatedAt).toBe(2000);
+    expect(testDb.select().from(schema.dmMessages).all()).toHaveLength(0);
+  });
+
+  it('preserves stored false when an older peer omits the setting', async () => {
+    seedChannelAndOwner({ channelName: 'same', channelIcon: null, metadataUpdatedAt: 1000 });
+    testDb.update(schema.dmChannels).set({ membersCanInvite: false }).where(eq(schema.dmChannels.id, CHANNEL_ID)).run();
+    expect((await deliver(buildEvent({ name: 'renamed', icon: null, metadataUpdatedAt: 2000 }))).rejected).toEqual([]);
+    expect(row().membersCanInvite).toBe(false);
+  });
+
+  it('advances a no-op version so a later-arriving older toggle cannot revert the setting', async () => {
+    seedChannelAndOwner({ channelName: 'same', channelIcon: null, metadataUpdatedAt: 1000 });
+    await deliver(permissionEvent(true, 3000));
+    expect(row().metadataUpdatedAt).toBe(3000);
+    await deliver(permissionEvent(false, 2000));
+    expect(row().membersCanInvite).toBe(true);
+    expect(connectionManager.sendToDmMembers).not.toHaveBeenCalled();
+  });
+
+  it.each([null, 0, 'false'])('rejects malformed invitation permission %s without mutation', async value => {
+    seedChannelAndOwner({ channelName: 'same', channelIcon: null, metadataUpdatedAt: 1000 });
+    const event = permissionEvent(false);
+    Object.assign(event.metadata!, { membersCanInvite: value });
+    expect((await deliver(event)).rejected[0]?.reason).toBe('invalid_payload');
+    expect(row().membersCanInvite).toBe(true);
+    expect(row().metadataUpdatedAt).toBe(1000);
+  });
+
+  it('rejects a same-peer non-owner actor and never creates that claimed user', async () => {
+    seedChannelAndOwner({ channelName: 'same', channelIcon: null, metadataUpdatedAt: 1000 });
+    const event = permissionEvent(false);
+    event.metadata!.actor = { homeUserId: 'pretender', homeInstance: OWNER_INSTANCE };
+    const count = testDb.select().from(schema.users).all().length;
+    expect((await deliver(event)).rejected[0]?.reason).toBe('attribution_mismatch');
+    expect(row().membersCanInvite).toBe(true);
+    expect(testDb.select().from(schema.users).all()).toHaveLength(count);
+  });
+
+  it('rejects a missing actor and an owner who is no longer a member', async () => {
+    seedChannelAndOwner({ channelName: 'same', channelIcon: null, metadataUpdatedAt: 1000 });
+    const event = permissionEvent(false);
+    delete (event.metadata as Partial<NonNullable<FederationRelayEvent['metadata']>>).actor;
+    expect((await deliver(event)).rejected[0]?.reason).toBe('attribution_mismatch');
+    testDb.delete(schema.dmMembers).where(eq(schema.dmMembers.userId, OWNER_ID)).run();
+    expect((await deliver(permissionEvent(false))).rejected[0]?.reason).toBe('attribution_mismatch');
+    expect(row().membersCanInvite).toBe(true);
+  });
+
+  it.each(['ownership', 'version'])('does not apply an icon-awaiting toggle after a concurrent %s change', async change => {
+    seedChannelAndOwner({ channelName: 'same', channelIcon: null, metadataUpdatedAt: 1000 });
+    const event = permissionEvent(false);
+    event.metadata!.icon = `${OWNER_ORIGIN}/api/uploads/slow.png`;
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      testDb.update(schema.dmChannels).set(change === 'ownership'
+        ? { ownerId: MEMBER_ID, ownerHomeUserId: MEMBER_ID, ownerHomeInstance: 'https://local.test' }
+        : { metadataUpdatedAt: 3000 })
+        .where(eq(schema.dmChannels.id, CHANNEL_ID)).run();
+      return makeImageResponse();
+    }));
+    const result = await deliver(event);
+    expect(result.rejected).toEqual(change === 'ownership'
+      ? [{ messageId: 'permission-2000', reason: 'attribution_mismatch' }] : []);
+    expect(row().membersCanInvite).toBe(true);
+    expect(row().icon).toBeNull();
+    expect(connectionManager.sendToDmMembers).not.toHaveBeenCalled();
+    expect(deleteUploadFile).toHaveBeenCalledWith(expect.stringMatching(/\.png$/));
+  });
+});
+
+
+describe('processOwnershipTransferEvent — invitation permission handover', () => {
+  function transferEvent(setting?: boolean): FederationRelayEvent {
+    return {
+      eventType: 'ownership_transfer', contextType: 'dm', messageId: 'transfer-setting',
+      federatedId: FEDERATED_ID, encryptionVersion: 0, timestamp: 2000,
+      ownership: {
+        previousOwner: ownerActor(), newOwner: { homeUserId: MEMBER_ID, homeInstance: 'https://local.test' },
+        ...(setting !== undefined ? { metadata: { name: 'same', icon: null, membersCanInvite: setting, metadataUpdatedAt: 2000 } } : {}),
+      },
+    };
+  }
+  async function transfer(event: FederationRelayEvent) {
+    const fed = await import('./federation.js');
+    const accepted: string[] = [];
+    const rejected: Array<{ messageId: string; reason: string }> = [];
+    fed.processOwnershipTransferEvent(event, OWNER_ORIGIN, testDb, accepted, rejected);
+    return { accepted, rejected };
+  }
+  const row = () => testDb.select().from(schema.dmChannels).where(eq(schema.dmChannels.id, CHANNEL_ID)).get()!;
+
+  it('recovers a missed OFF and version at transfer, and refuses old-owner replay', async () => {
+    seedChannelAndOwner({ channelName: 'same', channelIcon: null, metadataUpdatedAt: 1000 });
+    expect((await transfer(transferEvent(false))).rejected).toEqual([]);
+    expect(row()).toMatchObject({ ownerId: MEMBER_ID, membersCanInvite: false, metadataUpdatedAt: 2000 });
+    const fed = await import('./federation.js');
+    const event = buildEvent({ name: 'same', icon: null, metadataUpdatedAt: 1500 });
+    event.metadata!.membersCanInvite = true;
+    const accepted: string[] = [];
+    const rejected: Array<{ messageId: string; reason: string }> = [];
+    await fed.processGroupMetadataUpdateEvent(event, OWNER_ORIGIN, testDb, accepted, rejected);
+    expect(rejected[0]?.reason).toBe('attribution_mismatch');
+    expect(row().membersCanInvite).toBe(false);
+    const count = vi.mocked(connectionManager.sendToDmMembers).mock.calls.length;
+    expect((await transfer(transferEvent(false))).accepted).toEqual(['transfer-setting']);
+    expect(vi.mocked(connectionManager.sendToDmMembers).mock.calls).toHaveLength(count);
+    expect(connectionManager.sendToDmMembers).toHaveBeenCalledWith(CHANNEL_ID, {
+      type: 'dm_channel_updated', dmChannelId: CHANNEL_ID, name: 'same', icon: null, membersCanInvite: false,
+    });
+  });
+
+  it('preserves a stored false for a legacy transfer that omits the setting', async () => {
+    seedChannelAndOwner({ channelName: 'same', channelIcon: null, metadataUpdatedAt: 1000 });
+    testDb.update(schema.dmChannels).set({ membersCanInvite: false }).where(eq(schema.dmChannels.id, CHANNEL_ID)).run();
+    expect((await transfer(transferEvent())).rejected).toEqual([]);
+    expect(row().membersCanInvite).toBe(false);
+  });
+
+  it('allows the true owner handover after their member_remove already arrived', async () => {
+    seedChannelAndOwner({ channelName: 'same', channelIcon: null, metadataUpdatedAt: 1000 });
+    testDb.delete(schema.dmMembers).where(eq(schema.dmMembers.userId, OWNER_ID)).run();
+    expect((await transfer(transferEvent(false))).rejected).toEqual([]);
+    expect(row()).toMatchObject({ ownerId: MEMBER_ID, membersCanInvite: false });
+  });
+
+  it('preserves newer local metadata when the handover snapshot is stale', async () => {
+    seedChannelAndOwner({ channelName: 'newer', channelIcon: null, metadataUpdatedAt: 3000 });
+    testDb.update(schema.dmChannels).set({ membersCanInvite: false }).where(eq(schema.dmChannels.id, CHANNEL_ID)).run();
+    expect((await transfer(transferEvent(true))).rejected).toEqual([]);
+    expect(row()).toMatchObject({ ownerId: MEMBER_ID, membersCanInvite: false, name: 'newer', metadataUpdatedAt: 3000 });
+  });
+
+  it('adopts the full handover snapshot and cleans up a replaced local icon', async () => {
+    seedChannelAndOwner({ channelName: 'old', channelIcon: 'old.png', metadataUpdatedAt: 1000 });
+    const event = transferEvent(false);
+    event.ownership!.metadata!.icon = `${OWNER_ORIGIN}/api/uploads/new.png`;
+    expect((await transfer(event)).rejected).toEqual([]);
+    expect(row()).toMatchObject({ name: 'same', icon: `${OWNER_ORIGIN}/api/uploads/new.png`, membersCanInvite: false, metadataUpdatedAt: 2000 });
+    expect(deleteUploadFile).toHaveBeenCalledWith('old.png');
+  });
+
+  it.each([
+    { name: '' }, { icon: '/uploads/local.png' }, { metadataUpdatedAt: -1 }, { metadataUpdatedAt: Number.NaN },
+  ])('rejects malformed handover metadata %s', async invalid => {
+    seedChannelAndOwner({ channelName: 'same', channelIcon: null, metadataUpdatedAt: 1000 });
+    const event = transferEvent(false);
+    Object.assign(event.ownership!.metadata!, invalid);
+    expect((await transfer(event)).rejected[0]?.reason).toBe('invalid_payload');
+    expect(row()).toMatchObject({ ownerId: OWNER_ID, membersCanInvite: true, metadataUpdatedAt: 1000 });
+  });
+
+  it('rejects a forged previous owner from the same signing peer', async () => {
+    seedChannelAndOwner({ channelName: 'same', channelIcon: null, metadataUpdatedAt: 1000 });
+    const event = transferEvent(false);
+    event.ownership!.previousOwner = { homeUserId: 'pretender', homeInstance: OWNER_INSTANCE };
+    expect((await transfer(event)).rejected[0]?.reason).toBe('unauthorized_source');
+    expect(row()).toMatchObject({ ownerId: OWNER_ID, membersCanInvite: true });
+    expect(connectionManager.sendToDmMembers).not.toHaveBeenCalled();
+  });
+
+  it.each([null, 1, 'false'])('rejects malformed handover permission %s', async setting => {
+    seedChannelAndOwner({ channelName: 'same', channelIcon: null, metadataUpdatedAt: 1000 });
+    const event = transferEvent(false);
+    Object.assign(event.ownership!.metadata!, { membersCanInvite: setting });
+    expect((await transfer(event)).rejected[0]?.reason).toBe('invalid_payload');
+    expect(row()).toMatchObject({ ownerId: OWNER_ID, membersCanInvite: true });
+  });
+});

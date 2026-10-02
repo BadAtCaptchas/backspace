@@ -3,6 +3,8 @@ import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
 import userEvent from '@testing-library/user-event';
 import type { DmChannel, User } from '@backspace/shared';
 
+let lastCropComplete: ((blob: Blob) => void) | null = null;
+
 // ── Stubs for transitively-imported infra ──────────────────────────────────
 vi.mock('../../audio/AudioManager', () => ({
   AudioManager: {
@@ -35,6 +37,7 @@ vi.mock('../ui/ImageCropModal', () => ({
     maxOutputDimension?: number;
   }) => {
     if (!isOpen) return null;
+    lastCropComplete = onCropComplete;
     return (
       <div role="dialog" aria-label="cropper-mock">
         <button
@@ -160,6 +163,7 @@ function makeGroupDm(overrides: Partial<DmChannel> = {}): DmChannel {
     name: 'My Group',
     icon: null,
     metadataUpdatedAt: 0,
+    membersCanInvite: true,
     ...overrides,
   };
 }
@@ -179,6 +183,7 @@ function setStoreState(opts: { dmChannel: DmChannel; authUser: User | null }) {
 
 beforeEach(() => {
   useSpaceStore.setState({ channelOriginMap: new Map() });
+  useAuthStore.setState({ token: 'session-token' });
   mockUpdateMetadata.mockReset();
   mockLeave.mockReset();
   mockKickMember.mockReset();
@@ -391,8 +396,8 @@ describe('GroupDmSettings — adding group members', () => {
     renderModal();
   }
 
-  it('hides the add-member entry point from a non-owner', () => {
-    openMembers(makeGroupDm({ ownerId: 'user-2' }));
+  it('hides the add-member entry point when a non-owner cannot invite', () => {
+    openMembers(makeGroupDm({ ownerId: 'user-2', membersCanInvite: false }));
     expect(document.querySelector('[data-group-dm-add-member]')).toBeNull();
     expect(screen.queryByText(/Group is full/i)).not.toBeInTheDocument();
   });
@@ -409,6 +414,7 @@ describe('GroupDmSettings — adding group members', () => {
   it('recognizes the owner on a remote copy and removes the entry point after transfer', () => {
     const dm = makeGroupDm({
       ownerId: 'self-on-peer',
+      membersCanInvite: false,
       members: [
         makeUser({ id: 'self-on-peer', homeUserId: 'user-self', homeInstance: window.location.host }),
         makeUser({ id: 'user-2', username: 'alice' }),
@@ -428,4 +434,264 @@ describe('GroupDmSettings — adding group members', () => {
     expect(document.querySelector('[data-group-dm-add-member]')).toBeDisabled();
     expect(screen.getByText(/group is full/i)).toBeInTheDocument();
   });
+});
+
+
+describe('GroupDmSettings — member invitation setting', () => {
+  it.each([true, false])('owner saves membersCanInvite from %s to its opposite', async (allowed) => {
+    const user = userEvent.setup();
+    setStoreState({ dmChannel: makeGroupDm({ membersCanInvite: allowed }), authUser: makeUser() });
+    renderModal();
+
+    const toggle = screen.getByRole('switch');
+    expect(toggle).toHaveAttribute('aria-checked', String(allowed));
+    await user.click(toggle);
+    await user.click(document.querySelector('[data-group-dm-save]') as HTMLButtonElement);
+    await waitFor(() => expect(mockUpdateMetadata).toHaveBeenCalledWith('dm-1', { membersCanInvite: !allowed }));
+    expect(mockStartUpload).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])('non-owner sees a read-only setting when it is %s', (allowed) => {
+    setStoreState({ dmChannel: makeGroupDm({ ownerId: 'user-2', membersCanInvite: allowed }), authUser: makeUser() });
+    renderModal();
+    expect(screen.getByRole('switch')).toBeDisabled();
+    expect(screen.getByRole('switch')).toHaveAttribute('aria-checked', String(allowed));
+  });
+
+  it('defaults missing legacy settings to enabled', () => {
+    setStoreState({ dmChannel: makeGroupDm({ membersCanInvite: undefined }), authUser: makeUser() });
+    renderModal();
+    expect(screen.getByRole('switch')).toHaveAttribute('aria-checked', 'true');
+  });
+
+  it('replaces a local toggle draft when server metadata changes', async () => {
+    const user = userEvent.setup();
+    const dm = makeGroupDm({ membersCanInvite: true });
+    setStoreState({ dmChannel: dm, authUser: makeUser() });
+    renderModal();
+
+    await user.click(screen.getByRole('switch'));
+    act(() => useSpaceStore.setState({ dmChannels: [{ ...dm, membersCanInvite: false }] }));
+    expect(screen.getByRole('switch')).toHaveAttribute('aria-checked', 'false');
+    expect(document.querySelector('[data-group-dm-save]')).toBeDisabled();
+    act(() => useSpaceStore.setState({ dmChannels: [dm] }));
+    expect(screen.getByRole('switch')).toHaveAttribute('aria-checked', 'true');
+    expect(document.querySelector('[data-group-dm-save]')).toBeDisabled();
+  });
+
+  it('lets an existing non-owner invite when the setting is enabled', async () => {
+    setStoreState({ dmChannel: makeGroupDm({ ownerId: 'user-2' }), authUser: makeUser() });
+    useUIStore.setState({ modalData: { dmChannelId: 'dm-1', initialTab: 'members' } });
+    renderModal();
+    const button = document.querySelector('[data-group-dm-add-member]') as HTMLButtonElement;
+    expect(button).toBeEnabled();
+    await userEvent.click(button);
+    expect(useUIStore.getState().activeModal).toBe('addDmMember');
+  });
+});
+
+
+describe('GroupDmSettings — draft session safety', () => {
+  async function stageMetadataIcon(user: ReturnType<typeof userEvent.setup>) {
+    fireEvent.change(document.querySelector('input[type="file"]') as HTMLInputElement, {
+      target: { files: [new File(['image'], 'icon.png', { type: 'image/png' })] },
+    });
+    await user.click(await screen.findByTestId('cropper-mock-confirm'));
+  }
+
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    let reject!: (reason: Error) => void;
+    const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+    return { promise, resolve, reject };
+  }
+
+  it.each(['owner', 'membership', 'account', 'token', 'metadata', 'close'])('invalidates uploads after transient %s changes', async (change) => {
+    const user = userEvent.setup();
+    const dm = makeGroupDm();
+    const upload = deferred<{ filename: string }>();
+    mockWaitForTransfer.mockReturnValueOnce(upload.promise);
+    setStoreState({ dmChannel: dm, authUser: makeUser() });
+    renderModal();
+
+    await user.click(screen.getByRole('switch'));
+    await stageMetadataIcon(user);
+    await user.click(document.querySelector('[data-group-dm-save]') as HTMLButtonElement);
+    await waitFor(() => expect(mockWaitForTransfer).toHaveBeenCalledTimes(1));
+    act(() => {
+      if (change === 'owner') {
+        useSpaceStore.setState({ dmChannels: [{ ...dm, ownerId: 'user-2' }] });
+        useSpaceStore.setState({ dmChannels: [dm] });
+      } else if (change === 'membership') {
+        useSpaceStore.setState({ dmChannels: [{ ...dm, members: dm.members.filter((m) => m.id !== 'user-self') }] });
+        useSpaceStore.setState({ dmChannels: [dm] });
+      } else if (change === 'account') {
+        useAuthStore.setState({ user: null });
+        useAuthStore.setState({ user: makeUser() });
+      } else if (change === 'token') {
+        useAuthStore.setState({ token: null });
+        useAuthStore.setState({ token: 'session-token' });
+      } else if (change === 'metadata') {
+        useSpaceStore.setState({ dmChannels: [{ ...dm, membersCanInvite: false }] });
+        useSpaceStore.setState({ dmChannels: [dm] });
+      } else {
+        useUIStore.getState().closeModal(); useUIStore.getState().openModal('groupDmSettings', { dmChannelId: 'dm-1' });
+      }
+    });
+    await act(async () => upload.resolve({ filename: 'stale.webp' }));
+    expect(mockUpdateMetadata).not.toHaveBeenCalled();
+    expect(useUIStore.getState().toasts).toHaveLength(0);
+  });
+
+  it('checks ownership immediately after startUpload resolves', async () => {
+    const user = userEvent.setup();
+    const dm = makeGroupDm();
+    const started = deferred<string>();
+    mockStartUpload.mockReturnValueOnce(started.promise);
+    setStoreState({ dmChannel: dm, authUser: makeUser() });
+    renderModal();
+
+    await stageMetadataIcon(user);
+    await user.click(document.querySelector('[data-group-dm-save]') as HTMLButtonElement);
+    act(() => useSpaceStore.setState({ dmChannels: [{ ...dm, ownerId: 'user-2' }] }));
+    await act(async () => started.resolve('stale-upload'));
+    expect(mockWaitForTransfer).not.toHaveBeenCalled();
+    expect(mockUpdateMetadata).not.toHaveBeenCalled();
+    expect(screen.getByRole('switch')).toBeDisabled();
+  });
+
+  it('cancel during an upload discards the draft and does not disturb the next edit', async () => {
+    const user = userEvent.setup();
+    const upload = deferred<{ filename: string }>();
+    mockWaitForTransfer.mockReturnValueOnce(upload.promise);
+    setStoreState({ dmChannel: makeGroupDm(), authUser: makeUser() });
+    renderModal();
+
+    await user.click(screen.getByRole('switch'));
+    await stageMetadataIcon(user);
+    await user.click(document.querySelector('[data-group-dm-save]') as HTMLButtonElement);
+    await waitFor(() => expect(mockWaitForTransfer).toHaveBeenCalledTimes(1));
+    await user.click(document.querySelector('[data-group-dm-cancel]') as HTMLButtonElement);
+    act(() => useUIStore.getState().openModal('groupDmSettings', { dmChannelId: 'dm-1' }));
+    expect(screen.getByRole('switch')).toHaveAttribute('aria-checked', 'true');
+    await user.click(screen.getByRole('switch'));
+    await act(async () => upload.resolve({ filename: 'stale.webp' }));
+    expect(useUIStore.getState().activeModal).toBe('groupDmSettings');
+    expect(screen.getByRole('switch')).toHaveAttribute('aria-checked', 'false');
+    expect(document.querySelector('[data-group-dm-save]')).toBeEnabled();
+    expect(mockUpdateMetadata).not.toHaveBeenCalled();
+    await user.click(document.querySelector('[data-group-dm-save]') as HTMLButtonElement);
+    await waitFor(() => expect(mockUpdateMetadata).toHaveBeenCalledExactlyOnceWith('dm-1', { membersCanInvite: false }));
+  });
+
+  it.each(['success', 'failure'])('ignores a stale PATCH %s after cancellation and reopening', async (outcome) => {
+    const user = userEvent.setup();
+    const request = deferred<Record<string, never>>();
+    mockUpdateMetadata.mockReturnValueOnce(request.promise);
+    setStoreState({ dmChannel: makeGroupDm(), authUser: makeUser() });
+    renderModal();
+
+    await user.click(screen.getByRole('switch'));
+    await user.click(document.querySelector('[data-group-dm-save]') as HTMLButtonElement);
+    await waitFor(() => expect(mockUpdateMetadata).toHaveBeenCalledTimes(1));
+    await user.click(document.querySelector('[data-group-dm-cancel]') as HTMLButtonElement);
+    act(() => useUIStore.getState().openModal('groupDmSettings', { dmChannelId: 'dm-1' }));
+    await user.click(screen.getByRole('switch'));
+    await act(async () => {
+      if (outcome === 'success') request.resolve({});
+      else request.reject(new Error('old save failed'));
+    });
+    expect(useUIStore.getState().activeModal).toBe('groupDmSettings');
+    expect(screen.getByRole('switch')).toHaveAttribute('aria-checked', 'false');
+    expect(document.querySelector('[data-group-dm-save]')).toBeEnabled();
+    expect(useUIStore.getState().toasts).toHaveLength(0);
+  });
+
+  it('resets unsaved permission changes when the account session changes', async () => {
+    const user = userEvent.setup();
+    setStoreState({ dmChannel: makeGroupDm(), authUser: makeUser() });
+    renderModal();
+
+    await user.click(screen.getByRole('switch'));
+    act(() => useAuthStore.setState({ token: 'new-session' }));
+    expect(screen.getByRole('switch')).toHaveAttribute('aria-checked', 'true');
+    expect(document.querySelector('[data-group-dm-save]')).toBeDisabled();
+  });
+
+  it('uploads the icon to the owner instance before saving its metadata', async () => {
+    const user = userEvent.setup();
+    const owner = makeUser({ homeInstance: 'owner.example', homeUserId: 'user-self' });
+    const dm = makeGroupDm({ members: [owner, makeUser({ id: 'user-2', username: 'alice' })] });
+    setStoreState({ dmChannel: dm, authUser: owner });
+    useSpaceStore.setState({ channelOriginMap: new Map([['dm-1', 'https://owner.example']]) });
+    renderModal();
+
+    await stageMetadataIcon(user);
+    await user.click(document.querySelector('[data-group-dm-save]') as HTMLButtonElement);
+    await waitFor(() => expect(mockUpdateMetadata).toHaveBeenCalledTimes(1));
+    expect(mockStartUpload).toHaveBeenCalledWith(expect.any(File), { tray: false, origin: 'https://owner.example' });
+  });
+  it('does not apply an old crop completion to a reopened edit session', async () => {
+    const user = userEvent.setup();
+    setStoreState({ dmChannel: makeGroupDm(), authUser: makeUser() });
+    renderModal();
+
+    fireEvent.change(document.querySelector('input[type="file"]') as HTMLInputElement, {
+      target: { files: [new File(['image'], 'icon.png', { type: 'image/png' })] },
+    });
+    await screen.findByTestId('cropper-mock-confirm');
+    const oldCropComplete = lastCropComplete!;
+    // Cancel the crop before leaving the edit session.
+    await user.click(screen.getByTestId('cropper-mock-cancel'));
+    await user.click(document.querySelector('[data-group-dm-cancel]') as HTMLButtonElement);
+    act(() => useUIStore.getState().openModal('groupDmSettings', { dmChannelId: 'dm-1' }));
+    act(() => oldCropComplete(new Blob(['stale-image'], { type: 'image/webp' })));
+    expect(document.querySelector('[data-group-dm-save]')).toBeDisabled();
+    expect(mockStartUpload).not.toHaveBeenCalled();
+  });
+
+  it('ignores an upload completion after unmount', async () => {
+    const user = userEvent.setup();
+    const upload = deferred<{ filename: string }>();
+    mockWaitForTransfer.mockReturnValueOnce(upload.promise);
+    setStoreState({ dmChannel: makeGroupDm(), authUser: makeUser() });
+    const view = renderModal();
+
+    await stageMetadataIcon(user);
+    await user.click(document.querySelector('[data-group-dm-save]') as HTMLButtonElement);
+    await waitFor(() => expect(mockWaitForTransfer).toHaveBeenCalledTimes(1));
+    view.unmount();
+    await act(async () => upload.resolve({ filename: 'stale.webp' }));
+    expect(mockUpdateMetadata).not.toHaveBeenCalled();
+  });
+
+  it('resets the toggle when switching channels', async () => {
+    const user = userEvent.setup();
+    const first = makeGroupDm();
+    const second = makeGroupDm({ id: 'dm-2', membersCanInvite: false });
+    setStoreState({ dmChannel: first, authUser: makeUser() });
+    useSpaceStore.setState({ dmChannels: [first, second] });
+    renderModal();
+
+    await user.click(screen.getByRole('switch'));
+    act(() => useUIStore.getState().openModal('groupDmSettings', { dmChannelId: 'dm-2' }));
+    expect(screen.getByRole('switch')).toHaveAttribute('aria-checked', 'false');
+    expect(document.querySelector('[data-group-dm-save]')).toBeDisabled();
+  });
+
+  it('still finishes a valid save if its WebSocket update arrives before the PATCH response', async () => {
+    const user = userEvent.setup();
+    const request = deferred<Record<string, never>>();
+    const dm = makeGroupDm();
+    mockUpdateMetadata.mockReturnValueOnce(request.promise);
+    setStoreState({ dmChannel: dm, authUser: makeUser() });
+    renderModal();
+
+    await user.click(screen.getByRole('switch'));
+    await user.click(document.querySelector('[data-group-dm-save]') as HTMLButtonElement);
+    act(() => useSpaceStore.setState({ dmChannels: [{ ...dm, membersCanInvite: false }] }));
+    await act(async () => request.resolve({}));
+    expect(useUIStore.getState().activeModal).toBeNull();
+  });
+
 });

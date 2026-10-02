@@ -25,7 +25,8 @@ type PeerOptionalField =
   | 'name'
   | 'icon'
   | 'lastMessage'
-  | 'metadataUpdatedAt';
+  | 'metadataUpdatedAt'
+  | 'membersCanInvite';
 
 /**
  * A DM as a server of any version may send it. Up to 1.6.1, `GET /api/dm` left

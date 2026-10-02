@@ -1,3 +1,4 @@
+import i18n from '../i18n';
 import { isErrorCode, type ErrorCode, type ErrorDetails } from '@backspace/shared/src/errors';
 import type {
   AuthResponse,
@@ -81,7 +82,7 @@ import type {
   TelemetryPayload,
   TelemetryStatus,
 } from '@backspace/shared';
-import { getApiForOrigin, getOwnerInstanceForDm } from '../utils/crossStoreResolvers';
+import { getApiForOrigin, getOwnerInstanceForDm, getDmMetadataTarget } from '../utils/crossStoreResolvers';
 
 export type { FederationPeer, FederationOrphanedAccount, FederationResetEvent, FederationResetEventsResponse, ApprovalRequest, PeeringSubscription, PeeringNotification };
 
@@ -157,7 +158,11 @@ export class RateLimitError extends HttpError {
   }
 }
 
+type DmMetadataPatch = { name?: string | null; icon?: string | null; membersCanInvite?: boolean };
+
 export class BackspaceApiClient {
+  private readonly patchDmMetadata: (channelId: string, body: DmMetadataPatch, expectedOrigin: string) => Promise<DmChannel>;
+
   readonly auth: {
     register: (data: RegisterRequest) => Promise<AuthResponse>;
     login: (data: LoginRequest) => Promise<AuthResponse>;
@@ -249,12 +254,11 @@ export class BackspaceApiClient {
     addMember: (dmChannelId: string, data: AddDmMemberRequest) => Promise<DmChannel>;
     leave: (dmChannelId: string) => Promise<{ success: boolean }>;
     /**
-     * Owner-only: rename a group DM and/or update its icon.
-     * Routes via getApiForOrigin(getOwnerInstanceForDm(channelId)) so the
-     * federation event's sourceInstance equals the channel's ownerHomeInstance
-     * (required by the receiver's authority check).
+     * Owner-only: update a group DM's name, icon, or invitation setting.
+     * Resolves the owner instance AND its local conversation id. Refuses an
+     * unavailable owner copy rather than sending another instance's id.
      */
-    updateMetadata: (channelId: string, body: { name?: string | null; icon?: string | null }) => Promise<DmChannel>;
+    updateMetadata: (channelId: string, body: DmMetadataPatch) => Promise<DmChannel>;
     /**
      * Owner-only: kick a member from a group DM.
      *
@@ -593,6 +597,14 @@ export class BackspaceApiClient {
       url: (filename: string) => `${baseUrl}/uploads/${filename}`,
     };
 
+    this.patchDmMetadata = async (channelId, body, expectedOrigin) => {
+      // An unknown remote client falls back to the home API. Refuse to send
+      // that instance a remote copy id, even when its resolver falls back.
+      const clientOrigin = baseUrl === '/api' ? '' : new URL(baseUrl).origin;
+      if (clientOrigin !== expectedOrigin) throw new Error(i18n.t('dm:groupSettings.ownerUnavailable'));
+      return request<DmChannel>('PATCH', `/dm/${channelId}`, body);
+    };
+
     this.dm = {
       list: () => request<DmChannel[]>('GET', '/dm'),
       create: (data: CreateDmRequest) => request<DmChannel>('POST', '/dm', data),
@@ -620,7 +632,7 @@ export class BackspaceApiClient {
         request<DmChannel>('POST', `/dm/${dmChannelId}/members`, data),
       leave: (dmChannelId: string) =>
         request<{ success: boolean }>('DELETE', `/dm/${dmChannelId}/members`),
-      // Owner-only methods. Each first re-routes through the owner's home
+      // Owner-only methods first re-route through the owner's home
       // instance via getApiForOrigin(getOwnerInstanceForDm(channelId)). When
       // the resolved client is `this`, we fall through to the local request
       // (terminating the recursion). When it's a different client (i.e. a
@@ -629,10 +641,13 @@ export class BackspaceApiClient {
       // This keeps the federation event's sourceInstance equal to the
       // channel's current ownerHomeInstance — required by receiver authority
       // checks (see docs/systems/federation.md and the kick-authority test).
-      updateMetadata: (channelId, body) => {
-        const target = getApiForOrigin(getOwnerInstanceForDm(channelId));
-        if (target !== this) return target.dm.updateMetadata(channelId, body);
-        return request<DmChannel>('PATCH', `/dm/${channelId}`, body);
+      updateMetadata: async (channelId, body) => {
+        const route = getDmMetadataTarget(channelId);
+        if (!route) throw new Error(i18n.t('dm:groupSettings.ownerUnavailable'));
+        const target = getApiForOrigin(route.origin);
+        // Resolve once, then execute on that client. Re-entering the public
+        // method could route again through a lagging sibling's ownership.
+        return target.patchDmMetadata(route.channelId, body, route.origin);
       },
       kickMember: (channelId, targetUserId, federated) => {
         const target = getApiForOrigin(getOwnerInstanceForDm(channelId));

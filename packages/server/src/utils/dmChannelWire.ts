@@ -35,6 +35,7 @@ export function toDmChannelWire(
     name: channel.name ?? null,
     icon: channel.icon ?? null,
     metadataUpdatedAt: channel.metadataUpdatedAt ?? 0,
+    membersCanInvite: channel.membersCanInvite ?? true,
     members: members.map(u => sanitizeUser(u)),
     lastMessage: lastMessage ?? null,
   };

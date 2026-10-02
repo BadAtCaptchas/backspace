@@ -228,8 +228,86 @@ describe('federation e2e — legitimate member_add events are applied', () => {
   });
 });
 
+describe('federation e2e — default-on member invitations', () => {
+  it('relays a real member add while ON, then enforces a signed owner toggle and its replay', async () => {
+    const [group, fid] = await groupDelivered(A, alice, [
+      { id: carol.id }, { id: rowFor(A, bob.id), homeUserId: bob.id, homeInstance: B.domain },
+    ], relayToB);
+    befriend(A, carol.id, [rowFor(A, erin.id)]);
+    await postAs(A, carol.token, `/api/dm/${group}/members`, { userId: rowFor(A, erin.id) });
+    const add = queuedOnce(A, group, 'member_add').find(e => e.membership?.user.homeUserId === erin.id)!;
+    expect((await relayToB([add])).body?.accepted).toContain(add.messageId);
+    expect(memberIds(B, onB(fid))).toContain(erin.id);
+
+    const patch = await fetch(`${A.origin}/api/dm/${group}`, {
+      method: 'PATCH', headers: { Authorization: `Bearer ${alice.token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ membersCanInvite: false }),
+    });
+    expect(patch.status).toBe(200);
+    const update = queuedOnce(A, group, 'group_metadata_update')[0]!;
+    expect(update.metadata?.membersCanInvite).toBe(false);
+    expect((await relayToB([update])).body?.accepted).toContain(update.messageId);
+    expect((await relayToB([update])).body?.accepted).toContain(update.messageId);
+    expect(readDb(B, db => db.prepare('SELECT members_can_invite AS allowed FROM dm_channels WHERE id = ?')
+      .get(onB(fid)) as { allowed: number })).toEqual({ allowed: 0 });
+    const forged = reaimed(add, {
+      membership: { user: identity(dave, B), addedBy: identity(carol, A) },
+      group: { ...add.group!, membersCanInvite: true },
+    });
+    expect(rejectionReason(await relayToB([forged]), forged.messageId)).toBe('unauthorized_source');
+    expect(memberIds(B, onB(fid))).not.toContain(dave.id);
+  });
+
+  it('carries a missed OFF and metadata version through a signed cross-instance handover', async () => {
+    const [group, fid] = await groupDelivered(A, alice, [
+      { id: carol.id }, { id: rowFor(A, bob.id), homeUserId: bob.id, homeInstance: B.domain },
+    ], relayToB);
+    const patched = await fetch(`${A.origin}/api/dm/${group}`, {
+      method: 'PATCH', headers: { Authorization: `Bearer ${alice.token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ membersCanInvite: false }),
+    });
+    expect(patched.status).toBe(200);
+    const delayed = queuedOnce(A, group, 'group_metadata_update')[0]!;
+    await postAs(A, alice.token, `/api/dm/${group}/transfer`, { newOwnerId: rowFor(A, bob.id) });
+    const transfer = queuedOnce(A, group, 'ownership_transfer')[0]!;
+    expect(transfer.ownership?.metadata?.membersCanInvite).toBe(false);
+    expect((await relayToB([transfer])).body?.accepted).toContain(transfer.messageId);
+    expect(readDb(B, db => db.prepare('SELECT owner_id AS ownerId, members_can_invite AS allowed, metadata_updated_at AS version FROM dm_channels WHERE id = ?')
+      .get(onB(fid)) as { ownerId: string; allowed: number; version: number })).toEqual({
+      ownerId: bob.id, allowed: 0, version: delayed.metadata!.metadataUpdatedAt,
+    });
+    expect(rejectionReason(await relayToB([delayed]), delayed.messageId)).toBe('attribution_mismatch');
+  });
+
+  it('accepts a default-on non-owner bootstrap from the owner instance', async () => {
+    const add = await aliceAddsErin();
+    const fid = freshFid('member-default-on');
+    const event = reaimed(add, {
+      federatedId: fid,
+      membership: { user: identity(erin, B), addedBy: identity(carol, A) },
+    });
+    delete event.group!.membersCanInvite;
+    expect((await relayToB([event])).body?.accepted).toContain(event.messageId);
+    expect(memberIds(B, onB(fid))).toContain(erin.id);
+  });
+
+  it('refuses a member peer claiming the setting for a proven homeward owner', async () => {
+    const add = await aliceAddsErin();
+    const fid = freshFid('homeward-member');
+    const event = reaimed(add, {
+      federatedId: fid,
+      membership: { user: identity(erin, B), addedBy: identity(carol, A) },
+      group: { ...add.group!, owner: identity(dave, B), membersCanInvite: true,
+        members: [identity(dave, B), identity(carol, A), identity(erin, B)] },
+    });
+    expect(rejectionReason(await relayToB([event]), event.messageId)).toBe('invalid_target');
+    expect(channelByFederatedId(B, fid)).toBeUndefined();
+  });
+});
+
 describe('federation e2e — a member_add is refused unless the adder may add to that group', () => {
-  it('refuses a non-owner member even when the signed peer may speak for them', async () => {
+  it('refuses a non-owner member when inviting is disabled even when the signed peer may speak for them', async () => {
+    withWritableDb(B, db => db.prepare('UPDATE dm_channels SET members_can_invite = 0 WHERE id = ?').run(onB(groupFid)));
     const before = memberIds(B, onB(groupFid));
     const event = reaimed(await aliceAddsErin(), {
       membership: { user: identity(dave, B), addedBy: identity(carol, A) },
@@ -264,6 +342,8 @@ describe('federation e2e — a member_add is refused unless the adder may add to
       { id: carol.id },
       { id: rowFor(A, bob.id), homeUserId: bob.id, homeInstance: B.domain },
     ], relayToB);
+    withWritableDb(A, db => db.prepare('UPDATE dm_channels SET members_can_invite = 0 WHERE id = ?').run(group));
+    withWritableDb(B, db => db.prepare('UPDATE dm_channels SET members_can_invite = 0 WHERE id = ?').run(onB(fid)));
     await postAs(A, alice.token, `/api/dm/${group}/transfer`, { newOwnerId: carol.id });
     const transfer = queuedOnce(A, group, 'ownership_transfer')[0]!;
     expect((await relayToB([transfer])).body?.accepted).toContain(transfer.messageId);
@@ -331,11 +411,12 @@ describe('federation e2e — a member_add is refused unless the adder may add to
 });
 
 describe('federation e2e — a bootstrap is refused unless its owner is in the roster and the sender is one of its instances', () => {
-  it('refuses a bootstrap by a non-owner before creating the channel or roster', async () => {
+  it('refuses a bootstrap by a non-owner when inviting is disabled before creating the channel or roster', async () => {
     const add = await aliceAddsErin();
     const fid = freshFid('non-owner');
     const event = reaimed(add, {
       federatedId: fid,
+      group: { ...add.group!, membersCanInvite: false },
       membership: { user: identity(erin, B), addedBy: identity(carol, A) },
     });
     const res = await relayToB([event]);

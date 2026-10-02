@@ -1,0 +1,1 @@
+ALTER TABLE `dm_channels` ADD `members_can_invite` integer DEFAULT true NOT NULL;

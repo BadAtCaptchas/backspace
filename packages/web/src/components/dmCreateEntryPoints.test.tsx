@@ -87,7 +87,7 @@ function user(id: string, homeUserId: string | null = null, homeInstance: string
 }
 
 const aliceHome = user('alice-home', null, null, 'alice');
-const aliceOnRemote = user('alice-on-remote', 'alice-home', 'home.example', 'alice');
+const aliceOnRemote = user('alice-on-remote', 'alice-home', window.location.host, 'alice');
 /** bob as the home instance knows him: a replicated row naming his home identity. */
 const bobOnHome = user('bob-stub-on-home', 'bob-remote', 'remote.example', 'bob');
 /** bob in REMOTE's copy, under an id the client cannot link to `bobOnHome`. */
@@ -121,6 +121,7 @@ function renderAt(node: React.ReactNode, path = '/channels/@me') {
 }
 
 beforeEach(() => {
+  auth.state.token = 't';
   auth.state.user = { id: 'alice-home', username: 'alice', homeInstance: null, homeUserId: null };
   setOriginFromHostnameResolver((host) => (host === 'remote.example' ? REMOTE : ''));
   // alice's account on REMOTE, as REMOTE's ready registers it.
@@ -187,7 +188,7 @@ describe('a DM created from each UI entry point lands in the conversation\'s one
   });
 
   it('the add-member modal: the new group gets one row and is opened', async () => {
-    const carol: TaggedFriend = { ...user('carol-home', null, null, 'carol'), _origin: '' } as TaggedFriend;
+    const carol: TaggedFriend = { ...user('carol-home', null, null, 'carol'), _instanceOrigin: '' } as TaggedFriend;
     useSocialStore.setState({ friends: [carol] });
     useSpaceStore.getState().populateFromReady('', [], [], [copyDm(bobDmHome)]);
     const group: DmChannel = wireDm({
@@ -212,11 +213,11 @@ describe('the add-member modal names the 1-on-1 by the id of the instance it ask
     // conversation only by its own id.
     auth.state.user = { id: 'alice-home', username: 'alice', homeInstance: 'remote.example', homeUserId: 'alice-true' };
     useSpaceStore.getState().reset();
-    useSpaceStore.getState().populateFromReady(REMOTE, [], [], [copyDm(bobDmRemote)]);
-    useSpaceStore.getState().populateFromReady('', [], [], [copyDm(bobDmHome)]);
+    useSpaceStore.getState().populateFromReady(REMOTE, [], [], [{ ...copyDm(bobDmRemote), members: [user('alice-true', null, null, 'alice'), bobUnlinkedOnRemote] }]);
+    useSpaceStore.getState().populateFromReady('', [], [], [{ ...copyDm(bobDmHome), members: [user('alice-home', 'alice-true', 'remote.example', 'alice'), bobOnHome] }]);
     expect(rowIds()).toEqual(['dm-bob-remote']);
 
-    const carol: TaggedFriend = { ...user('carol-home', null, null, 'carol'), _origin: '' } as TaggedFriend;
+    const carol: TaggedFriend = { ...user('carol-home', null, null, 'carol'), _instanceOrigin: '' } as TaggedFriend;
     useSocialStore.setState({ friends: [carol] });
     vi.mocked(api.dm.createGroup).mockResolvedValue(wireDm({
       id: 'dm-group-new', ownerId: 'alice-home', createdAt: 9, members: [aliceHome, bobOnHome, user('carol-home')],
@@ -237,7 +238,7 @@ describe('the add-member modal names the 1-on-1 by the id of the instance it ask
   });
 
   it('sends no source id when the asked instance holds no copy of the conversation', async () => {
-    const carol: TaggedFriend = { ...user('carol-home', null, null, 'carol'), _origin: '' } as TaggedFriend;
+    const carol: TaggedFriend = { ...user('carol-home', null, null, 'carol'), _instanceOrigin: '' } as TaggedFriend;
     useSocialStore.setState({ friends: [carol] });
     vi.mocked(api.dm.createGroup).mockResolvedValue(wireDm({
       id: 'dm-group-new', ownerId: 'alice-home', createdAt: 9, members: [aliceHome, bobOnHome, user('carol-home')],
@@ -259,14 +260,14 @@ describe('the add-member modal names the 1-on-1 by the id of the instance it ask
 describe('the add-member modal adds to a group through home\'s copy of it', () => {
   const FID_GROUP = '0e0e0e0e-0000-4000-8000-000000000000';
   const groupRemote = wireDm({
-    id: 'dm-group-remote', federatedId: FID_GROUP, ownerId: 'alice-true', createdAt: 5,
+    id: 'dm-group-remote', federatedId: FID_GROUP, ownerId: 'alice-true', createdAt: 5, membersCanInvite: false,
     members: [user('alice-true', null, null, 'alice'), bobUnlinkedOnRemote],
   });
   const groupHome = wireDm({
-    id: 'dm-group-home', federatedId: FID_GROUP, ownerId: 'alice-home', createdAt: 4,
+    id: 'dm-group-home', federatedId: FID_GROUP, ownerId: 'alice-home', createdAt: 4, membersCanInvite: false,
     members: [user('alice-home', 'alice-true', 'remote.example', 'alice'), bobOnHome],
   });
-  const carol: TaggedFriend = { ...user('carol-home', null, null, 'carol'), _origin: '' } as TaggedFriend;
+  const carol: TaggedFriend = { ...user('carol-home', null, null, 'carol'), _instanceOrigin: '' } as TaggedFriend;
 
   beforeEach(() => {
     // alice's account is homed on REMOTE, so REMOTE's copy is the pinned row.
@@ -319,7 +320,7 @@ describe('the add-member modal adds to a group through home\'s copy of it', () =
 
 describe('the add-member modal enforces current group ownership', () => {
   const group = wireDm({
-    id: 'managed-group', createdAt: 4, ownerId: aliceHome.id,
+    id: 'managed-group', createdAt: 4, ownerId: aliceHome.id, membersCanInvite: false,
     members: [aliceHome, bobOnHome],
   });
 
@@ -390,5 +391,130 @@ describe('the add-member modal enforces current group ownership', () => {
     expect(api.dm.addMember).toHaveBeenCalledTimes(1);
     expect(useUIStore.getState().activeModal).toBe('addDmMember');
     expect(screen.getByText('Select Friends')).toBeInTheDocument();
+  });
+
+  it('allows an existing non-owner to add friends when invitations are enabled', async () => {
+    useSpaceStore.getState().updateDmOwner(group.id, bobOnHome.id);
+    useSpaceStore.getState().updateDmMetadata(group.id, { membersCanInvite: true });
+    renderAt(<AddDmMemberModal />);
+    await userEvent.click(screen.getByText('carol'));
+    await userEvent.click(screen.getByText('Add 1 Friend'));
+    expect(api.dm.addMember).toHaveBeenCalledTimes(1);
+  });
+
+  it('closes a non-owner modal immediately when the owner disables invitations', async () => {
+    useSpaceStore.getState().updateDmOwner(group.id, bobOnHome.id);
+    useSpaceStore.getState().updateDmMetadata(group.id, { membersCanInvite: true });
+    renderAt(<AddDmMemberModal />);
+    await userEvent.click(screen.getByText('carol'));
+    act(() => useSpaceStore.getState().updateDmMetadata(group.id, { membersCanInvite: false }));
+    expect(useUIStore.getState().activeModal).toBeNull();
+    expect(api.dm.addMember).not.toHaveBeenCalled();
+  });
+
+  it('stops a member batch when invitations are disabled during the first request', async () => {
+    useSpaceStore.getState().updateDmOwner(group.id, bobOnHome.id);
+    useSpaceStore.getState().updateDmMetadata(group.id, { membersCanInvite: true });
+    let finishFirst!: (value: DmChannel) => void;
+    vi.mocked(api.dm.addMember).mockImplementationOnce(() => new Promise((resolve) => { finishFirst = resolve; }));
+    renderAt(<AddDmMemberModal />);
+    await userEvent.click(screen.getByText('carol'));
+    await userEvent.click(screen.getByText('dave'));
+    await userEvent.click(screen.getByText('Add 2 Friends'));
+    act(() => useSpaceStore.getState().updateDmMetadata(group.id, { membersCanInvite: false }));
+    await act(async () => finishFirst(copyDm(group)));
+    expect(api.dm.addMember).toHaveBeenCalledTimes(1);
+    expect(useUIStore.getState().activeModal).toBeNull();
+  });
+
+  it('rejects a direct non-member modal even when invitations are enabled', () => {
+    useSpaceStore.getState().upsertDmCopy('', { ...group, members: [bobOnHome], membersCanInvite: true }, 'stated');
+    renderAt(<AddDmMemberModal />);
+    expect(useUIStore.getState().activeModal).toBeNull();
+    expect(api.dm.addMember).not.toHaveBeenCalled();
+  });
+
+  it('invalidates a batch when close and reopen happen in the same render', async () => {
+    let finishFirst!: (value: DmChannel) => void;
+    vi.mocked(api.dm.addMember).mockImplementationOnce(() => new Promise((resolve) => { finishFirst = resolve; }));
+    renderAt(<AddDmMemberModal />);
+    await userEvent.click(screen.getByText('carol'));
+    await userEvent.click(screen.getByText('dave'));
+    await userEvent.click(screen.getByText('Add 2 Friends'));
+    act(() => {
+      useUIStore.getState().closeModal();
+      useUIStore.getState().openModal('addDmMember', { dmChannelId: group.id });
+    });
+    await act(async () => finishFirst(copyDm(group)));
+    expect(api.dm.addMember).toHaveBeenCalledTimes(1);
+    expect(useUIStore.getState().activeModal).toBe('addDmMember');
+    expect(screen.getByText('Select Friends')).toBeInTheDocument();
+  });
+
+  it('stops a pending batch if the signed-in session changes', async () => {
+    let finishFirst!: (value: DmChannel) => void;
+    vi.mocked(api.dm.addMember).mockImplementationOnce(() => new Promise((resolve) => { finishFirst = resolve; }));
+    renderAt(<AddDmMemberModal />);
+    await userEvent.click(screen.getByText('carol'));
+    await userEvent.click(screen.getByText('dave'));
+    await userEvent.click(screen.getByText('Add 2 Friends'));
+    auth.state.token = 'different-session';
+    await act(async () => finishFirst(copyDm(group)));
+    expect(api.dm.addMember).toHaveBeenCalledTimes(1);
+  });
+
+
+  it('does not resume a batch after a transient permission loss in one render', async () => {
+    useSpaceStore.getState().updateDmOwner(group.id, bobOnHome.id);
+    useSpaceStore.getState().updateDmMetadata(group.id, { membersCanInvite: true });
+    let finishFirst!: (value: DmChannel) => void;
+    vi.mocked(api.dm.addMember).mockImplementationOnce(() => new Promise((resolve) => { finishFirst = resolve; }));
+    renderAt(<AddDmMemberModal />);
+    await userEvent.click(screen.getByText('carol'));
+    await userEvent.click(screen.getByText('dave'));
+    await userEvent.click(screen.getByText('Add 2 Friends'));
+    act(() => {
+      useSpaceStore.getState().updateDmMetadata(group.id, { membersCanInvite: false });
+      useSpaceStore.getState().updateDmMetadata(group.id, { membersCanInvite: true });
+    });
+    await act(async () => finishFirst(copyDm(group)));
+    expect(api.dm.addMember).toHaveBeenCalledTimes(1);
+    expect(screen.getByText('Select Friends')).toBeInTheDocument();
+  });
+
+
+  it('recognizes an existing friend listed as a native user on a remote instance', () => {
+    useSocialStore.setState({ friends: [{ ...user('bob-remote', null, null, 'bob'), _instanceOrigin: REMOTE } as TaggedFriend] });
+    renderAt(<AddDmMemberModal />);
+    expect(screen.getByText('Already in this DM')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /bob.*Already in this DM/ })).toBeDisabled();
+    expect(api.dm.addMember).not.toHaveBeenCalled();
+  });
+
+  it('adds a native remote friend using home identity, never their foreign local id', async () => {
+    useSocialStore.setState({ friends: [{ ...user('carol-remote', null, null, 'carol'), _instanceOrigin: REMOTE } as TaggedFriend] });
+    renderAt(<AddDmMemberModal />);
+    await userEvent.click(screen.getByText('carol'));
+    await userEvent.click(screen.getByText('Add 1 Friend'));
+    expect(api.dm.addMember).toHaveBeenCalledWith(group.id, {
+      userId: undefined, homeUserId: 'carol-remote', homeInstance: 'remote.example',
+    });
+  });
+
+});
+
+
+describe('1:1 conversion with a native remote friend', () => {
+  it('carries the selected remote friend home identity into the create request', async () => {
+    useSpaceStore.getState().populateFromReady('', [], [], [copyDm(bobDmHome)]);
+    useSocialStore.setState({ friends: [{ ...user('carol-remote', null, null, 'carol'), _instanceOrigin: REMOTE } as TaggedFriend] });
+    vi.mocked(api.dm.createGroup).mockResolvedValue(wireDm({ id: 'new-group', createdAt: 4, ownerId: aliceHome.id, members: [aliceHome, bobOnHome] }));
+    useUIStore.getState().openModal('addDmMember', { dmChannelId: bobDmHome.id });
+    renderAt(<AddDmMemberModal />);
+    await userEvent.click(screen.getByText('carol'));
+    await userEvent.click(screen.getByText('Add 1 Friend'));
+    expect(vi.mocked(api.dm.createGroup).mock.calls[0]?.[0].users).toContainEqual({
+      id: 'carol-remote', homeUserId: 'carol-remote', homeInstance: 'remote.example',
+    });
   });
 });
