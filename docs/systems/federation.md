@@ -1199,8 +1199,8 @@ After processing all events, the relay endpoint updates the peer's `lastSeenAt` 
 **Two paths:**
 
 **Bootstrap path** (channel does not exist locally by `federatedId`):
-1. Requires `event.group` metadata (owner + full member roster + group metadata snapshot). The owner is required and must match `membership.addedBy` by home identity. The adder must pass `attributionRefusal` before any writes, the owner must be in the resolved roster, and the signing peer must be one of the roster's instances (`mayRelayInto`); else `invalid_target` and nothing is created. See `dm-system.md` "Relayed member adds"
-2. Creates `dm_channels` row with `federatedId`, `ownerId` (resolved via `resolveOrCreateReplicatedUser`), `ownerHomeUserId`, `ownerHomeInstance`, plus the bootstrap `name`, `icon`, and `metadataUpdatedAt` from `event.group`
+1. Requires `event.group` metadata (owner + full member roster + group metadata snapshot). Both owner and adder must pass `attributionRefusal`, and both must appear in the roster before replicated users or a channel are written. `membersCanInvite` must be boolean when present and defaults to `true` when omitted. The owner can always add; another member can bootstrap only when inviting is enabled AND the signing peer is the owner's home instance directly. A homeward account binding alone cannot authorize another peer's permission snapshot. The signing peer must still be one of the roster's instances (`mayRelayInto`), and rosters larger than ten are rejected before writes. See `dm-system.md` "Relayed member adds"
+2. Creates `dm_channels` row with `federatedId`, `ownerId` (resolved via `resolveOrCreateReplicatedUser`), `ownerHomeUserId`, `ownerHomeInstance`, plus the bootstrap `name`, `icon`, `membersCanInvite`, and `metadataUpdatedAt` from `event.group`
 3. When `event.group.icon` is non-null, mirrors `processGroupMetadataUpdateEvent` and calls `downloadProfileAsset(icon, sourceInstance)` — stores the local bare filename on success or the absolute URL on failure
 4. Adds ALL roster members from `event.group.members` (each resolved via `resolveOrCreateReplicatedUser`)
 5. Sends `dm_channel_created` to **local-only members** (home instance matches `getOurOrigin()`, with normalization for bare domain)
@@ -1218,16 +1218,19 @@ interface FederationGroupPayload {
   name: string | null;            // explicit null = no custom name
   icon: string | null;            // absolute URL on the wire; null = no custom icon
   metadataUpdatedAt: number;      // 0 for legacy/unset rows
+  membersCanInvite?: boolean;     // omitted by older peers: defaults to true
 }
 ```
 
-Older peers that omit these fields fall back to safe defaults (null name/icon, `metadataUpdatedAt = 0`). Receivers never re-relay these fields — only the owner's home instance authors `group_metadata_update` events.
+Older peers that omit these fields fall back to null name/icon, `metadataUpdatedAt = 0`, and `membersCanInvite = true`. Receivers never re-relay these fields — only the owner's home instance authors `group_metadata_update` events.
+
+**Draft prototype boundary:** a remote member on B cannot bootstrap a brand-new peer C for a group owned on A: the existing owner-attribution rule already forbids that path. Supporting it requires a separately approved owner-authorization protocol; forwarding a member's claimed setting is not sufficient. Non-owner homeward bootstraps (owner homed on the receiver, acting member homed on the sender) are also refused because account standing does not prove the owner's permission. Owner-authored homeward bootstraps continue to work. Existing peers can accept member adds using their locally stored permission; propagation is asynchronous, and older servers do not enforce the new OFF setting.
 
 **Incremental path** (channel already exists):
-1. Validates authority: `attributionRefusal` on `membership.addedBy`, then the channel must be a group (`ownerId` set; else `invalid_target`), and the adder must be the current owner and a member of this instance's copy with the signing peer one of its relay target origins before the add (`mayRelayInto`); else `unauthorized_source`. Only the current owner may add. Existing attribution rules still permit an authenticated homeward relay from a conversation peer where that owner has proven federated presence. See `dm-system.md` "Relayed member adds".
+1. Validates authority: `attributionRefusal` on `membership.addedBy`, then the channel must be a group (`ownerId` set; else `invalid_target`), and the adder must be a current member of this instance's copy with the signing peer one of its relay target origins before the add (`mayRelayInto`); else `unauthorized_source`. The owner can always add; other members require this copy's stored `membersCanInvite = true`. An incremental `group` snapshot never changes or overrides that setting. Existing attribution rules still permit an authenticated homeward relay from a conversation peer where the acting member has proven federated presence. See `dm-system.md` "Relayed member adds".
 2. Cancels soft-delete if channel was pending GC
 3. Resolves added user via `resolveOrCreateReplicatedUser`
-4. Enforces max 10 members
+4. Enforces max 10 members for new insertions (the bootstrap roster already contains the target)
 5. Inserts `dm_members` row (idempotent -- skip if exists)
 6. Inserts system message, broadcasts `dm_member_added` to local WebSocket clients
 
@@ -1245,46 +1248,41 @@ Older peers that omit these fields fall back to safe defaults (null name/icon, `
 
 1. Find channel by `federatedId` -- if not found, accept idempotently. A 1-on-1 (no `ownerId`) is refused `invalid_target`: it has no owner to transfer
 2. Validate authority: `normalizeOriginForCompare(sourceInstance) === normalizeOriginForCompare(channel.ownerHomeInstance)`. Both sides are normalized to handle the bare-vs-full storage convention (see `dm-system.md` historical bugs for why this matters).
-3. Resolve the previous owner (the attributed actor) via `resolveRelayActor` before any change: unknown → the system message falls back to the channel's recorded owner
+3. The attributed `previousOwner` must match the channel's recorded owner by home identity, not just share their instance. Membership is not required: an owner self-leave can arrive first. Reject malformed optional `ownership.metadata` (complete name/icon/permission/version snapshot) before any change
 4. Resolve new owner via `resolveOrCreateReplicatedUser` (**never** `resolveLocalUser` -- must guarantee valid ID)
-5. Update `dm_channels`: `ownerId`, `ownerHomeUserId`, `ownerHomeInstance` (canonicalized to full URL on storage via `canonicalizeHomeInstance` so future authority checks stay stable)
+5. Atomically update `dm_channels`: `ownerId`, `ownerHomeUserId`, `ownerHomeInstance` (canonicalized to full URL), and optional `ownership.metadata` when its version is at least the stored version. Omission or a stale snapshot preserves stored metadata. The complete snapshot closes the missed-OFF-before-transfer gap and carries the version clock to the new owner, since old-owner metadata is no longer authoritative after handover. Its absolute icon URL is stored directly (an existing supported fallback), keeping transfer synchronous; replaced local icons are cleaned up
 6. Broadcast `dm_owner_updated` WebSocket event with `newOwnerHomeUserId` + `newOwnerHomeInstance` so local clients can refresh their owner-routing cache without reconnecting
-7. Insert system message with previous owner as actor
+7. When the metadata changes, also broadcast `dm_channel_updated` with the resulting name/icon and permission; insert the ownership system message with the previous owner as actor. Existing event dedup protects the entire handover from replay
 
 Triggered by both auto-transfer-on-leave and the manual `POST /api/dm/:id/transfer` endpoint — the receiver path is the same.
 
 ### group_metadata_update (`processGroupMetadataUpdateEvent`)
 
-Owner-authored update of a group DM's `name` and/or `icon`. Mirrors the `profile_update` shape — every payload carries both fields (`null` is unambiguously "cleared"), and a server-side version vector handles dedup; there is no partial-update wire form.
+Owner-authored update of a group DM's `name`, `icon`, and invitation permission. Every payload carries the name and icon snapshot (`null` is unambiguously "cleared"); `membersCanInvite` is optional for compatibility with older peers. A monotonic owner timestamp handles ordering and dedup.
 
 **Payload:** `FederationGroupMetadataPayload`:
 - `name: string | null` — trimmed, length-checked at the owner instance and re-checked by the receiver
 - `icon: string | null` — absolute http(s) URL on the wire (the owner instance normalizes its bare-filename storage via `normalizeIconForWire`); receivers download and store a bare filename, or fall back to the absolute URL on download failure
 - `metadataUpdatedAt: number` — captured at the moment of the owner-instance DB write
-- `actor: FederationRelayParticipant` — owner by authority invariant; used only for system-message rendering
+- `membersCanInvite?: boolean` — current owner-controlled invitation permission; omission preserves the receiver's stored value, including `false`
+- `iconChanged?: boolean` — originating mutation intent, used only to suppress a false icon-change system message when an absolute snapshot URL differs from a replica's cached filename. Omission preserves legacy notification behavior; `false` never skips snapshot application/download
+- `actor: FederationRelayParticipant` — must resolve by home identity to the current owner and a current member
 
-**Authority:** `extractDomain(sourceInstance) === extractDomain(channel.ownerHomeInstance)`. Otherwise rejected as `attribution_mismatch`. Receivers never re-relay this event — the owner instance is the only emitter.
+**Authority:** the signing source's normalized home domain must equal `channel.ownerHomeInstance`; `attributionRefusal(actor, sourceInstance)` must pass, and the actor must resolve to the current owner/member. A different user on the same owner instance is not authorized. Receivers never re-relay this event — the owner instance is the only emitter.
 
 **Targeting:** `getGroupDmTargetOrigins(channelId)` — every peer that hosts a member of the channel.
 
-**Coalescing:** queued via `queueGroupMetadataRelay`; rapid edits coalesce per peer with `entityId = channelId`.
+**Delivery and recovery:** `queueGroupMetadataRelay` writes a full snapshot to the outbox and the metadata object to the mutation log, using an entity ID containing the conversation key and version. Initial sync includes `group_metadata_update` in both channel-filtered and unfiltered mutation queries and reconstructs its `{ federatedId, metadata }` envelope. An offline peer therefore recovers an OFF setting even if its live outbox delivery expired.
 
 **Receiver flow (`processGroupMetadataUpdateEvent`):**
-1. Lookup channel by `event.federatedId`. If missing → accepted (idempotent — no replica to update).
-2. Authority: domain match against `channel.ownerHomeInstance`. Mismatch → rejected as `attribution_mismatch`.
-3. Receiver hardening (don't trust remote peers):
-   - missing `event.metadata` → rejected as `missing_metadata_payload`
-   - `payload.name` non-null with trimmed length outside `[GROUP_DM_NAME_MIN_LENGTH, GROUP_DM_NAME_MAX_LENGTH]` → rejected as `invalid_payload`
-   - `payload.icon` non-null without `http://` or `https://` prefix → rejected as `invalid_payload`
-4. Version check: `payload.metadataUpdatedAt > channel.metadataUpdatedAt`. Stale or duplicate → accepted silently (no side effects).
-5. Diff against the stored row. If neither `name` nor `icon` actually changed → accepted; no system message; no broadcast.
-6. Idempotency dedup pre-check on `(sourceInstance, sourceMessageId)` for both suffixes (see below). If every changed field already has its corresponding system row → accepted silently (outbox retry / initial-sync replay path).
-7. Resolve icon: when `iconChanged` and `payload.icon !== null`, `downloadProfileAsset(payload.icon, sourceInstance)`. Local filename on success; absolute URL fallback on failure (mirrors `processProfileUpdateEvent`).
-8. Resolve actor → local user id via `resolveOrCreateReplicatedUser`. On failure (e.g. tombstoned identity), fall back to `channel.ownerId`. If both are null → rejected as `actor_not_found`.
-9. Single transaction: update `dm_channels.{name, icon, metadataUpdatedAt}`; insert one or two system messages tagged with `(sourceInstance, sourceMessageId)` using the suffix scheme `${event.messageId}:name` / `${event.messageId}:icon` so two changes in a single event yield two distinct dedup keys.
-10. Broadcast `dm_channel_updated` to local members via `sendToDmMembers`.
-11. Broadcast each new system message via `dm_message_created`.
-12. Cleanup old local icon file when the icon changed away from a bare filename (matches the avatar precedent at `users.ts:463-466`).
+1. Look up the channel by `event.federatedId`. Missing replicas accept idempotently.
+2. Validate owner-instance and actor authority against the stored owner/member identities. Reject foreign actors before creating users or downloading assets.
+3. Validate name bounds, icon scheme, a nonnegative safe-integer version, and boolean optional permission/notification fields. Missing metadata is `missing_metadata_payload`; malformed values are `invalid_payload`.
+4. Silently accept versions at or below the stored version.
+5. Resolve a changed non-null icon to a cached filename, falling back to its absolute URL. Re-read owner identity, membership, and version after the download await; discard a stale download if ownership or a newer version changed meanwhile.
+6. Diff against the refreshed row. Preserve the stored invitation permission when the field is omitted. Even a no-op advances `metadataUpdatedAt`, preventing an older toggle from reverting a newer no-op.
+7. In one transaction, update the full snapshot and version. Insert name/icon system messages only for the relevant actual mutations, guarded by `(sourceInstance, sourceMessageId)` suffixes `:name` and `:icon`. A permission-only update does not insert a chat message.
+8. Broadcast `dm_channel_updated` with the stored invitation permission, then any new name/icon system messages. Unlink superseded local icon files. Replays produce no duplicate messages or broadcasts.
 
 **Wire dump (illustrative):**
 

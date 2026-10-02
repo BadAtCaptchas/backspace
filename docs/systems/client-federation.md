@@ -724,3 +724,16 @@ Client-side and S2S federation serve different purposes:
 3. User joins Spaces on the remote instance (client-side — API calls go directly to remote)
 4. User sends DMs — DM writes go to whichever instance delivered the channel (determined by `channelOriginMap`). S2S relay distributes messages, reactions, read states, and membership changes to all peer instances. DM calls remain home-only (gated for federated users).
 5. Friend requests and discovery work across instances (client loads friends from all connected instances, S2S relays friend events)
+
+### Group DM permission edits
+
+The owner-controlled `membersCanInvite` flag uses the existing metadata path.
+`getDmMetadataTarget` resolves the owner's connected origin and that origin's
+instance-local channel ID together; it refuses a missing owner copy rather than
+sending a pinned copy's unrelated ID. `useGroupDmMetadataDraft` shares desktop and
+mobile draft/session handling and sends staged icon uploads to the same origin.
+Canonical roster membership is required for invitation controls; missing legacy
+channel flags default ON, but later legacy updates do not overwrite a known OFF.
+Permission, membership and ownership changes invalidate stale invitation batches
+and unsubmitted owner drafts. See `dm-system.md` for server authority and mixed-
+version limitations.

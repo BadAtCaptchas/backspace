@@ -121,7 +121,10 @@
     "groupFull": "群成员已满",
     "groupFullSuffix": "— 群成员已满",
     "cropTitle": "裁剪群头像",
-    "saveFailed": "保存设置失败"
+    "saveFailed": "保存设置失败",
+    "membersCanInviteLabel": "允许成员邀请他人",
+    "membersCanInviteDescription": "现有成员可以邀请自己的好友。新成员可以查看聊天记录。",
+    "ownerUnavailable": "请连接到群主所在的实例以更改这些设置。"
   },
   "groupInfo": {
     "title": "群组信息",

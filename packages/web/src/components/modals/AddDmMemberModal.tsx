@@ -9,7 +9,7 @@ import { useAuthStore } from '../../stores/authStore';
 import { useSocialStore, type TaggedFriend } from '../../stores/socialStore';
 import { api } from '../../api/client';
 import { isSelf, parseFederatedUsername, deliveringHost } from '../../utils/identity';
-import { canAddDmMembers } from '../../utils/dmPermissions';
+import { canAddDmMembers, isDmMember } from '../../utils/dmPermissions';
 import { useCanonicalUserView } from '../../utils/userViewLookup';
 import type { User } from '@backspace/shared';
 
@@ -79,6 +79,16 @@ function AddDmFriendRow({
   );
 }
 
+/** Native friends from remote listings carry their home in the delivery tag. */
+function friendIdentity(friend: TaggedFriend) {
+  const homeInstance = friend.homeInstance || (friend._instanceOrigin ? deliveringHost(friend._instanceOrigin) : null);
+  return {
+    id: friend.id,
+    homeInstance,
+    homeUserId: friend.homeUserId ?? (homeInstance ? friend.id : null),
+  };
+}
+
 export function AddDmMemberModal() {
   const { t } = useTranslation(['dm', 'common']);
   const [query, setQuery] = useState('');
@@ -93,6 +103,7 @@ export function AddDmMemberModal() {
   const friends = useSocialStore((s) => s.friends);
   const navigate = useNavigate();
   const myUser = useAuthStore((s) => s.user);
+  const authToken = useAuthStore((s) => s.token);
   const inputRef = useRef<HTMLInputElement>(null);
   const modalSession = useRef(0);
 
@@ -103,8 +114,8 @@ export function AddDmMemberModal() {
   const canAddMembers = canAddDmMembers(dmChannel, myUser, getChannelOrigin(dmChannelId ?? ''))
     && (!homeChannel || canAddDmMembers(homeChannel, myUser, ''));
   const currentMemberIds = useMemo(
-    () => new Set(dmChannel?.members.map(m => m.id) ?? []),
-    [dmChannel?.members],
+    () => new Set(friends.filter((friend) => isDmMember(dmChannel, friendIdentity(friend), getChannelOrigin(dmChannelId ?? ''))).map((friend) => friend.id)),
+    [dmChannel, dmChannelId, friends],
   );
   const memberCount = dmChannel?.members.length ?? 0;
   const maxMembers = 10;
@@ -122,6 +133,38 @@ export function AddDmMemberModal() {
     });
   }, [friends, query, myUser]);
 
+  // Invalidate immediately even if a loss and regain of permission are batched
+  // into one React render. An old request must not resume a new modal/session.
+  useEffect(() => {
+    const invalidate = () => {
+      modalSession.current += 1;
+      setIsAdding(false);
+      setSelected(new Set());
+    };
+    const unsubscribeUi = useUIStore.subscribe((next, previous) => {
+      if (next.activeModal !== previous.activeModal || next.modalData !== previous.modalData) invalidate();
+    });
+    const unsubscribeAuth = useAuthStore.subscribe((next, previous) => {
+      if (next.token !== previous.token || next.user?.id !== previous.user?.id
+        || next.user?.homeUserId !== previous.user?.homeUserId
+        || next.user?.homeInstance !== previous.user?.homeInstance) invalidate();
+    });
+    const unsubscribeSpace = useSpaceStore.subscribe(() => {
+      if (!dmChannelId) return;
+      const current = useSpaceStore.getState().dmChannels.find((dm) => dm.id === dmChannelId);
+      const home = dmCopyOnOrigin(dmChannelId, '');
+      const viewer = useAuthStore.getState().user;
+      if (!canAddDmMembers(current, viewer, getChannelOrigin(dmChannelId))
+        || (home && !canAddDmMembers(home, viewer, ''))) invalidate();
+    });
+    return () => {
+      modalSession.current += 1;
+      unsubscribeUi();
+      unsubscribeAuth?.();
+      unsubscribeSpace();
+    };
+  }, [dmChannelId]);
+
   // Reset state when modal opens
   useEffect(() => {
     modalSession.current += 1;
@@ -136,9 +179,9 @@ export function AddDmMemberModal() {
         modalSession.current += 1;
       };
     }
-  }, [isOpen, dmChannelId]);
+  }, [isOpen, dmChannelId, modalData, myUser?.id, authToken]);
 
-  // Ownership can change while this modal is open, including between two
+  // Invite permission can change while this modal is open, including between two
   // requests in a batch. Hide immediately and clear the stale modal state.
   useEffect(() => {
     if (isOpen && !canAddMembers) closeModal();
@@ -181,7 +224,9 @@ export function AddDmMemberModal() {
       const home = dmCopyOnOrigin(dmChannelId, '');
       const viewer = useAuthStore.getState().user;
       return session === modalSession.current
-        && ui.activeModal === 'addDmMember' && ui.modalData.dmChannelId === dmChannelId
+        && ui.activeModal === 'addDmMember' && ui.modalData === modalData
+        && viewer?.id === myUser?.id && viewer?.homeUserId === myUser?.homeUserId
+        && viewer?.homeInstance === myUser?.homeInstance && useAuthStore.getState().token === authToken
         && canAddDmMembers(current, viewer, getChannelOrigin(dmChannelId))
         && (!home || canAddDmMembers(home, viewer, ''));
     };
@@ -195,7 +240,9 @@ export function AddDmMemberModal() {
     try {
       if (!dmChannel.ownerId) {
         // 1-on-1 DM → create a new group DM with all selected + existing other member
-        const partner = (homeCopy ?? dmChannel).members.find(m => !isSelf(m, myUser));
+        const source = homeCopy ?? dmChannel;
+        const sourceOrigin = homeCopy ? '' : getChannelOrigin(dmChannelId);
+        const partner = source.members.find((member) => !isDmMember({ ...source, members: [member] }, myUser, sourceOrigin));
         if (!partner) {
           setError(t('dm:addMember.noOtherMember'));
           setIsAdding(false);
@@ -212,17 +259,13 @@ export function AddDmMemberModal() {
             };
         const users = [
           partnerIdentity,
-          ...selectedFriends.map((f) => ({
-            id: f.id,
-            homeUserId: f.homeUserId,
-            homeInstance: f.homeInstance,
-          })),
+          ...selectedFriends.map(friendIdentity),
         ];
         // Home checks the source 1-on-1 by its own id; without a home copy
         // there is none to name.
         const newChannel = await api.dm.createGroup({ users, fromDmChannelId: homeCopy?.id });
-        const rowId = upsertDmCopy('', newChannel, 'stated');
         if (canStillAddMembers()) {
+          const rowId = upsertDmCopy('', newChannel, 'stated');
           closeModal();
           navigate(`/channels/@me/${rowId}`);
         }
@@ -235,10 +278,11 @@ export function AddDmMemberModal() {
         }
         for (const friend of selectedFriends) {
           if (!canStillAddMembers()) return;
+          const identity = friendIdentity(friend);
           await api.dm.addMember(homeCopy.id, {
-            userId: friend.homeInstance ? undefined : friend.id,
-            homeUserId: friend.homeUserId ?? undefined,
-            homeInstance: friend.homeInstance ?? undefined,
+            userId: identity.homeInstance ? undefined : identity.id,
+            homeUserId: identity.homeUserId ?? undefined,
+            homeInstance: identity.homeInstance ?? undefined,
           });
         }
         if (canStillAddMembers()) closeModal();

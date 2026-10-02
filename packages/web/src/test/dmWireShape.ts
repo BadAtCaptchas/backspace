@@ -20,6 +20,7 @@ export function wireDm(fields: Pick<DmChannel, 'id' | 'createdAt' | 'members'> &
     name: null,
     icon: null,
     metadataUpdatedAt: 0,
+    membersCanInvite: true,
     lastMessage: null,
     ...fields,
   };
@@ -39,6 +40,7 @@ export function asListedBy161(dm: DmChannel): DmChannel {
   delete listed.name;
   delete listed.icon;
   delete listed.metadataUpdatedAt;
+  delete listed.membersCanInvite;
   return listed as DmChannel;
 }
 

@@ -40,6 +40,7 @@ vi.mock('../stores/authStore', () => ({
 // above the rest of the file — can reference the spies without TDZ errors.
 const { remoteClient, homeClient, mockGetApiForOrigin } = vi.hoisted(() => {
   const remote = {
+    patchDmMetadata: vi.fn().mockResolvedValue({}),
     dm: {
       updateMetadata: vi.fn().mockResolvedValue({}),
       kickMember: vi.fn().mockResolvedValue({}),
@@ -48,6 +49,7 @@ const { remoteClient, homeClient, mockGetApiForOrigin } = vi.hoisted(() => {
     },
   };
   const home = {
+    patchDmMetadata: vi.fn().mockResolvedValue({}),
     dm: {
       updateMetadata: vi.fn().mockResolvedValue({}),
       kickMember: vi.fn().mockResolvedValue({}),
@@ -73,7 +75,7 @@ vi.mock('./crossStoreResolvers', async () => {
 });
 
 import { useSpaceStore, getOwnerInstanceForDm, getChannelOrigin } from '../stores/spaceStore';
-import { api } from '../api/client';
+import { api, BackspaceApiClient } from '../api/client';
 
 const baseDm = {
   id: 'dm-1',
@@ -87,6 +89,7 @@ const baseDm = {
   name: null,
   icon: null,
   metadataUpdatedAt: 0,
+  membersCanInvite: true,
 };
 
 beforeEach(() => {
@@ -137,19 +140,68 @@ describe('group DM owner routing — api.dm.* (Task 5.2)', () => {
     expect(mockGetApiForOrigin).toHaveBeenCalledWith('');
     // Home client is returned for empty origin; the singleton delegates to it,
     // and the spy on homeClient.dm.updateMetadata records the call.
-    expect(homeClient.dm.updateMetadata).toHaveBeenCalledWith('dm-1', { name: 'X' });
-    expect(remoteClient.dm.updateMetadata).not.toHaveBeenCalled();
+    expect(homeClient.patchDmMetadata).toHaveBeenCalledWith('dm-1', { name: 'X' }, '');
+    expect(remoteClient.patchDmMetadata).not.toHaveBeenCalled();
   });
 
-  it('after transfer: api.dm.updateMetadata routes to new owner instance', async () => {
-    useSpaceStore.setState({
-      dmChannels: [{ ...baseDm, ownerHomeInstance: 'https://orbit.test' }],
-    });
+  it('routes metadata to the owner instance using its own channel id', async () => {
+    const federatedId = 'group-key';
+    useSpaceStore.getState().populateFromReady('', [], [], [{ ...baseDm, federatedId, ownerHomeInstance: 'orbit.test' }]);
+    useSpaceStore.getState().populateFromReady('https://orbit.test', [], [], [{ ...baseDm, id: 'owner-copy', federatedId, ownerHomeInstance: 'orbit.test' }]);
 
-    await api.dm.updateMetadata('dm-1', { name: 'Renamed' });
+    await api.dm.updateMetadata('dm-1', { membersCanInvite: false });
 
     expect(mockGetApiForOrigin).toHaveBeenCalledWith('https://orbit.test');
-    expect(remoteClient.dm.updateMetadata).toHaveBeenCalledWith('dm-1', { name: 'Renamed' });
+    expect(remoteClient.patchDmMetadata).toHaveBeenCalledWith('owner-copy', { membersCanInvite: false }, 'https://orbit.test');
+    expect(homeClient.patchDmMetadata).not.toHaveBeenCalled();
+  });
+
+  it('rejects metadata when no owner copy is known, instead of sending the wrong local id', async () => {
+    useSpaceStore.getState().populateFromReady('', [], [], [{ ...baseDm, ownerHomeInstance: 'https://orbit.test' }]);
+    await expect(api.dm.updateMetadata('dm-1', { membersCanInvite: false })).rejects.toThrow('Connect to the group owner');
+    expect(remoteClient.patchDmMetadata).not.toHaveBeenCalled();
+    expect(homeClient.patchDmMetadata).not.toHaveBeenCalled();
+  });
+
+  it('uses one authority through delegation even while sibling ownership is stale', async () => {
+    const federatedId = 'lagging-owner-key';
+    useSpaceStore.getState().populateFromReady('', [], [], [{ ...baseDm, federatedId, ownerHomeInstance: 'orbit.test' }]);
+    useSpaceStore.getState().populateFromReady('https://orbit.test', [], [], [{ ...baseDm, id: 'remote-copy', federatedId, ownerHomeInstance: window.location.host }]);
+    const remote = new BackspaceApiClient('https://orbit.test/api', () => 'remote-token');
+    mockGetApiForOrigin.mockImplementation((origin) => origin ? remote as never : api as never);
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({ ...baseDm, membersCanInvite: false }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    try {
+      await api.dm.updateMetadata('dm-1', { membersCanInvite: false });
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(fetchSpy.mock.calls[0]?.[0]).toBe('https://orbit.test/api/dm/remote-copy');
+    } finally {
+      fetchSpy.mockRestore();
+      mockGetApiForOrigin.mockImplementation((origin) => origin ? remoteClient as never : homeClient as never);
+    }
+  });
+
+  it('refuses a disconnected remote API fallback instead of PATCHing home', async () => {
+    const federatedId = 'disconnected-key';
+    useSpaceStore.getState().populateFromReady('', [], [], [{ ...baseDm, federatedId, ownerHomeInstance: 'orbit.test' }]);
+    useSpaceStore.getState().populateFromReady('https://orbit.test', [], [], [{ ...baseDm, id: 'remote-copy', federatedId, ownerHomeInstance: 'orbit.test' }]);
+    mockGetApiForOrigin.mockReturnValue(api as never);
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    try {
+      await expect(api.dm.updateMetadata('dm-1', { membersCanInvite: false })).rejects.toThrow('Connect to the group owner');
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      fetchSpy.mockRestore();
+      mockGetApiForOrigin.mockImplementation((origin) => origin ? remoteClient as never : homeClient as never);
+    }
+  });
+
+  it('patches invite settings while preserving false across legacy metadata updates', () => {
+    useSpaceStore.getState().populateFromReady('', [], [], [{ ...baseDm }]);
+    useSpaceStore.getState().updateDmMetadata('dm-1', { membersCanInvite: false });
+    useSpaceStore.getState().updateDmMetadata('dm-1', { name: 'Legacy rename', icon: null, membersCanInvite: undefined });
+    expect(useSpaceStore.getState().dmChannels[0]?.membersCanInvite).toBe(false);
+    useSpaceStore.getState().updateDmMetadata('dm-1', { membersCanInvite: true });
+    expect(useSpaceStore.getState().dmChannels[0]?.membersCanInvite).toBe(true);
   });
 
   it('after transfer: api.dm.kickMember routes to new owner instance', async () => {

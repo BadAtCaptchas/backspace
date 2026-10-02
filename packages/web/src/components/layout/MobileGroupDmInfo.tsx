@@ -1,13 +1,13 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { DmChannel, User } from '@backspace/shared';
 import { useUIStore } from '../../stores/uiStore';
 import { useSpaceStore, getChannelOrigin } from '../../stores/spaceStore';
-import { isDmOwner } from '../../utils/dmPermissions';
+import { canAddDmMembers } from '../../utils/dmPermissions';
+import { useGroupDmMetadataDraft } from '../../hooks/useGroupDmMetadataDraft';
+import { Toggle } from '../ui/Toggle';
 import { useAuthStore } from '../../stores/authStore';
 import { useSocialStore } from '../../stores/socialStore';
-import { useTransferStore } from '../../stores/transferStore';
-import { waitForTransferAttachment } from '../../utils/waitForTransfer';
 import { api } from '../../api/client';
 import { isSelf, parseFederatedUsername, isFederationGlobeApplicable } from '../../utils/identity';
 import { useVisualViewportInset } from '../../hooks/useVisualViewportInset';
@@ -81,18 +81,12 @@ export function MobileGroupDmInfo({ params }: MobileGroupDmInfoProps) {
     [dmChannels, channelId],
   );
 
-  // ── Inline edit state ──────────────────────────────────────────────────
-  type IconState =
-    | { kind: 'unchanged' }
-    | { kind: 'cleared' }
-    | { kind: 'staged'; blob: Blob; previewUrl: string };
-
   const [editing, setEditing] = useState(false);
-  const [name, setName] = useState('');
-  const [iconState, setIconState] = useState<IconState>({ kind: 'unchanged' });
-  const [cropSrc, setCropSrc] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
-  const [saveError, setSaveError] = useState('');
+  const {
+    name, setName, membersCanInvite, setMembersCanInvite,
+    cropSrc, closeCrop, saving, saveError, isOwner, isDirty, previewIconUrl,
+    readIcon, stageIcon, clearIcon, discard, save,
+  } = useGroupDmMetadataDraft(dmChannel, editing, 'mobile', () => setEditing(false));
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // ── Destructive confirms (kick + transfer + leave) ─────────────────────
@@ -108,29 +102,6 @@ export function MobileGroupDmInfo({ params }: MobileGroupDmInfoProps) {
   // occlusion when one is. We paste that straight into the bar's `bottom`
   // style so it rides above the soft keyboard on iOS PWA.
   const { value: bottomInset, keyboardOpen } = useVisualViewportInset();
-
-  // Reset edit state whenever the channel changes or edit mode opens.
-  useEffect(() => {
-    if (!dmChannel) return;
-    if (editing) {
-      setName(dmChannel.name ?? '');
-      setIconState((prev) => {
-        if (prev.kind === 'staged') URL.revokeObjectURL(prev.previewUrl);
-        return { kind: 'unchanged' };
-      });
-      setSaveError('');
-    }
-  }, [editing, dmChannel?.id, dmChannel?.name]);
-
-  // Final cleanup: revoke any lingering preview URL on unmount.
-  useEffect(() => {
-    return () => {
-      setIconState((prev) => {
-        if (prev.kind === 'staged') URL.revokeObjectURL(prev.previewUrl);
-        return prev;
-      });
-    };
-  }, []);
 
   // ── Empty / non-group safety ───────────────────────────────────────────
   if (!dmChannel) {
@@ -155,8 +126,6 @@ export function MobileGroupDmInfo({ params }: MobileGroupDmInfoProps) {
     );
   }
 
-  const isOwner = isDmOwner(dmChannel, authUser, getChannelOrigin(dmChannel.id));
-
   const otherMembers: User[] = authUser
     ? dmChannel.members.filter((m) => !isSelf(m, authUser))
     : dmChannel.members;
@@ -166,19 +135,6 @@ export function MobileGroupDmInfo({ params }: MobileGroupDmInfoProps) {
     .join(', ');
 
   const displayName = dmChannel.name && dmChannel.name.length > 0 ? dmChannel.name : fallbackName || t('dm:names.groupFallback');
-
-  const currentName = dmChannel.name ?? '';
-  const trimmedName = name.trim();
-  const nameDirty = trimmedName !== currentName.trim();
-  const iconDirty = iconState.kind !== 'unchanged';
-  const isDirty = nameDirty || iconDirty;
-
-  const previewIconUrl: string | null | undefined =
-    iconState.kind === 'staged'
-      ? iconState.previewUrl
-      : iconState.kind === 'cleared'
-        ? null
-        : (dmChannel.icon ?? null);
 
   // Show the global federation globe next to the group name when any member
   // (besides self) is federated. Mobile intentionally omits the tooltip —
@@ -196,6 +152,7 @@ export function MobileGroupDmInfo({ params }: MobileGroupDmInfoProps) {
     .sort(sortByDisplayName);
 
   const memberCount = dmChannel.members.length;
+  const mayInvite = canAddDmMembers(dmChannel, authUser, getChannelOrigin(dmChannel.id));
   const canAddMembers = memberCount < MAX_GROUP_MEMBERS;
 
   // Friend lookup — federation-safe local-id compare (mirrors DmRosterPanel).
@@ -203,85 +160,20 @@ export function MobileGroupDmInfo({ params }: MobileGroupDmInfoProps) {
 
   // ── Icon handlers ──────────────────────────────────────────────────────
   const handleHeroClick = () => {
-    if (!editing || !isOwner) return;
+    if (!editing || !isOwner || saving) return;
     fileInputRef.current?.click();
   };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => setCropSrc(reader.result as string);
-    reader.readAsDataURL(file);
+    readIcon(file);
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
-  const handleCropComplete = (blob: Blob) => {
-    setIconState((prev) => {
-      if (prev.kind === 'staged') URL.revokeObjectURL(prev.previewUrl);
-      const previewUrl = URL.createObjectURL(blob);
-      return { kind: 'staged', blob, previewUrl };
-    });
-    setCropSrc(null);
-  };
-
-  const handleClearIcon = () => {
-    if (!isOwner) return;
-    setIconState((prev) => {
-      if (prev.kind === 'staged') URL.revokeObjectURL(prev.previewUrl);
-      return { kind: 'cleared' };
-    });
-  };
-
-  // ── Save / Cancel ─────────────────────────────────────────────────────
   const handleCancel = () => {
-    setIconState((prev) => {
-      if (prev.kind === 'staged') URL.revokeObjectURL(prev.previewUrl);
-      return { kind: 'unchanged' };
-    });
-    setSaveError('');
+    discard();
     setEditing(false);
-  };
-
-  const handleSave = async () => {
-    if (!channelId || !isOwner || !isDirty || saving) return;
-    setSaving(true);
-    setSaveError('');
-    try {
-      const body: { name?: string | null; icon?: string | null } = {};
-
-      if (nameDirty) {
-        body.name = trimmedName.slice(0, MAX_NAME_LENGTH);
-      }
-
-      if (iconState.kind === 'cleared') {
-        body.icon = null;
-      } else if (iconState.kind === 'staged') {
-        const file = new File([iconState.blob], 'dm-icon.webp', {
-          type: iconState.blob.type || 'image/webp',
-        });
-        const tid = await useTransferStore.getState().startUpload(file, {
-          tray: false,
-        });
-        const { filename } = await waitForTransferAttachment(tid);
-        body.icon = filename;
-      }
-
-      await api.dm.updateMetadata(channelId, body);
-      // Reset state and exit edit mode. The WS `dm_channel_updated` event
-      // will refresh `dmChannels` in-place.
-      setIconState((prev) => {
-        if (prev.kind === 'staged') URL.revokeObjectURL(prev.previewUrl);
-        return { kind: 'unchanged' };
-      });
-      setEditing(false);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : t('dm:groupSettings.saveFailed');
-      setSaveError(msg);
-      addToast(msg, 'warning', 4000);
-    } finally {
-      setSaving(false);
-    }
   };
 
   // ── Leave ──────────────────────────────────────────────────────────────
@@ -431,7 +323,7 @@ export function MobileGroupDmInfo({ params }: MobileGroupDmInfoProps) {
             <button
               type="button"
               onClick={handleHeroClick}
-              disabled={!editing || !isOwner}
+              disabled={!editing || !isOwner || saving}
               data-mobile-group-icon-hero
               aria-label={editing && isOwner ? t('dm:groupSettings.changeIcon') : t('dm:groupSettings.icon')}
               className={`relative block rounded-full overflow-hidden ${
@@ -451,7 +343,7 @@ export function MobileGroupDmInfo({ params }: MobileGroupDmInfoProps) {
             {editing && isOwner && previewIconUrl && (
               <button
                 type="button"
-                onClick={handleClearIcon}
+                onClick={clearIcon}
                 data-mobile-group-icon-clear
                 aria-label={t('dm:groupSettings.removeIcon')}
                 className="absolute -top-1 -right-1 w-6 h-6 rounded-full bg-surface-elevated border border-border-hard flex items-center justify-center text-txt-tertiary hover:text-txt-danger hover:bg-accent-rose/10 transition-colors"
@@ -481,7 +373,7 @@ export function MobileGroupDmInfo({ params }: MobileGroupDmInfoProps) {
               onChange={(e) => setName(e.target.value.slice(0, MAX_NAME_LENGTH))}
               placeholder={fallbackName || t('dm:names.groupFallback')}
               maxLength={MAX_NAME_LENGTH}
-              disabled={!isOwner}
+              disabled={!isOwner || saving}
               data-mobile-group-name-input
               aria-label={t('dm:groupSettings.nameAria')}
               className="input-standard w-full max-w-[280px] text-center text-base"
@@ -526,8 +418,21 @@ export function MobileGroupDmInfo({ params }: MobileGroupDmInfoProps) {
           )}
         </div>
 
+        <div className="flex items-start justify-between gap-4 px-4 py-4 border-b border-border-soft">
+          <div>
+            <p className="text-sm font-medium text-txt-primary">{t('dm:groupSettings.membersCanInviteLabel')}</p>
+            <p className="mt-1 text-xs text-txt-tertiary">{t('dm:groupSettings.membersCanInviteDescription')}</p>
+          </div>
+          <Toggle
+            enabled={membersCanInvite}
+            onChange={setMembersCanInvite}
+            disabled={!editing || !isOwner || saving}
+            ariaLabel={t('dm:groupSettings.membersCanInviteLabel')}
+          />
+        </div>
+
         {/* ACTIONS ROW ──────────────────────────────────────────────────── */}
-        {isOwner && (
+        {mayInvite && (
           <div className="px-4 py-3 border-b border-border-soft">
             <button
               type="button"
@@ -602,7 +507,6 @@ export function MobileGroupDmInfo({ params }: MobileGroupDmInfoProps) {
           <button
             type="button"
             onClick={handleCancel}
-            disabled={saving}
             className="px-3 py-1.5 text-sm text-txt-tertiary hover:text-txt-secondary transition-colors disabled:opacity-50"
             data-mobile-group-save-cancel
           >
@@ -610,7 +514,7 @@ export function MobileGroupDmInfo({ params }: MobileGroupDmInfoProps) {
           </button>
           <button
             type="button"
-            onClick={handleSave}
+            onClick={save}
             disabled={!isDirty || saving || !isOwner}
             className="px-4 py-1.5 bg-accent-primary hover:bg-accent-primary/80 text-white text-sm font-medium rounded-full transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             data-mobile-group-save
@@ -623,9 +527,9 @@ export function MobileGroupDmInfo({ params }: MobileGroupDmInfoProps) {
       {/* Cropper for new icons — 1:1, 256px max, matches GroupDmSettings. */}
       <ImageCropModal
         isOpen={cropSrc !== null}
-        onClose={() => setCropSrc(null)}
+        onClose={closeCrop}
         imageSrc={cropSrc ?? ''}
-        onCropComplete={handleCropComplete}
+        onCropComplete={stageIcon}
         title={t('dm:groupSettings.cropTitle')}
         cropShape="round"
         aspectRatio={1}

@@ -171,6 +171,7 @@ export const dmChannels = sqliteTable('dm_channels', {
   name: text('name'),
   icon: text('icon'),
   metadataUpdatedAt: integer('metadata_updated_at').default(0).notNull(),
+  membersCanInvite: integer('members_can_invite', { mode: 'boolean' }).default(true).notNull(),
 }, (table) => ({
   federatedIdx: uniqueIndex('idx_dm_federated')
     .on(table.federatedId)

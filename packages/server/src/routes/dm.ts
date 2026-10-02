@@ -27,11 +27,10 @@ import { loadDmChannelWire, loadOpenDmChannels } from '../utils/dmChannelWire.js
 import { findOrCreateOneOnOne, mintGroupKey, type OneOnOneResult } from '../utils/dmConversation.js';
 import { sendError } from '../utils/httpErrors.js';
 
-/** Members a group DM can hold, the owner included. */
-const GROUP_DM_MAX_MEMBERS = 10;
 import { deleteAttachmentFiles, deleteUploadFile, deleteAttachmentByFilename } from '../utils/fileCleanup.js';
 import { isValidAssetUrl } from './users.js';
 import {
+  GROUP_DM_MAX_MEMBERS,
   GROUP_DM_NAME_MIN_LENGTH,
   GROUP_DM_NAME_MAX_LENGTH,
   GROUP_DM_ICON_MAX_BYTES,
@@ -521,6 +520,12 @@ function transferGroupDmOwnership(
         encryptionVersion: 0,
         timestamp: ownerNow,
         ownership: {
+          metadata: {
+            name: dmChannel.name,
+            icon: normalizeIconForWire(dmChannel.icon, domainOrigin!),
+            membersCanInvite: dmChannel.membersCanInvite,
+            metadataUpdatedAt: dmChannel.metadataUpdatedAt,
+          },
           newOwner: {
             homeUserId: newOwnerHomeUserId,
             homeInstance: newOwnerHomeInstance ?? (domainOrigin ?? ''),
@@ -1115,6 +1120,7 @@ export async function dmRoutes(app: FastifyInstance): Promise<void> {
             name: channelRow?.name ?? null,
             icon: wireIcon,
             metadataUpdatedAt: channelRow?.metadataUpdatedAt ?? 0,
+            membersCanInvite: channelRow?.membersCanInvite ?? true,
           },
         };
 
@@ -1145,14 +1151,14 @@ export async function dmRoutes(app: FastifyInstance): Promise<void> {
     return reply.code(201).send(result);
   });
 
-  // PATCH /api/dm/:id — Update group DM metadata (name + icon). Owner-only.
-  // Body: { name?: string | null, icon?: string | null }
+  // PATCH /api/dm/:id — Update group metadata and invite permission. Owner-only.
+  // Body: { name?: string | null, icon?: string | null, membersCanInvite?: boolean }
   // - name: trimmed; empty → cleared (null); otherwise length must be in
   //   [GROUP_DM_NAME_MIN_LENGTH, GROUP_DM_NAME_MAX_LENGTH].
   // - icon: null/empty → cleared; bare filename → must be an attachment
   //   uploaded by the caller, image/* mimetype, ≤ GROUP_DM_ICON_MAX_BYTES;
   //   absolute http(s) URL → accepted as-is (federated rebroadcast path).
-  app.patch<{ Params: { id: string }; Body: { name?: string | null; icon?: string | null } }>('/api/dm/:id', async (request, reply) => {
+  app.patch<{ Params: { id: string }; Body: { name?: string | null; icon?: string | null; membersCanInvite?: boolean } }>('/api/dm/:id', async (request, reply) => {
     const { id } = request.params;
     const body = request.body ?? {};
     const db = getDb();
@@ -1183,10 +1189,16 @@ export async function dmRoutes(app: FastifyInstance): Promise<void> {
 
     const nameProvided = Object.prototype.hasOwnProperty.call(body, 'name');
     const iconProvided = Object.prototype.hasOwnProperty.call(body, 'icon');
+    const invitesProvided = Object.prototype.hasOwnProperty.call(body, 'membersCanInvite');
+    if (invitesProvided && typeof body.membersCanInvite !== 'boolean') {
+      return sendError(reply, 400, 'validation_failed');
+    }
+    const nextMembersCanInvite = body.membersCanInvite ?? dmChannel.membersCanInvite;
+    const invitesChanged = nextMembersCanInvite !== dmChannel.membersCanInvite;
 
-    if (!nameProvided && !iconProvided) {
+    if (!nameProvided && !iconProvided && !invitesProvided) {
       // No fields to update — return the channel unchanged.
-      return reply.code(200).send({ id: dmChannel.id, name: dmChannel.name, icon: dmChannel.icon, metadataUpdatedAt: dmChannel.metadataUpdatedAt });
+      return reply.code(200).send({ id: dmChannel.id, name: dmChannel.name, icon: dmChannel.icon, metadataUpdatedAt: dmChannel.metadataUpdatedAt, membersCanInvite: dmChannel.membersCanInvite });
     }
 
     const oldName = dmChannel.name ?? null;
@@ -1274,12 +1286,13 @@ export async function dmRoutes(app: FastifyInstance): Promise<void> {
     }
 
     // ---- No-op short-circuit ----
-    if (!nameChanged && !iconChanged) {
+    if (!nameChanged && !iconChanged && !invitesChanged) {
       return reply.code(200).send({
         id: dmChannel.id,
         name: dmChannel.name,
         icon: dmChannel.icon,
         metadataUpdatedAt: dmChannel.metadataUpdatedAt,
+        membersCanInvite: dmChannel.membersCanInvite,
       });
     }
 
@@ -1297,9 +1310,9 @@ export async function dmRoutes(app: FastifyInstance): Promise<void> {
     // ---- Transaction: persist channel update + system message rows ----
     let metadataUpdatedAt = 0;
     db.transaction((tx) => {
-      metadataUpdatedAt = Date.now();
+      metadataUpdatedAt = Math.max(Date.now(), dmChannel.metadataUpdatedAt + 1);
       tx.update(schema.dmChannels)
-        .set({ name: nextName, icon: nextIcon, metadataUpdatedAt })
+        .set({ name: nextName, icon: nextIcon, membersCanInvite: nextMembersCanInvite, metadataUpdatedAt })
         .where(eq(schema.dmChannels.id, id))
         .run();
 
@@ -1340,6 +1353,7 @@ export async function dmRoutes(app: FastifyInstance): Promise<void> {
       dmChannelId: id,
       name: nextName,
       icon: nextIcon,
+      membersCanInvite: nextMembersCanInvite,
     });
 
     // ---- Broadcast each new system message ----
@@ -1368,6 +1382,8 @@ export async function dmRoutes(app: FastifyInstance): Promise<void> {
       queueGroupMetadataRelay(id, {
         name: nextName,
         icon: nextIcon,
+        membersCanInvite: nextMembersCanInvite,
+        iconChanged,
         metadataUpdatedAt,
         actor: {
           userId: request.userId,
@@ -1393,6 +1409,7 @@ export async function dmRoutes(app: FastifyInstance): Promise<void> {
       id,
       name: nextName,
       icon: nextIcon,
+      membersCanInvite: nextMembersCanInvite,
       metadataUpdatedAt,
     });
   });
@@ -1474,12 +1491,13 @@ export async function dmRoutes(app: FastifyInstance): Promise<void> {
     if (!dmChannel.ownerId) {
       return sendError(reply, 400, 'dm_not_group');
     }
-    // Only the group owner can authorize expanding access to private DM history
-    if (dmChannel.ownerId !== request.userId) {
+    // Members may invite only while the current owner permits it. Never take
+    // this permission from the request: the persisted channel is authoritative.
+    if (!dmChannel.membersCanInvite && dmChannel.ownerId !== request.userId) {
       return sendError(reply, 403, 'dm_owner_only');
     }
 
-    // Validate the owner and target are friends
+    // Validate the caller and target are friends
     const friendship = db.select().from(schema.friends).where(
       or(
         and(eq(schema.friends.userId, request.userId), eq(schema.friends.friendId, targetUserId)),
@@ -1612,6 +1630,7 @@ export async function dmRoutes(app: FastifyInstance): Promise<void> {
 
       const addedUser = db.select().from(schema.users).where(eq(schema.users.id, targetUserId)).get();
       const adderUser = db.select().from(schema.users).where(eq(schema.users.id, request.userId)).get();
+      const ownerUser = db.select().from(schema.users).where(eq(schema.users.id, dmChannel.ownerId!)).get();
 
       // Carry the current group metadata snapshot so a fresh peer can
       // bootstrap the channel with the correct name + icon. Re-fetch to
@@ -1640,13 +1659,14 @@ export async function dmRoutes(app: FastifyInstance): Promise<void> {
         },
         group: {
           owner: {
-            homeUserId: dmChannel.ownerHomeUserId || request.userId,
-            homeInstance: dmChannel.ownerHomeInstance || domainOrigin,
+            homeUserId: ownerUser?.homeUserId || dmChannel.ownerId!,
+            homeInstance: ownerUser?.homeInstance || domainOrigin,
           },
           members: allParticipants,
           name: channelRow?.name ?? null,
           icon: wireIcon,
           metadataUpdatedAt: channelRow?.metadataUpdatedAt ?? 0,
+          membersCanInvite: channelRow?.membersCanInvite ?? true,
         },
       };
 

@@ -136,6 +136,14 @@ describe('DmChannel wire shape: GET /api/dm, ready and dm_channel_created agree'
     expect(listEntry).toEqual(readyEntry);
   });
 
+  it('lists disabled invitations consistently in ready, REST and channel-created payloads', async () => {
+    testDb.update(schema.dmChannels).set({ membersCanInvite: false }).where(eq(schema.dmChannels.id, GROUP)).run();
+    const { loadDmChannelWire } = await import('../utils/dmChannelWire.js');
+    expect((await listedDmChannels(app)).find(d => d.id === GROUP)?.membersCanInvite).toBe(false);
+    expect((await readyDmChannels()).find(d => d.id === GROUP)?.membersCanInvite).toBe(false);
+    expect(loadDmChannelWire(testDb as never, GROUP)?.membersCanInvite).toBe(false);
+  });
+
   it('the list carries the conversation key and the group metadata', async () => {
     const list = await listedDmChannels(app);
     const one = list.find(d => d.id === ONE_ON_ONE)!;
@@ -148,6 +156,7 @@ describe('DmChannel wire shape: GET /api/dm, ready and dm_channel_created agree'
       ownerHomeUserId: ME,
       ownerHomeInstance: 'local.example',
       name: 'Weekend plans',
+      membersCanInvite: true,
       icon: '/uploads/group-icon.png',
       metadataUpdatedAt: now + 5,
     });

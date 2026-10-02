@@ -398,6 +398,8 @@ export interface DmChannel {
   name: string | null;
   icon: string | null;
   metadataUpdatedAt: number;
+  /** Owners may disable member invitations; older servers omit this (default true). */
+  membersCanInvite: boolean;
 }
 
 export interface DmMessage {
@@ -540,7 +542,7 @@ export type ServerEvent =
   | { type: 'space_voice_state'; spaceId: string; voiceStates: Record<string, string[]>; voiceChannelElapsedSeconds: Record<string, number>; voiceUserStates: Record<string, { isMuted: boolean; isDeafened: boolean; isCameraOn: boolean; isScreenSharing: boolean }>; spaceVoiceStates: Record<string, { spaceMuted: boolean; spaceDeafened: boolean; permissionMuted: boolean }> }
   | { type: 'dm_channel_created'; dmChannel: DmChannel }
   | { type: 'dm_channel_closed'; dmChannelId: string }
-  | { type: 'dm_channel_updated'; dmChannelId: string; name: string | null; icon: string | null }
+  | { type: 'dm_channel_updated'; dmChannelId: string; name: string | null; icon: string | null; membersCanInvite?: boolean }
   | { type: 'dm_member_added'; dmChannelId: string; user: User }
   | { type: 'dm_member_removed'; dmChannelId: string; userId: string }
   | { type: 'friend_removed'; userId: string }
@@ -1244,6 +1246,13 @@ export interface FederationMembershipPayload {
 export interface FederationOwnershipPayload {
   newOwner: FederationRelayParticipant;
   previousOwner: FederationRelayParticipant;
+  /** Last owner-authoritative state, so an out-of-order transfer cannot lose a restriction. */
+  metadata?: {
+    name: string | null;
+    icon: string | null;
+    membersCanInvite: boolean;
+    metadataUpdatedAt: number;
+  };
 }
 
 export interface FederationGroupPayload {
@@ -1254,12 +1263,18 @@ export interface FederationGroupPayload {
   name: string | null;
   icon: string | null;            // absolute URL
   metadataUpdatedAt: number;
+  /** Missing on older peers: member invitations are enabled. */
+  membersCanInvite?: boolean;
 }
 
 export interface FederationGroupMetadataPayload {
   name: string | null;     // explicit null = cleared
   icon: string | null;     // absolute URL on the wire; null = cleared
+  /** Originating edit intent, only for system-message rendering; snapshot still applies. */
+  iconChanged?: boolean;
   metadataUpdatedAt: number;
+  /** Omission preserves the receiver's current permission. */
+  membersCanInvite?: boolean;
   actor: FederationRelayParticipant; // == owner by authority invariant; used for system-message rendering
 }
 
