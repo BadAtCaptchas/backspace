@@ -1,31 +1,32 @@
-import React, { useMemo, useRef, useEffect } from 'react';
+import React, { useRef, useEffect } from 'react';
 import { createPortal } from 'react-dom';
-import type { MemberWithUser } from '@backspace/shared';
+import { useTranslation } from 'react-i18next';
 import { Avatar } from '../ui/Avatar';
-import { useSpaceStore } from '../../stores/spaceStore';
 import { useFloatingPosition } from '../../hooks/useFloatingPosition';
 import { useCanonicalUserView } from '../../utils/userViewLookup';
+import { userDisplayName } from '../../utils/identity';
 import { useUIStore } from '../../stores/uiStore';
-
-const MAX_RESULTS = 8;
+import type { ChannelUser } from '../../utils/channelUser';
 
 function MentionMemberRow({
-  member,
+  candidate,
   isSelected,
   selectedRef,
   onSelect,
-  roleColor,
   mobile,
 }: {
-  member: MemberWithUser;
+  candidate: ChannelUser;
   isSelected: boolean;
   selectedRef: React.RefObject<HTMLDivElement>;
-  onSelect: (member: MemberWithUser) => void;
-  roleColor: string | undefined;
+  onSelect: (candidate: ChannelUser) => void;
   mobile: boolean;
 }) {
-  const canonical = useCanonicalUserView(member.user);
-  const displayName = canonical.displayName ?? canonical.username;
+  const canonical = useCanonicalUserView(candidate.user);
+  const roleColor = candidate.nameColor;
+  const displayName = userDisplayName(canonical);
+  // The username is the second label whenever it says more than the name:
+  // a display name is set, or the name is the base of a federated username.
+  const showUsername = canonical.username !== displayName;
   // Mobile: ≥44 px tap target per Apple HIG; desktop: compact list.
   const rowSizing = mobile
     ? 'gap-3 px-3 py-2.5 min-h-[44px]'
@@ -33,7 +34,7 @@ function MentionMemberRow({
   return (
     <div
       ref={isSelected ? selectedRef : undefined}
-      onClick={() => onSelect(member)}
+      onClick={() => onSelect(candidate)}
       className={`flex items-center mx-1 rounded cursor-pointer transition-colors ${rowSizing} ${
         isSelected ? 'bg-interactive-selected' : 'hover:bg-interactive-hover'
       }`}
@@ -46,58 +47,69 @@ function MentionMemberRow({
         userId={canonical.homeUserId ?? canonical.id}
         user={canonical}
       />
-      <span
-        className={`${mobile ? 'text-[15px]' : 'text-[14px]'} font-medium truncate`}
-        style={roleColor ? { color: roleColor } : undefined}
-      >
-        {displayName}
-      </span>
-      {canonical.displayName && (
-        <span className="text-[12px] text-txt-tertiary truncate">
-          @{canonical.username}
+      {/* The name keeps its width while the username has any to give: the
+          username truncates first, and the name only once it alone is wider
+          than the row. The spacing is padding inside the username's clipping
+          box, so a username squeezed to nothing takes its gap with it. */}
+      <div className="flex items-center min-w-0 flex-1">
+        <span
+          className={`${mobile ? 'text-[15px]' : 'text-[14px]'} font-medium shrink-0 max-w-full truncate`}
+          style={roleColor ? { color: roleColor } : undefined}
+        >
+          {displayName}
         </span>
-      )}
+        {showUsername && (
+          <span className="flex min-w-0 overflow-hidden">
+            <span className={`text-[12px] text-txt-tertiary min-w-0 truncate ${mobile ? 'pl-3' : 'pl-2.5'}`}>
+              @{canonical.username}
+            </span>
+          </span>
+        )}
+      </div>
     </div>
   );
 }
 
 interface MentionPopoverProps {
-  query: string;
+  /**
+   * The channel's matching candidates, already filtered and capped
+   * (`filterMentionCandidates`). The composer owns the list so its keyboard
+   * navigation and this popover index the same rows.
+   */
+  candidates: ChannelUser[];
   selectedIndex: number;
-  onSelect: (member: MemberWithUser) => void;
+  onSelect: (candidate: ChannelUser) => void;
   anchorRef: React.RefObject<HTMLElement | null>;
 }
 
 interface ResolvedListProps {
-  filtered: MemberWithUser[];
+  candidates: ChannelUser[];
   selectedIndex: number;
   selectedRef: React.RefObject<HTMLDivElement>;
-  onSelect: (member: MemberWithUser) => void;
-  getMemberColor: (member: MemberWithUser) => string | undefined;
+  onSelect: (candidate: ChannelUser) => void;
   mobile: boolean;
 }
 
 function MemberList({
-  filtered,
+  candidates,
   selectedIndex,
   selectedRef,
   onSelect,
-  getMemberColor,
   mobile,
 }: ResolvedListProps) {
+  const { t } = useTranslation(['chat', 'common']);
   return (
     <>
       <div className="px-2 py-1.5 text-[11px] font-bold text-txt-tertiary uppercase tracking-wider">
-        Members
+        {t('common:labels.members')}
       </div>
-      {filtered.map((member, i) => (
+      {candidates.map((candidate, i) => (
         <MentionMemberRow
-          key={member.userId}
-          member={member}
+          key={candidate.userId}
+          candidate={candidate}
           isSelected={i === selectedIndex}
           selectedRef={selectedRef}
           onSelect={onSelect}
-          roleColor={getMemberColor(member)}
           mobile={mobile}
         />
       ))}
@@ -105,25 +117,19 @@ function MemberList({
   );
 }
 
-interface DesktopMentionProps extends MentionPopoverProps {
-  filtered: MemberWithUser[];
-  getMemberColor: (member: MemberWithUser) => string | undefined;
-}
-
 function DesktopMention({
-  filtered,
+  candidates,
   selectedIndex,
   onSelect,
   anchorRef,
-  getMemberColor,
-}: DesktopMentionProps) {
+}: MentionPopoverProps) {
   const selectedRef = useRef<HTMLDivElement>(null);
   const floatingRef = useRef<HTMLDivElement>(null);
 
   const { style } = useFloatingPosition(anchorRef, floatingRef, {
     placement: 'top',
     offset: 4,
-    enabled: filtered.length > 0,
+    enabled: candidates.length > 0,
   });
 
   // Scroll selected item into view
@@ -135,11 +141,10 @@ function DesktopMention({
     <div ref={floatingRef} style={style} className="w-[280px]">
       <div className="glass rounded-lg overflow-hidden max-h-[320px] overflow-y-auto scrollbar-thin">
         <MemberList
-          filtered={filtered}
+          candidates={candidates}
           selectedIndex={selectedIndex}
           selectedRef={selectedRef}
           onSelect={onSelect}
-          getMemberColor={getMemberColor}
           mobile={false}
         />
       </div>
@@ -148,17 +153,11 @@ function DesktopMention({
   );
 }
 
-interface MobileMentionProps extends MentionPopoverProps {
-  filtered: MemberWithUser[];
-  getMemberColor: (member: MemberWithUser) => string | undefined;
-}
-
 function MobileMention({
-  filtered,
+  candidates,
   selectedIndex,
   onSelect,
-  getMemberColor,
-}: MobileMentionProps) {
+}: MentionPopoverProps) {
   const selectedRef = useRef<HTMLDivElement>(null);
 
   // Scroll selected item into view as the user types/arrows
@@ -177,9 +176,9 @@ function MobileMention({
       <div
         className="fixed left-0 right-0 z-[301] rounded-t-2xl glass-modal animate-slide-up-sheet flex flex-col"
         style={{
-          bottom: 'env(keyboard-inset-height, 0px)',
-          paddingBottom: 'env(safe-area-inset-bottom)',
-          maxHeight: 'min(50dvh, 50vh)',
+          bottom: 'var(--keyboard-inset)',
+          paddingBottom: 'var(--safe-bottom)',
+          maxHeight: 'min(calc(50*var(--app-dvh)), calc(50*var(--app-vh)))',
         }}
       >
         {/* Drag handle */}
@@ -187,11 +186,10 @@ function MobileMention({
 
         <div className="flex-1 min-h-0 overflow-y-auto scrollbar-thin">
           <MemberList
-            filtered={filtered}
+            candidates={candidates}
             selectedIndex={selectedIndex}
             selectedRef={selectedRef}
             onSelect={onSelect}
-            getMemberColor={getMemberColor}
             mobile={true}
           />
         </div>
@@ -201,57 +199,28 @@ function MobileMention({
   );
 }
 
-export function MentionPopover({ query, selectedIndex, onSelect, anchorRef }: MentionPopoverProps) {
-  const members = useSpaceStore((s) => s.members);
-  const spaces = useSpaceStore((s) => s.spaces);
-  const currentSpaceId = useSpaceStore((s) => s.currentSpaceId);
+export function MentionPopover({ candidates, selectedIndex, onSelect, anchorRef }: MentionPopoverProps) {
   const isMobile = useUIStore((s) => s.isMobile);
 
-  const ownerId = spaces.find((s) => s.id === currentSpaceId)?.ownerId;
-
-  const filtered = useMemo(() => {
-    const q = query.toLowerCase();
-    return members
-      .filter((m) => {
-        const name = (m.user.displayName ?? m.user.username).toLowerCase();
-        const username = m.user.username.toLowerCase();
-        return name.includes(q) || username.includes(q);
-      })
-      .slice(0, MAX_RESULTS);
-  }, [members, query]);
-
-  if (filtered.length === 0) return null;
-
-  const getMemberColor = (member: MemberWithUser): string | undefined => {
-    if (member.roles && member.roles.length > 0) {
-      const sorted = [...member.roles].sort((a, b) => b.position - a.position);
-      return sorted[0]!.color;
-    }
-    if (ownerId && member.userId === ownerId) return '#fda4af';
-    return undefined;
-  };
+  if (candidates.length === 0) return null;
 
   if (isMobile) {
     return (
       <MobileMention
-        query={query}
+        candidates={candidates}
         selectedIndex={selectedIndex}
         onSelect={onSelect}
         anchorRef={anchorRef}
-        filtered={filtered}
-        getMemberColor={getMemberColor}
       />
     );
   }
 
   return (
     <DesktopMention
-      query={query}
+      candidates={candidates}
       selectedIndex={selectedIndex}
       onSelect={onSelect}
       anchorRef={anchorRef}
-      filtered={filtered}
-      getMemberColor={getMemberColor}
     />
   );
 }

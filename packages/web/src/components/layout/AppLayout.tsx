@@ -1,5 +1,8 @@
 import React, { useEffect } from 'react';
+import { isMobileViewport } from '../../platform/interfaceScale';
 import { useParams, useNavigate } from 'react-router-dom';
+import { useTranslation } from 'react-i18next';
+import i18n from '../../i18n';
 import { SpaceSidebar } from './SpaceSidebar';
 import { ChannelSidebar } from './ChannelSidebar';
 import { MainContent } from './MainContent';
@@ -19,6 +22,8 @@ import { NewDmModal } from '../modals/NewDmModal';
 import { AddDmMemberModal } from '../modals/AddDmMemberModal';
 import { GroupDmSettings } from '../modals/GroupDmSettings';
 import { UserProfileModal } from '../modals/UserProfileModal';
+import { ConnectAndJoinModal } from '../modals/ConnectAndJoinModal';
+import { MemberRolesModal } from '../modals/MemberRolesModal';
 import { IncomingCallModal } from '../voice/IncomingCallModal';
 import { PictureInPicture } from '../voice/PictureInPicture';
 import { SoundController } from '../voice/SoundController';
@@ -27,6 +32,7 @@ import { NotificationController } from '../NotificationController';
 import { UserProfilePopout } from '../ui/UserProfilePopout';
 import { ToastContainer } from '../ui/ToastContainer';
 import { UpdateToast } from '../ui/UpdateToast';
+import { InstanceUpdateToast } from '../ui/InstanceUpdateToast';
 import { ContextMenuRenderer } from '../ui/ContextMenuRenderer';
 import { useAuth } from '../../hooks/useAuth';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
@@ -43,6 +49,7 @@ import { useVoiceStore } from '../../stores/voiceStore';
 import { AudioManager } from '../../audio/AudioManager';
 
 export function AppLayout() {
+  const { t } = useTranslation('common');
   const { spaceId, channelId } = useParams<{ spaceId?: string; channelId?: string }>();
   const navigate = useNavigate();
   
@@ -155,9 +162,11 @@ export function AppLayout() {
           const newest = devices.find(d =>
             d.kind === 'audioinput' && d.groupId && newGroups.includes(d.groupId) && d.label,
           );
-          const label = newest?.label || 'New audio device';
+          // `i18n.t` rather than the hook's `t`: this closure lives for the
+          // component's lifetime and must follow later language changes.
+          const label = newest?.label || i18n.t('common:devices.unnamedAudioInput');
           useUIStore.getState().addToast(
-            `${label} detected — choose it in Voice settings to switch`,
+            i18n.t('common:devices.newAudioInput', { label }),
             'info',
             6000,
           );
@@ -263,7 +272,7 @@ export function AppLayout() {
 
   // Responsive detection
   useEffect(() => {
-    const checkMobile = () => setIsMobile(window.innerWidth < 768);
+    const checkMobile = () => setIsMobile(isMobileViewport());
     checkMobile();
     window.addEventListener('resize', checkMobile);
     return () => window.removeEventListener('resize', checkMobile);
@@ -339,16 +348,16 @@ export function AppLayout() {
 
   if (!user || showBootSkeleton) {
     return (
-      <div className="h-full flex bg-surface-base" role="status" aria-label="Loading Backspace">
+      <div className="h-full flex bg-surface-base" role="status" aria-label={t('app.loading')}>
         {/* Space strip */}
-        <div className="w-[72px] hidden md:flex flex-col items-center gap-3 pt-4 bg-surface-base flex-shrink-0">
+        <div className="w-[72px] hidden desktop:flex flex-col items-center gap-3 pt-4 bg-surface-base flex-shrink-0">
           {Array.from({ length: 5 }, (_, i) => (
             <div key={i} className="skeleton skeleton-circle w-12 h-12" style={{ animationDelay: `${i * 0.1}s` }} />
           ))}
         </div>
 
         {/* Sidebar */}
-        <div className="w-60 hidden md:flex bg-surface-channel flex-shrink-0 flex-col pt-4 px-2">
+        <div className="w-60 hidden desktop:flex bg-surface-channel flex-shrink-0 flex-col pt-4 px-2">
           {/* Header bar */}
           <div className="skeleton skeleton-bar w-[60%] h-4 mb-6 ml-2" />
           {/* Channel items */}
@@ -406,6 +415,9 @@ export function AppLayout() {
         <AddDmMemberModal />
         <GroupDmSettings />
         <UserProfileModal />
+        <ConnectAndJoinModal />
+        {/* MemberRolesModal is desktop-only: it opens from the profile card's
+            Edit Roles, and its two-pane layout has no mobile form. */}
         <IncomingCallModal />
         <ImagePreview />
         {/* PictureInPicture is desktop-only. Mobile has its own purpose-built
@@ -419,6 +431,7 @@ export function AppLayout() {
         <GlobalAudioRenderer />
         <NotificationController />
         <UpdateToast />
+        <InstanceUpdateToast />
         <ToastContainer />
         <ContextMenuRenderer />
       </>
@@ -427,9 +440,9 @@ export function AppLayout() {
 
   // ── Desktop layout ──
   return (
-    <div className="h-full flex flex-col md:grid md:grid-cols-[312px_1fr] md:grid-rows-[minmax(0,1fr)] bg-surface-base overflow-hidden">
+    <div className="h-full flex flex-col desktop:grid desktop:grid-cols-[312px_1fr] desktop:grid-rows-[minmax(0,1fr)] bg-surface-base overflow-hidden">
       {/* Space sidebar - always visible on desktop */}
-      <div className={`fixed inset-y-0 left-0 z-40 flex w-[312px] transition-transform duration-200 ${sidebarOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'} md:static md:z-auto md:w-auto md:transform-none`}>
+      <div className={`fixed inset-y-0 left-0 z-40 flex w-[312px] transition-transform duration-200 ${sidebarOpen ? 'translate-x-0' : '-translate-x-full desktop:translate-x-0'} desktop:static desktop:z-auto desktop:w-auto desktop:transform-none`}>
         <SpaceSidebar />
         <ChannelSidebar />
       </div>
@@ -454,6 +467,8 @@ export function AppLayout() {
       <AddDmMemberModal />
       <GroupDmSettings />
       <UserProfileModal />
+      <ConnectAndJoinModal />
+      <MemberRolesModal />
       <IncomingCallModal />
       <ImagePreview />
       <PictureInPicture />
@@ -463,7 +478,7 @@ export function AppLayout() {
       <UpdateToast />
 
       {/* User Profile Popout */}
-      {userProfilePopout.user && userProfilePopout.position && (
+      {userProfilePopout.user && userProfilePopout.anchor && (
         <>
           <div
             className="fixed inset-0 z-[145]"
@@ -472,12 +487,17 @@ export function AppLayout() {
           <UserProfilePopout
             user={userProfilePopout.user}
             onClose={closeUserProfile}
-            position={userProfilePopout.position}
+            anchor={userProfilePopout.anchor}
+            placement={userProfilePopout.placement}
+            member={userProfilePopout.member}
           />
         </>
       )}
 
-      {/* Federation toasts */}
+      {/* Federation toasts render through ToastContainer below (raised by the
+          useFederationToasts() hook above); this also mounts the instance
+          update toast. */}
+      <InstanceUpdateToast />
       <ToastContainer />
       <ContextMenuRenderer />
     </div>

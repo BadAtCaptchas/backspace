@@ -1,12 +1,27 @@
 import React, { useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { Avatar } from '../../ui/Avatar';
 import { ConfirmDialog } from '../../ui/ConfirmDialog';
 import { useSpaceStore, getApiForOrigin } from '../../../stores/spaceStore';
-import { useAuthStore } from '../../../stores/authStore';
 import { parseFederatedUsername, isFederationGlobeApplicable } from '../../../utils/identity';
 import { useCanonicalUserView } from '../../../utils/userViewLookup';
-import { hasPermissionBit, PermissionBits } from '../../../utils/permissions';
+import { hasPermissionBit, PermissionBits, stringToPermissions } from '../../../utils/permissions';
+import {
+  myUserIdInSpace,
+  viewerCanActOn,
+  viewerCanManageRoleAt,
+  viewerHoldsEveryBit,
+  useViewerHeldPermissions,
+} from '../../../utils/roleHierarchy';
+import { useFormatters } from '../../../i18n/formatters';
+import { describeError } from '../../../i18n/errors';
 import type { MemberWithUser, Role } from '@backspace/shared';
+
+// The padlock the role editor's lock notes use.
+const LOCK_ICON = 'M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z';
+
+/** Why a role checkbox is locked: the role ranks too high, or it carries bits the viewer lacks. */
+type RoleLock = 'rank' | 'bits';
 
 function MembersPanelRow({
   member,
@@ -16,9 +31,12 @@ function MembersPanelRow({
   expandable,
   canKick,
   canBan,
-  currentUserId,
+  isSelf,
   assignableRoles,
+  manageableRoleIds,
   memberRoleIds,
+  savedRoleIds,
+  heldPermissions,
   hasPendingChanges,
   onToggleExpand,
   onRoleToggle,
@@ -33,9 +51,15 @@ function MembersPanelRow({
   expandable: boolean;
   canKick: boolean;
   canBan: boolean;
-  currentUserId: string | undefined;
+  isSelf: boolean;
   assignableRoles: Role[];
+  /** Roles the viewer may hand out or take back (below their own top role). */
+  manageableRoleIds: Set<string>;
   memberRoleIds: Set<string>;
+  /** The member's roles as the server has them; a role not among them is being given. */
+  savedRoleIds: Set<string>;
+  /** The viewer's bits in the space (held-bits rule); null when not loaded. */
+  heldPermissions: bigint | null;
   hasPendingChanges: boolean;
   onToggleExpand: (userId: string) => void;
   onRoleToggle: (userId: string, roleId: string, currentRoleIds: Set<string>) => void;
@@ -43,9 +67,26 @@ function MembersPanelRow({
   onCancelRoleChange: (userId: string) => void;
   onPendingAction: (action: { type: 'kick' | 'ban'; userId: string; displayName: string }) => void;
 }) {
+  const { t } = useTranslation(['spaces', 'common']);
   const canonical = useCanonicalUserView(member.user);
   const isOwner = member.userId === ownerId;
   const displayName = canonical.displayName ?? canonical.username;
+
+  // A role is locked when it ranks at or above the viewer (hierarchy), or when
+  // giving it would hand out bits the viewer does not hold (held-bits rule).
+  // Taking a role the member already has is governed by the hierarchy alone.
+  const roleLocks = new Map<string, RoleLock>();
+  for (const role of assignableRoles) {
+    if (!manageableRoleIds.has(role.id)) roleLocks.set(role.id, 'rank');
+    else if (!savedRoleIds.has(role.id) && !viewerHoldsEveryBit(heldPermissions, stringToPermissions(role.permissions))) {
+      roleLocks.set(role.id, 'bits');
+    }
+  }
+  const lockKinds = (['rank', 'bits'] as const).filter((kind) => [...roleLocks.values()].includes(kind));
+  const lockReason: Record<RoleLock, string> = {
+    rank: t('spaces:settings.members.rolesAboveYou'),
+    bits: t('spaces:settings.members.rolesUnheld'),
+  };
 
   return (
     <div>
@@ -75,7 +116,7 @@ function MembersPanelRow({
             <div className="flex items-center gap-1 flex-wrap">
               {isOwner && (
                 <span className="text-[10px] px-1.5 py-0.5 rounded bg-accent-rose/20 text-txt-danger font-medium">
-                  Owner
+                  {t('spaces:settings.members.owner')}
                 </span>
               )}
               {member.roles?.filter((r) => r.id !== spaceId).map((r) => (
@@ -88,27 +129,27 @@ function MembersPanelRow({
                 </span>
               ))}
               {!isOwner && (!member.roles || member.roles.filter((r) => r.id !== spaceId).length === 0) && (
-                <span className="text-[10px] text-txt-tertiary">No roles</span>
+                <span className="text-[10px] text-txt-tertiary">{t('spaces:settings.members.noRoles')}</span>
               )}
             </div>
           </div>
         </div>
 
         <div className="flex items-center gap-1 flex-shrink-0">
-          {canBan && member.userId !== currentUserId && !isOwner && (
+          {canBan && !isSelf && !isOwner && (
             <button
               onClick={(e) => { e.stopPropagation(); onPendingAction({ type: 'ban', userId: member.userId, displayName }); }}
               className="px-2 py-1 text-xs text-txt-danger hover:bg-accent-rose/10 rounded transition-colors"
             >
-              Ban
+              {t('spaces:settings.members.ban')}
             </button>
           )}
-          {canKick && member.userId !== currentUserId && !isOwner && (
+          {canKick && !isSelf && !isOwner && (
             <button
               onClick={(e) => { e.stopPropagation(); onPendingAction({ type: 'kick', userId: member.userId, displayName }); }}
               className="px-2 py-1 text-xs text-txt-danger hover:bg-accent-rose/10 rounded transition-colors"
             >
-              Kick
+              {t('spaces:settings.members.kick')}
             </button>
           )}
           {expandable && (
@@ -128,35 +169,54 @@ function MembersPanelRow({
       {/* Role checkboxes — only shown when expanded */}
       {isExpanded && expandable && (
         <div className="mt-1 mb-1 ml-10 space-y-1">
-          {assignableRoles.map((role) => (
-            <label key={role.id} className="flex items-center gap-2 cursor-pointer group/role">
-              <input
-                type="checkbox"
-                checked={memberRoleIds.has(role.id)}
-                onChange={() => onRoleToggle(member.userId, role.id, memberRoleIds)}
-                className="w-3.5 h-3.5 rounded border-txt-tertiary accent-accent-primary"
-              />
-              <span
-                className="text-xs font-medium"
-                style={{ color: role.color !== '#9ca3af' ? role.color : undefined }}
+          {assignableRoles.map((role) => {
+            const lock = roleLocks.get(role.id);
+            const manageable = lock === undefined;
+            return (
+              <label
+                key={role.id}
+                title={lock ? lockReason[lock] : undefined}
+                className={`flex items-center gap-2 group/role ${manageable ? 'cursor-pointer' : 'cursor-default opacity-50'}`}
               >
-                {role.name}
+                <input
+                  type="checkbox"
+                  checked={memberRoleIds.has(role.id)}
+                  disabled={!manageable}
+                  onChange={() => onRoleToggle(member.userId, role.id, memberRoleIds)}
+                  className="w-3.5 h-3.5 rounded border-txt-tertiary accent-accent-primary"
+                />
+                <span
+                  className="text-xs font-medium"
+                  style={{ color: role.color !== '#9ca3af' ? role.color : undefined }}
+                >
+                  {role.name}
+                </span>
+              </label>
+            );
+          })}
+          {lockKinds.length > 0 && (
+            <div className="flex items-start gap-2 pt-1 text-[12px] leading-snug text-txt-tertiary">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" className="flex-shrink-0 mt-[2px]">
+                <path d={LOCK_ICON} />
+              </svg>
+              <span>
+                {lockKinds.map((kind) => <span key={kind} className="block">{lockReason[kind]}</span>)}
               </span>
-            </label>
-          ))}
+            </div>
+          )}
           {hasPendingChanges && (
             <div className="flex items-center gap-2 mt-1.5">
               <button
                 onClick={() => onSaveRoles(member.userId)}
                 className="px-2 py-0.5 text-xs bg-accent-primary hover:bg-accent-primary/80 text-white rounded transition-colors"
               >
-                Save
+                {t('common:actions.save')}
               </button>
               <button
                 onClick={() => onCancelRoleChange(member.userId)}
                 className="px-2 py-0.5 text-xs text-txt-tertiary hover:text-txt-secondary transition-colors"
               >
-                Cancel
+                {t('common:actions.cancel')}
               </button>
             </div>
           )}
@@ -171,12 +231,14 @@ interface MembersPanelProps {
 }
 
 export function MembersPanel({ spaceId }: MembersPanelProps) {
+  const { t } = useTranslation(['spaces', 'common']);
+  const f = useFormatters();
   const spaces = useSpaceStore((s) => s.spaces);
   const members = useSpaceStore((s) => s.members);
   const roles = useSpaceStore((s) => s.roles);
   const loadSpaceDetail = useSpaceStore((s) => s.loadSpaceDetail);
-  const currentUser = useAuthStore((s) => s.user);
   const spacePermissions = useSpaceStore((s) => s.spacePermissions);
+  const heldPermissions = useViewerHeldPermissions(spaceId);
 
   const space = spaces.find((s) => s.id === spaceId);
   const spaceApi = getApiForOrigin(space?._instanceOrigin ?? '');
@@ -194,6 +256,14 @@ export function MembersPanel({ spaceId }: MembersPanelProps) {
   const assignableRoles = roles.filter((r) => r.id !== spaceId);
 
   if (!space) return null;
+
+  // Role hierarchy (permissions.md): the viewer moderates members ranked below
+  // them and hands out roles below their own top role. Ids are the viewer's
+  // and the members' ids on the space's instance.
+  const myUserId = myUserIdInSpace(space);
+  const manageableRoleIds = new Set(
+    assignableRoles.filter((r) => viewerCanManageRoleAt(space, members, r.position)).map((r) => r.id),
+  );
 
   const getMemberRoleIds = (member: MemberWithUser): Set<string> => {
     const pending = pendingRoleChanges.get(member.userId);
@@ -224,7 +294,7 @@ export function MembersPanel({ spaceId }: MembersPanelProps) {
       setExpandedMemberId(null);
       await loadSpaceDetail(spaceId);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to update roles');
+      setError(describeError(err));
     }
   };
 
@@ -241,7 +311,7 @@ export function MembersPanel({ spaceId }: MembersPanelProps) {
       await spaceApi.spaces.removeMember(spaceId, userId);
       await loadSpaceDetail(spaceId);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to kick member');
+      setError(describeError(err));
     }
   };
 
@@ -250,24 +320,25 @@ export function MembersPanel({ spaceId }: MembersPanelProps) {
       await spaceApi.spaces.ban(spaceId, userId);
       await loadSpaceDetail(spaceId);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to ban member');
+      setError(describeError(err));
     }
   };
 
   const canExpandMember = (member: MemberWithUser) =>
-    canManageRoles && member.userId !== currentUser?.id && member.userId !== space.ownerId && assignableRoles.length > 0;
+    canManageRoles && member.userId !== myUserId && member.userId !== space.ownerId
+    && manageableRoleIds.size > 0 && viewerCanActOn(space, members, member);
 
   return (
     <div className="space-y-4">
-      <h2 className="text-lg font-semibold text-txt-primary mb-6">Members</h2>
+      <h2 className="text-lg font-semibold text-txt-primary mb-6">{t('common:labels.members')}</h2>
       {error && (
         <div className="p-2 bg-accent-rose/10 border border-accent-rose/30 rounded text-txt-danger text-sm">{error}</div>
       )}
-      <p className="text-xs text-txt-tertiary">Manage members of this space. Click a member to edit their roles.</p>
+      <p className="text-xs text-txt-tertiary">{t('spaces:settings.members.description')}</p>
 
       <div>
         <div className="text-[11px] font-semibold text-txt-tertiary uppercase tracking-wider mb-1.5">
-          Members ({members.length})
+          {t('spaces:settings.members.listHeading', { total: f.formatNumber(members.length) })}
         </div>
         <div className="rounded-lg bg-white/[0.02] p-2">
           <div className="space-y-0.5">
@@ -279,11 +350,14 @@ export function MembersPanel({ spaceId }: MembersPanelProps) {
                 ownerId={space.ownerId}
                 isExpanded={expandedMemberId === member.userId}
                 expandable={canExpandMember(member)}
-                canKick={canKick}
-                canBan={canBan}
-                currentUserId={currentUser?.id}
+                canKick={canKick && viewerCanActOn(space, members, member)}
+                canBan={canBan && viewerCanActOn(space, members, member)}
+                isSelf={member.userId === myUserId}
                 assignableRoles={assignableRoles}
+                manageableRoleIds={manageableRoleIds}
                 memberRoleIds={getMemberRoleIds(member)}
+                savedRoleIds={new Set(member.roles?.map((r) => r.id) ?? [])}
+                heldPermissions={heldPermissions}
                 hasPendingChanges={pendingRoleChanges.has(member.userId)}
                 onToggleExpand={(uid) => setExpandedMemberId(expandedMemberId === uid ? null : uid)}
                 onRoleToggle={handleRoleToggle}
@@ -308,14 +382,18 @@ export function MembersPanel({ spaceId }: MembersPanelProps) {
           }
           setPendingAction(null);
         }}
-        title={pendingAction?.type === 'ban' ? `Ban ${pendingAction.displayName}` : `Kick ${pendingAction?.displayName ?? ''}`}
+        title={
+          pendingAction?.type === 'ban'
+            ? t('spaces:settings.members.confirm.banTitle', { name: pendingAction.displayName })
+            : t('spaces:settings.members.confirm.kickTitle', { name: pendingAction?.displayName ?? '' })
+        }
         description={
           pendingAction?.type === 'ban'
-            ? 'They will be permanently banned from this space until unbanned.'
-            : 'They can rejoin with an invite link.'
+            ? t('spaces:settings.members.confirm.banDescription')
+            : t('spaces:settings.members.confirm.kickDescription')
         }
         variant={pendingAction?.type === 'ban' ? 'danger' : 'warning'}
-        confirmLabel={pendingAction?.type === 'ban' ? 'Ban' : 'Kick'}
+        confirmLabel={pendingAction?.type === 'ban' ? t('spaces:settings.members.ban') : t('spaces:settings.members.kick')}
       />
     </div>
   );

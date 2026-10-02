@@ -1,3 +1,4 @@
+import { layoutRect, layoutPixels, MOBILE_LAYOUT_BREAKPOINT } from '../../platform/interfaceScale';
 import React, { useRef, useEffect, useState, useCallback, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useVoiceStore } from '../../stores/voiceStore';
@@ -35,18 +36,18 @@ function getPipBounds(pipX: number): {
   minY: number;
   maxY: number;
 } {
-  const vw = window.innerWidth;
-  const vh = window.innerHeight;
+  const vw = layoutPixels(window.innerWidth);
+  const vh = layoutPixels(window.innerHeight);
   let minX = PIP_MARGIN;
   const maxX = vw - PIP_WIDTH - PIP_MARGIN;
   const minY = PIP_MARGIN;
   let maxY = vh - PIP_HEIGHT - PIP_MARGIN;
 
-  if (vw < 768) return { minX, maxX, minY, maxY };
+  if (vw < MOBILE_LAYOUT_BREAKPOINT) return { minX, maxX, minY, maxY };
 
   const obstacles = document.querySelectorAll<HTMLElement>('[data-pip-obstacle]');
   for (const el of obstacles) {
-    const rect = el.getBoundingClientRect();
+    const rect = layoutRect(el.getBoundingClientRect());
     if (rect.width === 0 || rect.height === 0) continue;
 
     const direction = el.dataset.pipObstacle;
@@ -126,6 +127,7 @@ export function PictureInPicture() {
   const focusedParticipantId = useVoiceStore((s) => s.focusedParticipantId);
   const watchingStreams = useVoiceStore((s) => s.watchingStreams);
   const speakingParticipantIds = useVoiceStore((s) => s.speakingParticipantIds);
+  const pipEnabled = useVoiceStore((s) => s.pipEnabled);
   const currentChannelId = useChatStore((s) => s.currentChannelId);
   const voiceFullscreen = useUIStore((s) => s.voiceFullscreen);
   const pipCollapsed = useUIStore((s) => s.pipCollapsed);
@@ -156,7 +158,7 @@ export function PictureInPicture() {
   // Visibility — split into wouldShow (ignores collapsed) and shouldShow (full check)
   const isInServerVoice = currentVoiceChannelId !== null && currentChannelId !== currentVoiceChannelId;
   const isInDmCall = activeDmCall !== null && currentChannelId !== activeDmCall.dmChannelId;
-  const wouldShow = (isInServerVoice || isInDmCall) && !voiceFullscreen;
+  const wouldShow = (isInServerVoice || isInDmCall) && !voiceFullscreen && pipEnabled;
   const shouldShow = wouldShow && !pipCollapsed;
 
   // Reset pipCollapsed when wouldShow transitions false → true
@@ -261,7 +263,7 @@ export function PictureInPicture() {
   // Initialize position to bottom-right
   useEffect(() => {
     if (shouldShow && position.x === -1) {
-      const initX = window.innerWidth - PIP_WIDTH - PIP_MARGIN;
+      const initX = layoutPixels(window.innerWidth) - PIP_WIDTH - PIP_MARGIN;
       const { maxY } = getPipBounds(initX);
       setPosition({ x: initX, y: maxY });
     }
@@ -309,11 +311,11 @@ export function PictureInPicture() {
   // Snap to nearest horizontal edge
   const snapToEdge = useCallback((currentX: number, currentY: number) => {
     const centerX = currentX + PIP_WIDTH / 2;
-    const screenMidX = window.innerWidth / 2;
+    const screenMidX = layoutPixels(window.innerWidth) / 2;
     const { minX } = getPipBounds(currentX);
     const targetX = centerX < screenMidX
       ? minX
-      : window.innerWidth - PIP_WIDTH - PIP_MARGIN;
+      : layoutPixels(window.innerWidth) - PIP_WIDTH - PIP_MARGIN;
     const { minY, maxY } = getPipBounds(targetX);
     const clampedY = Math.max(minY, Math.min(maxY, currentY));
     setPosition({ x: targetX, y: clampedY });
@@ -324,23 +326,23 @@ export function PictureInPicture() {
     if ((e.target as HTMLElement).closest('[data-pip-action]')) return;
     setIsDragging(true);
     hasMoved.current = false;
-    dragOffset.current = { x: e.clientX - position.x, y: e.clientY - position.y };
-    dragStartPos.current = { x: e.clientX, y: e.clientY };
+    dragOffset.current = { x: layoutPixels(e.clientX) - position.x, y: layoutPixels(e.clientY) - position.y };
+    dragStartPos.current = { x: layoutPixels(e.clientX), y: layoutPixels(e.clientY) };
     containerRef.current?.setPointerCapture(e.pointerId);
   }, [position]);
 
   const handlePointerMove = useCallback((e: React.PointerEvent) => {
     if (!isDragging) return;
-    const dx = Math.abs(e.clientX - dragStartPos.current.x);
-    const dy = Math.abs(e.clientY - dragStartPos.current.y);
+    const dx = Math.abs(layoutPixels(e.clientX) - dragStartPos.current.x);
+    const dy = Math.abs(layoutPixels(e.clientY) - dragStartPos.current.y);
     if (dx > DRAG_THRESHOLD || dy > DRAG_THRESHOLD) {
       hasMoved.current = true;
     }
-    const rawX = e.clientX - dragOffset.current.x;
+    const rawX = layoutPixels(e.clientX) - dragOffset.current.x;
     const bounds = getPipBounds(rawX);
     const newX = Math.max(bounds.minX, Math.min(bounds.maxX, rawX));
     const { minY, maxY } = getPipBounds(newX);
-    const newY = Math.max(minY, Math.min(maxY, e.clientY - dragOffset.current.y));
+    const newY = Math.max(minY, Math.min(maxY, layoutPixels(e.clientY) - dragOffset.current.y));
     setPosition({ x: newX, y: newY });
   }, [isDragging]);
 

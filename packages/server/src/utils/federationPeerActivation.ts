@@ -3,6 +3,7 @@ import * as schema from '../db/schema.js';
 import { and, eq } from 'drizzle-orm';
 import { isFederationRelayEnabled } from './federationOutbox.js';
 import { buildFederationHeaders, getOurOrigin } from './federationAuth.js';
+import { federationFetch } from './federationFetch.js';
 import { generateSnowflake } from './snowflake.js';
 import { healResetIncarnation } from './federationReset.js';
 import type { FederationRelayEvent } from '@backspace/shared';
@@ -90,7 +91,7 @@ export async function onPeerActivated(
         // presence is outbox-only (no mutation-log replay), and any prior
         // markPeerStubsOffline ran on our side too.
         const { snapshotPresenceForPeer } = await import('./federationPresence.js');
-        try { snapshotPresenceForPeer(peerRow.origin); } catch (e) {
+        try { await snapshotPresenceForPeer(peerRow.origin); } catch (e) {
           console.warn(`[onPeerActivated] snapshotPresenceForPeer(${peerRow.origin}) failed`, e);
         }
       }
@@ -169,10 +170,10 @@ export async function syncPeerMutationLog(
       if (contextType) bodyObj.contextType = contextType;
       const body = JSON.stringify(bodyObj);
       const headers = buildFederationHeaders(body, signingSecret, ourOrigin);
-      const resp = await fetch(`${activePeer.origin}/api/federation/sync`, {
+      const resp = await federationFetch(activePeer.origin, '/api/federation/sync', {
         method: 'POST', headers, body,
         signal: AbortSignal.timeout(30_000),
-      });
+      }, 'approved');
       if (!resp.ok) {
         console.warn(`[federation] Sync-pull ${contextType ?? 'dm'} pass HTTP ${resp.status} for ${activePeer.origin}`);
         return false;
@@ -347,7 +348,7 @@ export async function startupBootstrapSync(): Promise<void> {
 export type PeerDeactivationReason =
   | 'network_threshold'        // outbox worker hit PEER_UNREACHABLE_THRESHOLD
   | 'auth_threshold'           // outbox worker hit AUTH_FAILURE_THRESHOLD
-  | 'remote_rejected'          // auto-peer handshake got 403 PEERING_REQUIRES_APPROVAL
+  | 'remote_rejected'          // auto-peer handshake got a 403 (PEERING_REQUIRES_APPROVAL or revoked)
   | 'admin_revoked';           // admin revoked peering from this side
 
 // Dedup: concurrent deactivations for the same peerId share one promise.
@@ -367,7 +368,7 @@ const inFlightDeactivation = new Map<string, Promise<void>>();
  *   - utils/federationWorker.ts resolvePendingPeers case 'rejected'
  *   - routes/federation.ts admin revoke endpoint
  *   - routes/federation.ts admin reset endpoint (when it transitions to a non-active status)
- *   - utils/federationPeering.ts performHandshake 403 PEERING_REQUIRES_APPROVAL path
+ *   - utils/federationPeering.ts performHandshake 403 path (settleRejectedHandshake)
  *
  * Deduplicated by peerId — concurrent calls share one promise. Separate map from
  * onPeerActivated so flapping peers don't collapse transitions.
@@ -422,12 +423,12 @@ export async function onPeerDeactivated(
         const { markPeerStubsOffline } = await import('./federationPresence.js');
         await markPeerStubsOffline(peer.origin);
       } catch (e) {
-        console.warn(`[onPeerDeactivated] markPeerStubsOffline(${peer.origin}) failed`, e);
+        console.warn('[onPeerDeactivated] markPeerStubsOffline(%s) failed', peer.origin, e);
       }
 
       connectionManager.sendToAdmins({ type: 'federation_peers_changed' as const });
     } catch (err) {
-      console.error(`[federation] onPeerDeactivated(${peerId}, ${reason}) failed:`, err);
+      console.error('[federation] onPeerDeactivated(%s, %s) failed:', peerId, reason, err);
     }
   })();
 

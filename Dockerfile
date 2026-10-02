@@ -2,8 +2,19 @@
 # Backspace — Multi-stage Docker build
 # ============================================================
 
-# Stage 1: Install dependencies and build frontend
-FROM node:20-slim AS builder
+# Stage 1: Production dependencies
+#
+# better-sqlite3 13.x is an N-API addon and ships its prebuilt binaries inside
+# the npm package (prebuilds/linux-x64.node and linux-arm64.node among them), so
+# the install downloads nothing extra and compiles nothing: this stage needs no
+# Python and no C++ compiler. pnpm would still run `node-gyp rebuild` on sight
+# of the package's binding.gyp, which is why the root package.json lists
+# better-sqlite3 under pnpm.ignoredBuiltDependencies. The runtime stage copies
+# the resulting node_modules and runs no install of its own.
+#
+# The base is node:24-slim, Node v24.20.0. All three stages pin it by the digest
+# of the multi-arch index, so the same pin resolves on amd64 and on arm64.
+FROM node:24-slim@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6 AS deps
 
 RUN corepack enable && corepack prepare pnpm@10.34.3 --activate
 
@@ -21,25 +32,72 @@ COPY packages/web/package.json packages/web/
 # Copy patches (referenced by pnpm-lock.yaml)
 COPY patches/ patches/
 
-# Install dependencies
-RUN pnpm install --frozen-lockfile
+# The production dependency tree that ships in the runtime image
+RUN pnpm install --prod --frozen-lockfile
+
+# ============================================================
+# Stage 2: Build the frontend
+#
+# Installs only @backspace/web and what it depends on (@backspace/shared). That
+# keeps the server dependencies, better-sqlite3 among them, out of this stage, so
+# the native module is installed once, in `deps`.
+#
+# Base: node:24-slim, Node v24.20.0.
+FROM node:24-slim@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6 AS builder
+
+RUN corepack enable && corepack prepare pnpm@10.34.3 --activate
+
+WORKDIR /app
+
+# Copy workspace config
+COPY package.json pnpm-workspace.yaml pnpm-lock.yaml* ./
+COPY tsconfig.base.json ./
+
+# Copy package.json files for all workspace packages
+COPY packages/shared/package.json packages/shared/
+COPY packages/server/package.json packages/server/
+COPY packages/web/package.json packages/web/
+
+# Copy patches (referenced by pnpm-lock.yaml)
+COPY patches/ patches/
+
+RUN pnpm install --frozen-lockfile --filter @backspace/web...
 
 # Copy source code (excluding desktop — not needed in Docker)
 COPY packages/shared/ packages/shared/
-COPY packages/server/ packages/server/
 COPY packages/web/ packages/web/
+
+# The web build starts with the localization consistency check, which lives
+# in scripts/ and reads its allowlist and pending list from there. Only the
+# check is copied: scripts/metrics is a workspace package the image does not
+# build, and its lockfile entries are already filtered out by the install above.
+COPY scripts/check-i18n.mjs scripts/i18n-allowlist.json scripts/i18n-pending.txt scripts/
+COPY scripts/i18n/ scripts/i18n/
 
 # Build the web frontend
 RUN pnpm --filter @backspace/web build
 
 # ============================================================
-# Stage 2: Production runtime
-FROM node:20-slim AS runtime
+# Stage 3: Production runtime
+#
+# Base: node:24-slim, Node v24.20.0.
+FROM node:24-slim@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6 AS runtime
 
-RUN corepack enable && corepack prepare pnpm@10.34.3 --activate
+# No package manager ships in the runtime image. This stage installs nothing
+# from a registry: node_modules arrives from `deps` as a finished tree and the
+# CMD starts node directly, so neither pnpm nor npm is ever invoked here. Both
+# used to be present anyway. pnpm because this stage also ran `corepack prepare`
+# (now removed), npm because node:24-slim bundles it. Between them they were
+# most of the image's fixable HIGH/CRITICAL scan findings, all of it in code
+# that never runs. Deleting them deletes the findings.
+#
+# If a future change needs to install something at image build time, do it in
+# `deps` and copy the result in, the way better-sqlite3 already works.
+RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
 
 # Runtime deps only: ffmpeg (media processing) + gosu (drop to non-root in the
-# entrypoint). No C toolchain — better-sqlite3 and sharp load prebuilt binaries.
+# entrypoint). No C toolchain. The native modules come from `deps` as prebuilt
+# binaries and are copied in below.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ffmpeg gosu && \
     rm -rf /var/lib/apt/lists/*
@@ -55,17 +113,16 @@ COPY packages/shared/package.json packages/shared/
 COPY packages/server/package.json packages/server/
 COPY packages/web/package.json packages/web/
 
-# Copy patches (referenced by pnpm-lock.yaml)
-COPY patches/ patches/
-
-# Install production dependencies only (tsx is in server dependencies)
-RUN pnpm install --prod --frozen-lockfile
-
 # Copy shared source (needed at runtime since server imports types directly)
 COPY packages/shared/ packages/shared/
 
 # Copy server source
 COPY packages/server/ packages/server/
+
+# Production dependencies, built in the `deps` stage. All of pnpm's symlinks are
+# relative to /app, so the tree works unchanged after the copy.
+COPY --from=deps /app/node_modules node_modules
+COPY --from=deps /app/packages/server/node_modules packages/server/node_modules
 
 # Copy built frontend from builder stage
 COPY --from=builder /app/packages/web/dist packages/web/dist

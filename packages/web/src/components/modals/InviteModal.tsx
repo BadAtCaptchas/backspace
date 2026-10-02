@@ -1,13 +1,16 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import type { TFunction } from 'i18next';
 import { Modal } from '../ui/Modal';
 import { Avatar } from '../ui/Avatar';
 import { useUIStore } from '../../stores/uiStore';
 import { useSpaceStore } from '../../stores/spaceStore';
 import { useAuthStore } from '../../stores/authStore';
 import { useSocialStore } from '../../stores/socialStore';
-import { api } from '../../api/client';
+import { api, HttpError } from '../../api/client';
 import { isSelf, parseFederatedUsername } from '../../utils/identity';
 import { useCanonicalUserView } from '../../utils/userViewLookup';
+import { describeError } from '../../i18n/errors';
 import type { Friend, MemberWithUser, SpaceInviteRequest, User } from '@backspace/shared';
 
 type SendStatus =
@@ -15,30 +18,36 @@ type SendStatus =
   | { kind: 'success' }
   | { kind: 'failure'; reason: string };
 
-const FAILURE_COPY: Record<string, string> = {
-  invite_invalid: 'Invite link no longer valid',
-  not_a_friend: 'Not a friend',
-  user_not_found: 'User not found',
-  already_member: 'Already a member',
-  upstream: "Couldn't verify invite — try again",
-  cannot_invite_self: 'Cannot invite yourself',
-  invalid_body: 'Invalid request',
-  invalid_target: 'Invalid target',
-};
+type InviteT = TFunction<['spaces', 'common']>;
 
-function reasonForError(error: unknown): string {
-  if (error instanceof Error) {
-    // The api client throws Error(message) where message is the server's
-    // `error` field (e.g. 'invite_invalid'). Fall back to message-based
-    // network detection for transport failures.
-    const msg = error.message;
-    const mapped = FAILURE_COPY[msg];
-    if (mapped) return mapped;
-    if (/network|fetch|failed to fetch/i.test(msg)) {
-      return "Couldn't reach your instance";
+/**
+ * Row-sized copy for each way a space invite can fail. Keyed on the server's
+ * error code; the two message checks below cover a failed fetch and the
+ * client-side "upstream" marker, which never carry a code.
+ */
+function reasonForError(error: unknown, t: InviteT): string {
+  if (error instanceof HttpError) {
+    switch (error.code) {
+      case 'invite_invalid': return t('spaces:invite.failure.inviteInvalid');
+      case 'not_a_friend': return t('spaces:invite.failure.notAFriend');
+      case 'user_not_found': return t('spaces:invite.failure.userNotFound');
+      case 'already_member': return t('spaces:invite.failure.alreadyMember');
+      case 'cannot_invite_self': return t('spaces:invite.failure.cannotInviteSelf');
+      case 'invalid_body': return t('spaces:invite.failure.invalidBody');
+      case 'invalid_target': return t('spaces:invite.failure.invalidTarget');
+      default:
+        break;
     }
   }
-  return "Couldn't send (server error)";
+  if (error instanceof Error) {
+    if (error.message === 'upstream') {
+      return t('spaces:invite.failure.upstream');
+    }
+    if (/network|fetch|failed to fetch/i.test(error.message)) {
+      return t('spaces:invite.failure.unreachable');
+    }
+  }
+  return t('spaces:invite.failure.serverError');
 }
 
 function InviteResultFriendRow({
@@ -48,6 +57,7 @@ function InviteResultFriendRow({
   friend: Friend;
   status: SendStatus | undefined;
 }) {
+  const { t } = useTranslation(['spaces', 'common']);
   const canonical = useCanonicalUserView(friend as unknown as User);
   const { baseName } = parseFederatedUsername(canonical.username);
   const dn = canonical.displayName ?? baseName;
@@ -65,10 +75,10 @@ function InviteResultFriendRow({
         <div className="text-[11px] text-txt-tertiary truncate">@{canonical.username}</div>
       </div>
       {status?.kind === 'success' && (
-        <span className="text-[12px] text-accent-mint flex-shrink-0">✓ Sent</span>
+        <span className="text-[12px] text-accent-mint flex-shrink-0">{t('spaces:invite.status.sent')}</span>
       )}
       {status?.kind === 'failure' && (
-        <span className="text-[12px] text-txt-danger flex-shrink-0">✗ {status.reason}</span>
+        <span className="text-[12px] text-txt-danger flex-shrink-0">{t('spaces:invite.status.failed', { reason: status.reason })}</span>
       )}
       {status?.kind === 'pending' && (
         <span className="text-[12px] text-txt-tertiary flex-shrink-0">...</span>
@@ -90,6 +100,7 @@ function InviteSelectFriendRow({
   sending: boolean;
   onToggle: (id: string, friend: Friend) => void;
 }) {
+  const { t } = useTranslation(['spaces', 'common']);
   const canonical = useCanonicalUserView(friend as unknown as User);
   const { baseName } = parseFederatedUsername(canonical.username);
   const dn = canonical.displayName ?? baseName;
@@ -116,7 +127,7 @@ function InviteSelectFriendRow({
       <div className="flex-1 min-w-0">
         <div className="text-[13px] font-medium text-txt-primary truncate">{dn}</div>
         <div className="text-[11px] text-txt-tertiary truncate">
-          {alreadyMember ? 'Already in space' : `@${canonical.username}`}
+          {alreadyMember ? t('spaces:invite.alreadyMember') : `@${canonical.username}`}
         </div>
       </div>
       {!alreadyMember && (
@@ -137,6 +148,7 @@ function InviteSelectFriendRow({
 }
 
 export function InviteModal() {
+  const { t } = useTranslation(['spaces', 'common']);
   const activeModal = useUIStore((s) => s.activeModal);
   const closeModal = useUIStore((s) => s.closeModal);
   const generateInvite = useSpaceStore((s) => s.generateInvite);
@@ -180,7 +192,7 @@ export function InviteModal() {
         setCodeLoading(false);
       },
       (err) => {
-        setCodeError((err as Error)?.message ?? 'Failed to generate invite link');
+        setCodeError(describeError(err));
         setCodeLoading(false);
       },
     );
@@ -276,7 +288,7 @@ export function InviteModal() {
       } catch (err) {
         return {
           friend,
-          status: { kind: 'failure' as const, reason: reasonForError(err) },
+          status: { kind: 'failure' as const, reason: reasonForError(err, t) },
         };
       }
     });
@@ -324,8 +336,8 @@ export function InviteModal() {
   const inResultsView = results.size > 0 && !sending;
   const submitLabel =
     selectedFriends.length === 0
-      ? 'Select Friends'
-      : `Send ${selectedFriends.length} Invite${selectedFriends.length > 1 ? 's' : ''}`;
+      ? t('spaces:invite.selectFriends')
+      : t('spaces:invite.send', { count: selectedFriends.length });
   const hasFailures =
     inResultsView &&
     selectedFriends.some((f) => results.get(f.id)?.kind === 'failure');
@@ -334,26 +346,25 @@ export function InviteModal() {
     <Modal
       isOpen={isOpen}
       onClose={closeModal}
-      title="Invite Friends"
+      title={t('spaces:invite.title')}
       mobileStyle="sheet"
     >
       {isRequestOnly ? (
         <div className="space-y-3">
           <p className="text-[13px] text-txt-tertiary">
-            This space uses join requests — people join by requesting approval
-            from a manager, so it has no invite link to share.
+            {t('spaces:invite.requestOnly.notice')}
           </p>
           <button
             onClick={closeModal}
             className="w-full py-2 rounded-md text-[13px] font-semibold glass-pill text-txt-primary"
           >
-            Got it
+            {t('spaces:invite.requestOnly.dismiss')}
           </button>
         </div>
       ) : (
       <div className="space-y-3">
         <p className="text-[13px] text-txt-tertiary">
-          Send to friends, or share a link.
+          {t('spaces:invite.intro')}
         </p>
 
         {/* Selected chips — hidden in results view */}
@@ -368,7 +379,7 @@ export function InviteModal() {
                 <button
                   onClick={() => removeFriend(f.id)}
                   className="opacity-60 hover:opacity-100 transition-opacity text-[14px] leading-none"
-                  aria-label={`Remove ${f.displayName ?? f.username}`}
+                  aria-label={t('spaces:invite.removeSelected', { name: f.displayName ?? f.username })}
                 >
                   &times;
                 </button>
@@ -384,7 +395,7 @@ export function InviteModal() {
             type="text"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search friends..."
+            placeholder={t('spaces:invite.searchPlaceholder')}
             className="input-search w-full py-2 text-[14px]"
           />
         )}
@@ -404,8 +415,8 @@ export function InviteModal() {
               {filteredFriends.length === 0 && (
                 <div className="py-4 text-center text-txt-tertiary text-[14px]">
                   {query.trim()
-                    ? 'No friends match your search'
-                    : 'No friends yet'}
+                    ? t('spaces:invite.noMatches')
+                    : t('spaces:invite.noFriends')}
                 </div>
               )}
               {filteredFriends.map((friend) => (
@@ -431,14 +442,14 @@ export function InviteModal() {
                 disabled={sending}
                 className="flex-1 py-2 rounded-md text-[13px] font-semibold transition-colors bg-accent-mint text-surface-base hover:bg-accent-mint/90 disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                Retry failed
+                {t('spaces:invite.retryFailed')}
               </button>
             )}
             <button
               onClick={closeModal}
               className="flex-1 py-2 rounded-md text-[13px] font-semibold glass-pill text-txt-primary"
             >
-              Done
+              {t('common:actions.done')}
             </button>
           </div>
         ) : (
@@ -447,14 +458,14 @@ export function InviteModal() {
             disabled={selectedFriends.length === 0 || sending || codeLoading}
             className="w-full py-2 rounded-md text-[13px] font-semibold transition-colors bg-accent-mint text-surface-base hover:bg-accent-mint/90 disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            {sending ? 'Sending...' : submitLabel}
+            {sending ? t('spaces:invite.sending') : submitLabel}
           </button>
         )}
 
         {/* Share-link footer */}
         <div className="pt-3 border-t border-white/[0.06]">
           <p className="text-[12px] text-txt-tertiary mb-2">
-            Or share a link
+            {t('spaces:invite.shareLink')}
           </p>
           {codeError && (
             <div className="mb-2 text-[12px] text-txt-danger">{codeError}</div>
@@ -462,7 +473,7 @@ export function InviteModal() {
           <div className="flex items-center gap-2">
             <input
               type="text"
-              value={codeLoading ? 'Generating...' : inviteUrl}
+              value={codeLoading ? t('spaces:invite.generating') : inviteUrl}
               readOnly
               className="input-embedded flex-1 font-mono text-xs px-2 py-1.5"
             />
@@ -473,7 +484,7 @@ export function InviteModal() {
                 linkCopied ? 'text-accent-mint' : 'text-txt-primary'
               }`}
             >
-              {linkCopied ? 'Copied!' : 'Copy'}
+              {linkCopied ? t('common:actions.copied') : t('common:actions.copy')}
             </button>
           </div>
         </div>

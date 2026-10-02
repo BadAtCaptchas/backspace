@@ -1,4 +1,7 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { useTranslation } from 'react-i18next';
+import { useFormatters } from '../../../i18n/formatters';
+import { describeError } from '../../../i18n/errors';
 import { useSettingsStore } from '../../../stores/settingsStore';
 import { useUIStore } from '../../../stores/uiStore';
 import type { InstanceStreamingLimits } from '@backspace/shared';
@@ -11,21 +14,25 @@ import {
   type Resolution,
 } from '@backspace/shared/src/constants';
 
-function formatKbps(kbps: number): string {
-  return kbps >= 1000
-    ? `${(kbps / 1000).toFixed(kbps % 1000 === 0 ? 0 : 1)} Mbps`
-    : `${kbps} kbps`;
-}
-
 export function StreamingPanel() {
+  const { t } = useTranslation(['admin', 'common']);
+  const f = useFormatters();
   const limits = useSettingsStore((s) => s.streamingLimits);
   const updateStreamingLimits = useSettingsStore((s) => s.updateStreamingLimits);
+  const fetchStreamingLimits = useSettingsStore((s) => s.fetchStreamingLimits);
 
   const addToast = useUIStore((s) => s.addToast);
 
   const [draft, setDraft] = useState<InstanceStreamingLimits | null>(null);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState('');
+  // Whether this panel's own load came back without a document. The store
+  // leaves `streamingLimits` null when the request fails rather than
+  // substituting defaults an admin could save over the real configuration, so
+  // the panel is the one that has to tell "not fetched yet" from "fetch
+  // failed"; without this it would sit on "Loading settings" forever.
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [loading, setLoading] = useState(false);
 
 
   // Matrix editor state: full grid of kbps values (integers only)
@@ -33,6 +40,26 @@ export function StreamingPanel() {
   const [editingCell, setEditingCell] = useState<string | null>(null);
   const [scaleValue, setScaleValue] = useState(1.0);
   const scaleSnapshot = useRef<Record<string, number> | null>(null);
+
+  // The panel edits this document, so it reads it when it opens rather than
+  // living on whatever a parent fetched earlier. `fetchStreamingLimits`
+  // swallows its own error, so the outcome is read from the store: the
+  // document either arrived or it did not.
+  const loadLimits = useCallback(async () => {
+    // `loadFailed` is deliberately not cleared here. Clearing it would take
+    // the failure line, and the button that was just clicked, off the screen
+    // for the length of the retry and drop the admin back on "Loading
+    // settings"; the outcome below is what decides, so a retry that fails
+    // again never moves anything.
+    setLoading(true);
+    await fetchStreamingLimits();
+    setLoadFailed(useSettingsStore.getState().streamingLimits === null);
+    setLoading(false);
+  }, [fetchStreamingLimits]);
+
+  useEffect(() => {
+    void loadLimits();
+  }, [loadLimits]);
 
   useEffect(() => {
     if (limits) setDraft({ ...limits });
@@ -51,7 +78,34 @@ export function StreamingPanel() {
     setMatrixDraft(matrix);
   }, [limits]);
 
-  if (!draft) return <div className="text-sm text-txt-tertiary">Loading settings...</div>;
+  // Mbps with one decimal, kbps below a megabit; the unit words come from the catalog.
+  const formatKbps = (kbps: number): string =>
+    kbps >= 1000
+      ? t('common:units.mbps', { value: f.formatNumber(Math.round(kbps / 100) / 10) })
+      : t('common:units.kbps', { value: f.formatNumber(kbps) });
+
+  if (!draft) {
+    // A failed load says so and offers the way back, rather than leaving the
+    // admin on a spinner for a request that is not coming.
+    if (loadFailed) {
+      // The panel's own failure treatment, the one its save errors use: a
+      // load that failed is an error, not an empty state.
+      return (
+        <div className="p-2 bg-accent-rose/10 border border-accent-rose/30 rounded text-txt-danger text-sm flex flex-wrap items-center gap-3">
+          <span>{t('common:states.loadSettingsFailed')}</span>
+          <button
+            type="button"
+            onClick={() => { void loadLimits(); }}
+            disabled={loading}
+            className="font-medium underline underline-offset-2 hover:no-underline transition-all disabled:no-underline disabled:opacity-60 disabled:cursor-default"
+          >
+            {t('common:actions.retry')}
+          </button>
+        </div>
+      );
+    }
+    return <div className="text-sm text-txt-tertiary">{t('common:states.loadingSettings')}</div>;
+  }
 
   const getDefaultKbps = (key: string): number => {
     const parts = key.split('_').map(Number);
@@ -110,9 +164,9 @@ export function StreamingPanel() {
         bitrateMatrixOverrides: Object.keys(overrides).length > 0 ? overrides : null,
       };
       await updateStreamingLimits(payload);
-      addToast('Settings saved', 'success', 2000);
+      addToast(t('common:states.settingsSaved'), 'success', 2000);
     } catch (err) {
-      setSaveError(err instanceof Error ? err.message : 'Failed to save');
+      setSaveError(err instanceof Error ? describeError(err) : t('common:states.saveFailed'));
     } finally {
       setSaving(false);
     }
@@ -164,21 +218,21 @@ export function StreamingPanel() {
 
   return (
     <div className="space-y-5">
-      <h2 className="text-lg font-semibold text-txt-primary">Streaming</h2>
+      <h2 className="text-lg font-semibold text-txt-primary">{t('admin:streaming.title')}</h2>
       <div className="text-xs text-txt-tertiary">
-        These limits apply to all users on this instance. Users can pick values within these bounds.
+        {t('admin:streaming.description')}
       </div>
 
       {/* Bandwidth */}
       <div>
-        <div className="text-[11px] font-semibold text-txt-tertiary uppercase tracking-wider mb-1.5">Bandwidth</div>
-        <p className="text-xs text-txt-tertiary mb-2">Minimum and maximum bitrate bounds, and the step size for the quality slider.</p>
+        <div className="text-[11px] font-semibold text-txt-tertiary uppercase tracking-wider mb-1.5">{t('admin:streaming.bandwidth.label')}</div>
+        <p className="text-xs text-txt-tertiary mb-2">{t('admin:streaming.bandwidth.description')}</p>
         <div className="rounded-lg bg-white/[0.02] p-3.5 space-y-4">
           {/* Allow Custom Bitrate */}
           <div className="flex items-center justify-between">
             <div>
-              <div className="text-sm text-txt-primary">Allow Custom Bitrate</div>
-              <div className="text-xs text-txt-tertiary">Let users set their own bitrate instead of using the matrix defaults</div>
+              <div className="text-sm text-txt-primary">{t('admin:streaming.bandwidth.customBitrate.label')}</div>
+              <div className="text-xs text-txt-tertiary">{t('admin:streaming.bandwidth.customBitrate.description')}</div>
             </div>
             <Toggle
               enabled={draft.allowCustomBitrate}
@@ -188,11 +242,11 @@ export function StreamingPanel() {
           {/* Bitrate Range */}
           <div>
             <div className="text-xs text-txt-secondary mb-1.5">
-              Bitrate Range
+              {t('admin:streaming.bandwidth.range')}
             </div>
             <div className="flex items-start gap-3">
               <div className="flex-1 space-y-1.5">
-                <label className="text-[11px] text-txt-tertiary block">Min</label>
+                <label className="text-[11px] text-txt-tertiary block">{t('admin:streaming.bandwidth.min')}</label>
                 <input
                   type="range"
                   min={100}
@@ -222,7 +276,7 @@ export function StreamingPanel() {
                 </div>
               </div>
               <div className="flex-1 space-y-1.5">
-                <label className="text-[11px] text-txt-tertiary block">Max</label>
+                <label className="text-[11px] text-txt-tertiary block">{t('admin:streaming.bandwidth.max')}</label>
                 <input
                   type="range"
                   min={draft.minBitrateKbps + 500}
@@ -257,7 +311,7 @@ export function StreamingPanel() {
           {/* Bitrate Step — presets + custom input */}
           <div className="pt-2 border-t border-white/[0.04]">
             <div className="flex items-center gap-2 mb-1.5">
-              <span className="text-[11px] text-txt-tertiary">Slider Step</span>
+              <span className="text-[11px] text-txt-tertiary">{t('admin:streaming.bandwidth.step')}</span>
               <input
                 type="number"
                 min={50}
@@ -270,7 +324,7 @@ export function StreamingPanel() {
                 }}
                 className="input-standard w-14 px-1.5 py-0 text-[11px] text-center"
               />
-              <span className="text-[11px] text-txt-tertiary">kbps</span>
+              <span className="text-[11px] text-txt-tertiary">{t('admin:streaming.units.kbpsLabel')}</span>
             </div>
             <div className="flex flex-wrap gap-1">
               {[100, 250, 500, 1000, 2500, 5000].map((step) => (
@@ -283,7 +337,7 @@ export function StreamingPanel() {
                       : 'bg-surface-elevated text-txt-secondary hover:bg-interactive-hover'
                   }`}
                 >
-                  {step >= 1000 ? `${step / 1000} Mbps` : `${step} kbps`}
+                  {formatKbps(step)}
                 </button>
               ))}
             </div>
@@ -293,13 +347,13 @@ export function StreamingPanel() {
 
       {/* Quality */}
       <div>
-        <div className="text-[11px] font-semibold text-txt-tertiary uppercase tracking-wider mb-1.5">Quality</div>
-        <p className="text-xs text-txt-tertiary mb-2">Available resolution and frame rate options for screen sharing.</p>
+        <div className="text-[11px] font-semibold text-txt-tertiary uppercase tracking-wider mb-1.5">{t('admin:streaming.quality.label')}</div>
+        <p className="text-xs text-txt-tertiary mb-2">{t('admin:streaming.quality.description')}</p>
         <div className="rounded-lg bg-white/[0.02] p-3.5 space-y-4">
           {/* Allowed Resolutions */}
           <div>
             <div className="text-xs text-txt-secondary mb-1.5">
-              Allowed Resolutions
+              {t('admin:streaming.quality.resolutions')}
             </div>
             <div className="flex flex-wrap gap-1.5">
               {ALL_RESOLUTIONS.map((res) => (
@@ -317,7 +371,7 @@ export function StreamingPanel() {
           {/* Allowed Frame Rates */}
           <div>
             <div className="text-xs text-txt-secondary mb-1.5">
-              Allowed Frame Rates
+              {t('admin:streaming.quality.framerates')}
             </div>
             <div className="flex flex-wrap gap-1.5">
               {STANDARD_FRAMERATES.map((fps) => (
@@ -326,7 +380,7 @@ export function StreamingPanel() {
                   onClick={() => toggleFramerate(fps)}
                   className={`${pillBase} ${draft.allowedFramerates.includes(fps) ? pillOn : pillOff}`}
                 >
-                  {fps} fps
+                  {t('admin:streaming.units.fps', { value: fps })}
                 </button>
               ))}
             </div>
@@ -346,12 +400,8 @@ export function StreamingPanel() {
               <path fillRule="evenodd" d="M8.485 2.495c.673-1.167 2.357-1.167 3.03 0l6.28 10.875c.673 1.167-.168 2.625-1.516 2.625H3.72c-1.347 0-2.189-1.458-1.515-2.625L8.485 2.495zM10 6a.75.75 0 01.75.75v3.5a.75.75 0 01-1.5 0v-3.5A.75.75 0 0110 6zm0 9a1 1 0 100-2 1 1 0 000 2z" clipRule="evenodd" />
             </svg>
             <div className="text-xs text-accent-amber/90 leading-relaxed">
-              <span className="font-semibold">High-performance settings enabled.</span>{' '}
-              Streaming above 1080p or 60 fps requires significant client-side CPU/GPU encoding
-              power and can saturate server bandwidth, especially when streams are routed through
-              TURN. High-end configurations (e.g., 4K at 120 fps) can require up to 45 Mbps per
-              active stream. Ensure your infrastructure can handle this load before enabling these
-              options for all users.
+              <span className="font-semibold">{t('admin:streaming.highEndWarning.title')}</span>{' '}
+              {t('admin:streaming.highEndWarning.description')}
             </div>
           </div>
         </div>
@@ -359,13 +409,13 @@ export function StreamingPanel() {
 
       {/* Bitrate Matrix */}
       <div>
-        <div className="text-[11px] font-semibold text-txt-tertiary uppercase tracking-wider mb-1.5">Bitrate Matrix</div>
-        <p className="text-xs text-txt-tertiary mb-2">Default bitrates per resolution and frame rate. Edit individual cells or scale all values at once.</p>
+        <div className="text-[11px] font-semibold text-txt-tertiary uppercase tracking-wider mb-1.5">{t('admin:streaming.matrix.label')}</div>
+        <p className="text-xs text-txt-tertiary mb-2">{t('admin:streaming.matrix.description')}</p>
         <div className="rounded-lg bg-white/[0.02] p-3.5 space-y-4">
           {/* Scale slider */}
           <div>
             <div className="flex items-center justify-between mb-1.5">
-              <div className="text-xs text-txt-secondary">Scale All</div>
+              <div className="text-xs text-txt-secondary">{t('admin:streaming.matrix.scaleAll')}</div>
               <div className="text-xs text-txt-tertiary font-mono">&times;{scaleValue.toFixed(2)}</div>
             </div>
             <input
@@ -383,7 +433,7 @@ export function StreamingPanel() {
                 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-white [&::-webkit-slider-thumb]:shadow-md
                 [&::-webkit-slider-thumb]:cursor-pointer [&::-webkit-slider-thumb]:border-0"
             />
-            <div className="text-[10px] text-txt-tertiary mt-0.5">Drag to scale all bitrates. Fine-tune individual cells below.</div>
+            <div className="text-[10px] text-txt-tertiary mt-0.5">{t('admin:streaming.matrix.scaleHint')}</div>
           </div>
 
           {/* Matrix grid */}
@@ -393,7 +443,7 @@ export function StreamingPanel() {
                 <tr>
                   <th className="text-left text-txt-tertiary font-normal pb-1.5 pr-2"></th>
                   {enabledFramerates.map((fps) => (
-                    <th key={fps} className="text-center text-txt-tertiary font-normal pb-1.5 px-1 min-w-[52px]">{fps} fps</th>
+                    <th key={fps} className="text-center text-txt-tertiary font-normal pb-1.5 px-1 min-w-[52px]">{t('admin:streaming.units.fps', { value: fps })}</th>
                   ))}
                 </tr>
               </thead>
@@ -436,7 +486,7 @@ export function StreamingPanel() {
                                 ${overridden && !exceedsCap ? 'bg-accent-primary/10 text-accent-primary' : ''}
                                 ${!overridden && !exceedsCap ? 'text-txt-secondary hover:bg-interactive-hover' : ''}
                               `}
-                              title={overridden ? `Default: ${(getDefaultKbps(key) / 1000).toFixed(1)} Mbps (click \u00d7 to reset)` : 'Click to edit'}
+                              title={overridden ? t('admin:streaming.matrix.cellDefault', { value: formatKbps(getDefaultKbps(key)) }) : t('admin:streaming.matrix.cellEdit')}
                             >
                               {(val / 1000).toFixed(1)}
                               {overridden && (
@@ -473,7 +523,7 @@ export function StreamingPanel() {
               }}
               className="text-[11px] text-accent-primary hover:text-accent-lavender transition-colors"
             >
-              Reset all to defaults
+              {t('admin:streaming.matrix.resetAll')}
             </button>
           )}
         </div>
@@ -487,9 +537,8 @@ export function StreamingPanel() {
               <path fillRule="evenodd" d="M8.485 2.495c.673-1.167 2.357-1.167 3.03 0l6.28 10.875c.673 1.167-.168 2.625-1.516 2.625H3.72c-1.347 0-2.189-1.458-1.515-2.625L8.485 2.495zM10 6a.75.75 0 01.75.75v3.5a.75.75 0 01-1.5 0v-3.5A.75.75 0 0110 6zm0 9a1 1 0 100-2 1 1 0 000 2z" clipRule="evenodd" />
             </svg>
             <div className="text-xs text-accent-amber/90 leading-relaxed">
-              <span className="font-semibold">Matrix values exceed global cap.</span>{' '}
-              Some bitrate values exceed your maximum of {formatKbps(draft.maxBitrateKbps)}.
-              Streams at those combos will be quality-degraded to your cap.
+              <span className="font-semibold">{t('admin:streaming.capWarning.title')}</span>{' '}
+              {t('admin:streaming.capWarning.description', { max: formatKbps(draft.maxBitrateKbps) })}
             </div>
           </div>
         </div>
@@ -507,14 +556,14 @@ export function StreamingPanel() {
                 onClick={handleReset}
                 className="px-3 py-1 text-sm text-txt-tertiary hover:text-txt-secondary transition-colors"
               >
-                Reset
+                {t('common:actions.reset')}
               </button>
               <button
                 onClick={handleSave}
                 disabled={saving}
                 className="px-3 py-1.5 bg-accent-primary hover:bg-accent-primary/80 text-white text-sm font-medium rounded-full transition-colors disabled:opacity-50"
               >
-                {saving ? 'Saving...' : 'Save'}
+                {saving ? t('common:states.saving') : t('common:actions.save')}
               </button>
             </div>
           </div>

@@ -1,17 +1,21 @@
 import React, { useState, useEffect, useMemo } from 'react';
+import { Trans, useTranslation } from 'react-i18next';
 import { Modal } from '../ui/Modal';
 import { useUIStore } from '../../stores/uiStore';
 import { useSpaceStore, NotConnectedError } from '../../stores/spaceStore';
-import { useInstanceStore, DifferentPasswordError } from '../../stores/instanceStore';
+import { useInstanceStore, RemoteLoginRequiredError, type RemoteLoginReason } from '../../stores/instanceStore';
 import { useAuthStore } from '../../stores/authStore';
 import { useExploreStore } from '../../stores/exploreStore';
 import { useNavigate } from 'react-router-dom';
 import { parseInviteInput } from '../../utils/inviteParser';
 import { ExploreSpacePreviewCard } from './ExploreSpacePreviewCard';
+import { describeError } from '../../i18n/errors';
+import { FallbackNotice } from './RemotePasswordStep';
 
 type JoinPhase = 'input' | 'connect' | 'fallback';
 
 export function JoinSpaceModal() {
+  const { t } = useTranslation(['spaces', 'common']);
   const [inviteCode, setInviteCode] = useState('');
   const [error, setError] = useState('');
   const [isLoading, setIsLoading] = useState(false);
@@ -20,6 +24,7 @@ export function JoinSpaceModal() {
   const [parsedOrigin, setParsedOrigin] = useState('');
   const [password, setPassword] = useState('');
   const [fallbackUsername, setFallbackUsername] = useState('');
+  const [fallbackReason, setFallbackReason] = useState<RemoteLoginReason>('credential-refused');
   const [fallbackPassword, setFallbackPassword] = useState('');
 
   const activeModal = useUIStore((s) => s.activeModal);
@@ -96,7 +101,7 @@ export function JoinSpaceModal() {
     try {
       parsed = parseInviteInput(inviteCode);
     } catch (err) {
-      setError((err as Error).message);
+      setError(describeError(err));
       return;
     }
 
@@ -111,7 +116,7 @@ export function JoinSpaceModal() {
         setPhase('connect');
         setError('');
       } else {
-        setError(err instanceof Error ? err.message : 'Failed to join space');
+        setError(describeError(err));
       }
     } finally {
       setIsLoading(false);
@@ -127,13 +132,14 @@ export function JoinSpaceModal() {
       await connectToRemote(parsedOrigin, password, user?.displayName || undefined);
       await joinAndNavigate(parsedCode, parsedOrigin);
     } catch (err) {
-      if (err instanceof DifferentPasswordError) {
+      if (err instanceof RemoteLoginRequiredError) {
         setPhase('fallback');
         setFallbackUsername(err.remoteUsername);
+        setFallbackReason(err.reason);
         setFallbackPassword('');
         setError('');
       } else {
-        setError((err as Error).message);
+        setError(describeError(err));
       }
     } finally {
       setIsLoading(false);
@@ -149,7 +155,7 @@ export function JoinSpaceModal() {
       await loginToRemote(parsedOrigin, fallbackUsername, fallbackPassword);
       await joinAndNavigate(parsedCode, parsedOrigin);
     } catch (err) {
-      setError((err as Error).message);
+      setError(describeError(err));
     } finally {
       setIsLoading(false);
     }
@@ -161,7 +167,7 @@ export function JoinSpaceModal() {
   } catch { /* ignore */ }
 
   return (
-    <Modal isOpen={isOpen} onClose={closeModal} title="Join a Space" mobileStyle="sheet">
+    <Modal isOpen={isOpen} onClose={closeModal} title={t('spaces:join.title')} mobileStyle="sheet">
       {/* Error display (shared across all phases) */}
       {error && (
         <div className="mb-3 p-2 bg-accent-rose/10 border border-accent-rose/30 rounded text-txt-danger text-sm">
@@ -176,7 +182,7 @@ export function JoinSpaceModal() {
           {discoveryEnabled ? (
             <div className="mb-1">
               <p className="text-txt-secondary text-sm mb-3">
-                Discover spaces to join, or browse them all in Explore.
+                {t('spaces:join.discoverIntro')}
               </p>
 
               {discoveryLoading && previewSpaces.length === 0 ? (
@@ -187,11 +193,11 @@ export function JoinSpaceModal() {
                 </div>
               ) : discoveryError ? (
                 <div className="p-2.5 rounded-lg bg-surface-channel border border-border-soft text-[13px] text-txt-tertiary">
-                  Couldn’t load spaces to discover right now. You can still join with an invite code below.
+                  {t('spaces:join.discoverError')}
                 </div>
               ) : previewSpaces.length === 0 ? (
                 <div className="p-3 rounded-lg bg-surface-channel border border-border-soft text-[13px] text-txt-tertiary text-center">
-                  No spaces to discover yet — try an invite code below, or check back later.
+                  {t('spaces:join.discoverEmpty')}
                 </div>
               ) : (
                 <div className="space-y-2 max-h-[280px] overflow-y-auto pr-0.5">
@@ -210,7 +216,7 @@ export function JoinSpaceModal() {
                 onClick={handleBrowseExplore}
                 className="mt-3 w-full py-2 flex items-center justify-center gap-1.5 text-sm font-medium text-accent-primary hover:bg-accent-primary/10 rounded-lg transition-colors"
               >
-                Browse all in Explore
+                {t('spaces:join.browseExplore')}
                 <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                   <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
                 </svg>
@@ -218,7 +224,7 @@ export function JoinSpaceModal() {
             </div>
           ) : (
             <div className="mb-1 p-2.5 rounded-lg bg-accent-amber/10 border border-accent-amber/30 text-[13px] text-accent-amber">
-              Space discovery is turned off on this instance. You can still join with an invite code.
+              {t('spaces:join.discoveryOff')}
             </div>
           )}
 
@@ -226,7 +232,7 @@ export function JoinSpaceModal() {
           <div className="flex items-center gap-3 my-4">
             <div className="flex-1 h-px bg-white/[0.06]" />
             <span className="text-[11px] font-semibold uppercase tracking-wider text-txt-tertiary">
-              Have an invite code?
+              {t('spaces:join.inviteDivider')}
             </span>
             <div className="flex-1 h-px bg-white/[0.06]" />
           </div>
@@ -239,7 +245,7 @@ export function JoinSpaceModal() {
                 value={inviteCode}
                 onChange={(e) => setInviteCode(e.target.value)}
                 className="input-standard w-full"
-                placeholder="e.g. abc123 or https://instance.com/join/abc123"
+                placeholder={t('spaces:join.invitePlaceholder')}
               />
             </div>
             <div className="sticky bottom-0 z-10 pointer-events-none">
@@ -250,14 +256,14 @@ export function JoinSpaceModal() {
                     onClick={closeModal}
                     className="px-3 py-1 text-sm text-txt-tertiary hover:text-txt-secondary transition-colors"
                   >
-                    Cancel
+                    {t('common:actions.cancel')}
                   </button>
                   <button
                     type="submit"
                     disabled={isLoading || !inviteCode.trim()}
                     className="px-3 py-1.5 bg-accent-primary hover:bg-accent-primary/80 text-white text-sm font-medium rounded-full transition-colors disabled:opacity-50"
                   >
-                    {isLoading ? 'Joining...' : 'Join Space'}
+                    {isLoading ? t('spaces:join.submitting') : t('spaces:join.submit')}
                   </button>
                 </div>
               </div>
@@ -271,25 +277,30 @@ export function JoinSpaceModal() {
         <form onSubmit={handleConnect}>
           <input type="text" autoComplete="username" value={user?.username || ''} readOnly tabIndex={-1} className="sr-only" />
           <p className="text-txt-secondary text-sm mb-4">
-            Connect to <span className="text-txt-primary font-medium">{hostDisplay}</span> to join this space.
+            <Trans
+              t={t}
+              i18nKey="spaces:join.connect.intro"
+              values={{ host: hostDisplay }}
+              components={{ host: <span className="text-txt-primary font-medium" /> }}
+            />
           </p>
           <div className="mb-4 space-y-2">
             <div>
               <label className="block text-xs text-txt-tertiary mb-1">
-                Enter your password to connect
+                {t('spaces:join.connect.passwordLabel')}
               </label>
               <input
                 type="password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
-                placeholder="Your account password"
+                placeholder={t('spaces:join.connect.passwordPlaceholder')}
                 className="input-standard w-full"
                 disabled={isLoading}
                 autoFocus
                 autoComplete="current-password"
               />
               <div className="text-xs text-txt-tertiary mt-1">
-                Your password is verified locally, then used to create or access your account on the remote instance.
+                {t('spaces:join.connect.passwordNote', { host: hostDisplay })}
               </div>
             </div>
           </div>
@@ -304,7 +315,7 @@ export function JoinSpaceModal() {
                   <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" />
                   </svg>
-                  Back
+                  {t('common:actions.back')}
                 </button>
                 <div className="w-px h-5 bg-white/10" />
                 <button
@@ -312,14 +323,14 @@ export function JoinSpaceModal() {
                   onClick={closeModal}
                   className="px-3 py-1 text-sm text-txt-tertiary hover:text-txt-secondary transition-colors"
                 >
-                  Cancel
+                  {t('common:actions.cancel')}
                 </button>
                 <button
                   type="submit"
                   disabled={isLoading || !password}
                   className="px-3 py-1.5 bg-accent-primary hover:bg-accent-primary/80 text-white text-sm font-medium rounded-full transition-colors disabled:opacity-50"
                 >
-                  {isLoading ? 'Connecting...' : 'Connect & Join'}
+                  {isLoading ? t('spaces:join.connect.submitting') : t('spaces:join.connect.submit')}
                 </button>
               </div>
             </div>
@@ -327,32 +338,30 @@ export function JoinSpaceModal() {
         </form>
       )}
 
-      {/* Phase: fallback — different password on remote instance */}
+      {/* Phase: fallback — the account's own credentials on the remote instance */}
       {phase === 'fallback' && (
         <form onSubmit={handleFallbackLogin}>
-          <div className="mb-3 p-2 bg-accent-amber/10 border border-accent-amber/30 rounded text-xs text-accent-amber">
-            An account already exists on {hostDisplay} with a different password. Enter the credentials you used on that instance.
-          </div>
+          <FallbackNotice reason={fallbackReason} host={hostDisplay} className="mb-3" />
           <div className="mb-4 space-y-3">
             <div>
-              <label className="block text-xs text-txt-tertiary mb-1">Username</label>
+              <label className="block text-xs text-txt-tertiary mb-1">{t('common:labels.username')}</label>
               <input
                 type="text"
                 value={fallbackUsername}
                 onChange={(e) => setFallbackUsername(e.target.value)}
-                placeholder="Your username on this instance"
+                placeholder={t('spaces:join.fallback.usernamePlaceholder')}
                 className="input-standard w-full"
                 disabled={isLoading}
                 autoComplete="username"
               />
             </div>
             <div>
-              <label className="block text-xs text-txt-tertiary mb-1">Password for this instance</label>
+              <label className="block text-xs text-txt-tertiary mb-1">{t('spaces:join.fallback.passwordLabel')}</label>
               <input
                 type="password"
                 value={fallbackPassword}
                 onChange={(e) => setFallbackPassword(e.target.value)}
-                placeholder="Password on the remote instance"
+                placeholder={t('spaces:join.fallback.passwordPlaceholder')}
                 className="input-standard w-full"
                 disabled={isLoading}
                 autoFocus
@@ -371,7 +380,7 @@ export function JoinSpaceModal() {
                   <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" />
                   </svg>
-                  Back
+                  {t('common:actions.back')}
                 </button>
                 <div className="w-px h-5 bg-white/10" />
                 <button
@@ -379,14 +388,14 @@ export function JoinSpaceModal() {
                   onClick={closeModal}
                   className="px-3 py-1 text-sm text-txt-tertiary hover:text-txt-secondary transition-colors"
                 >
-                  Cancel
+                  {t('common:actions.cancel')}
                 </button>
                 <button
                   type="submit"
                   disabled={isLoading || !fallbackUsername || !fallbackPassword}
                   className="px-3 py-1.5 bg-accent-primary hover:bg-accent-primary/80 text-white text-sm font-medium rounded-full transition-colors disabled:opacity-50"
                 >
-                  {isLoading ? 'Logging in...' : 'Login & Join'}
+                  {isLoading ? t('spaces:join.fallback.submitting') : t('spaces:join.fallback.submit')}
                 </button>
               </div>
             </div>

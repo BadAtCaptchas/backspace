@@ -2,7 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import type { WebSocket } from 'ws';
 import { verifyJwt } from '../utils/auth.js';
 import { getDb, schema } from '../db/index.js';
-import { eq, and, or, inArray, isNull, desc, sql } from 'drizzle-orm';
+import { eq, and, or, inArray, desc, sql } from 'drizzle-orm';
 import { handleClientEvent } from './events.js';
 import { computePermissions, PermissionBits, permissionsToString } from '../utils/permissions.js';
 import type {
@@ -19,26 +19,23 @@ import type {
   ReadState,
   ActiveCallInfo,
   Activity,
+  PresenceIdentity,
 } from '@backspace/shared';
 import { sanitizeUser } from '../utils/sanitize.js';
+import { batchInArray } from '../utils/sqlBatch.js';
+import { loadOpenDmChannels } from '../utils/dmChannelWire.js';
 import { collectProfileBroadcastTargetIds } from '../utils/userDeletion.js';
+import { statusOnConnect } from '../utils/presenceStatus.js';
+import { presenceIdentityOf, presenceUpdateFor, snapshotActivities } from './presenceEvent.js';
+import { touchUserActivity, parseClientKind } from '../telemetry/activity.js';
+import { utcDay } from '../telemetry/day.js';
 
 // ─── Heartbeat State ──────────────────────────────────────────────────────────
 const wsIsAlive: WeakMap<WebSocket, boolean> = new WeakMap();
 let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
 
-// SQLite's SQLITE_MAX_VARIABLE_NUMBER default is 999.
-// Chunk inArray() calls to stay safely under this limit.
-const BATCH_CHUNK_SIZE = 500;
-
-function batchInArray<TId, TResult>(ids: TId[], queryFn: (chunk: TId[]) => TResult[]): TResult[] {
-  if (ids.length <= BATCH_CHUNK_SIZE) return queryFn(ids);
-  const results: TResult[] = [];
-  for (let i = 0; i < ids.length; i += BATCH_CHUNK_SIZE) {
-    results.push(...queryFn(ids.slice(i, i + BATCH_CHUNK_SIZE)));
-  }
-  return results;
-}
+export const VOICE_RECONNECT_GRACE_MS = 60_000;
+const MAX_PENDING_VOICE_RECONNECTS = 10_000;
 
 export interface AuthenticatedSocket {
   ws: WebSocket;
@@ -81,6 +78,11 @@ export interface VoiceRoom {
   startedAt: number;
 }
 
+/** Whole occupied seconds for the wire protocol; never exposes a server clock timestamp. */
+export function getVoiceRoomElapsedSeconds(room: VoiceRoom, now = Date.now()): number {
+  return Math.max(0, Math.floor((now - room.startedAt) / 1_000));
+}
+
 // ─── ConnectionManager ─────────────────────────────────────────────────────
 
 class ConnectionManager {
@@ -98,6 +100,9 @@ class ConnectionManager {
   private voiceUserStates: Map<string, { isMuted: boolean; isDeafened: boolean; isCameraOn: boolean; isScreenSharing: boolean }> = new Map();
   // userId → Timeout
   private pendingOfflineTimeouts: Map<string, NodeJS.Timeout> = new Map();
+  // Voice has a longer grace than presence so a VPN/network handover can be
+  // recovered by LiveKit without creating a visible leave/join cycle.
+  private pendingVoiceReconnects: Map<string, { timeout: NodeJS.Timeout; roomId: string | null }> = new Map();
   // roomId → Timeout for ringing DM rooms (60s auto-cleanup)
   private ringingTimeouts: Map<string, NodeJS.Timeout> = new Map();
   // Callback registered by events.ts to fan dm_call_end out to peers on ring timeout.
@@ -112,7 +117,7 @@ class ConnectionManager {
   // Permission-muted users (SPEAK permission revoked while in voice)
   private permissionMutedUsers: Set<string> = new Set(); // Stores spaceId:userId
   // The specific WebSocket that initiated voice_join / DM call for this user.
-  // When THIS socket closes, voice state is cleaned up immediately.
+  // When THIS socket closes, voice cleanup enters the reconnect grace period.
   private voiceWs: Map<string, WebSocket> = new Map();
   // Per-user WebSocket rate limiters (shared across all tabs/connections)
   private userRateLimiters: Map<string, WsRateLimiter> = new Map();
@@ -147,70 +152,16 @@ class ConnectionManager {
     if (userConnections) {
       userConnections.delete(ws);
 
-      // ── Immediate voice cleanup if this was the voice-active socket ──
+      // Only the socket that owns voice starts the voice grace period. Closing
+      // another tab must not disturb the active voice session.
       if (this.voiceWs.get(userId) === ws) {
         this.voiceWs.delete(userId);
-
-        // Leave voice room (space or DM)
-        const left = this.leaveCurrentRoom(userId);
-        this.clearVoiceUserStatus(userId);
-        if (left) {
-          if (left.room.roomType === 'space') {
-            const meta = left.room.metadata as SpaceRoomMeta;
-            this.sendToSpace(meta.spaceId, {
-              type: 'voice_state_update',
-              channelId: left.roomId,
-              userId,
-              action: 'leave',
-            });
-          } else {
-            this.sendToDmMembers(left.roomId, {
-              type: 'voice_state_update',
-              channelId: left.roomId,
-              userId,
-              action: 'leave',
-            });
-            // Auto-end empty active DM calls
-            const updatedRoom = this.voiceRooms.get(left.roomId);
-            if (updatedRoom && updatedRoom.participants.size === 0
-                && (updatedRoom.metadata as DmRoomMeta).state === 'active') {
-              this.destroyRoom(left.roomId);
-              this.sendToDmMembers(left.roomId, {
-                type: 'dm_call_ended',
-                dmChannelId: left.roomId,
-              });
-            }
-          }
-        }
-
-        // Clean up ringing DM rooms where this user is the caller
-        for (const [roomId, room] of this.voiceRooms) {
-          if (room.roomType === 'dm') {
-            const meta = room.metadata as DmRoomMeta;
-            if (meta.state === 'ringing' && meta.callerId === userId) {
-              this.destroyRoom(roomId);
-              this.sendToDmMembers(roomId, {
-                type: 'dm_call_ended',
-                dmChannelId: roomId,
-              });
-            }
-          }
-        }
-
-        // Notify the user's remaining tabs so their UI updates
-        if (userConnections.size > 0 && left) {
-          this.sendToUser(userId, {
-            type: 'voice_disconnected',
-            userId,
-            channelId: left.roomId,
-            reason: 'session_closed',
-          });
-        }
+        this.scheduleVoiceDisconnect(userId);
       }
 
       if (userConnections.size === 0) {
         this.connections.delete(userId);
-        // Schedule disconnect cleanup (presence/offline, NOT voice — already handled above)
+        // Presence and voice have independent grace periods.
         this.scheduleDisconnect(userId);
       }
     }
@@ -237,6 +188,82 @@ class ConnectionManager {
     }
   }
 
+  private scheduleVoiceDisconnect(userId: string): void {
+    this.cancelVoiceDisconnect(userId);
+    const roomId = this.userToRoom.get(userId)
+      ?? Array.from(this.voiceRooms).find(([, room]) =>
+        room.roomType === 'dm'
+        && (room.metadata as DmRoomMeta).state === 'ringing'
+        && (room.metadata as DmRoomMeta).callerId === userId,
+      )?.[0]
+      ?? null;
+    if (!roomId) return;
+
+    if (this.pendingVoiceReconnects.size >= MAX_PENDING_VOICE_RECONNECTS) {
+      const oldest = this.pendingVoiceReconnects.entries().next().value as
+        | [string, { timeout: NodeJS.Timeout; roomId: string | null }]
+        | undefined;
+      if (oldest) {
+        clearTimeout(oldest[1].timeout);
+        this.pendingVoiceReconnects.delete(oldest[0]);
+        this.finalizeVoiceDisconnect(oldest[0], oldest[1].roomId);
+      }
+    }
+
+    const timeout = setTimeout(() => {
+      const pending = this.pendingVoiceReconnects.get(userId);
+      if (!pending || pending.timeout !== timeout) return;
+      this.pendingVoiceReconnects.delete(userId);
+      if (!this.voiceWs.has(userId)) this.finalizeVoiceDisconnect(userId, pending.roomId);
+    }, VOICE_RECONNECT_GRACE_MS);
+    this.pendingVoiceReconnects.set(userId, { timeout, roomId });
+  }
+
+  private cancelVoiceDisconnect(userId: string): void {
+    const pending = this.pendingVoiceReconnects.get(userId);
+    if (!pending) return;
+    clearTimeout(pending.timeout);
+    this.pendingVoiceReconnects.delete(userId);
+  }
+
+  private finalizeVoiceDisconnect(userId: string, expectedRoomId: string | null = null): void {
+    if (this.voiceWs.has(userId)) return;
+    const current = this.getUserRoom(userId);
+    const left = (!expectedRoomId || current?.roomId === expectedRoomId)
+      ? this.leaveCurrentRoom(userId)
+      : null;
+    this.clearVoiceUserStatus(userId);
+
+    if (left) {
+      if (left.room.roomType === 'space') {
+        const meta = left.room.metadata as SpaceRoomMeta;
+        this.sendToSpace(meta.spaceId, {
+          type: 'voice_state_update', channelId: left.roomId, userId, action: 'leave',
+        });
+      } else {
+        this.sendToDmMembers(left.roomId, {
+          type: 'voice_state_update', channelId: left.roomId, userId, action: 'leave',
+        });
+        const updatedRoom = this.voiceRooms.get(left.roomId);
+        if (updatedRoom && updatedRoom.participants.size === 0
+            && (updatedRoom.metadata as DmRoomMeta).state === 'active') {
+          this.destroyRoom(left.roomId);
+          this.sendToDmMembers(left.roomId, { type: 'dm_call_ended', dmChannelId: left.roomId });
+        }
+      }
+    }
+
+    for (const [roomId, room] of this.voiceRooms) {
+      if (room.roomType !== 'dm') continue;
+      const meta = room.metadata as DmRoomMeta;
+      if (meta.state === 'ringing' && meta.callerId === userId
+          && (!expectedRoomId || expectedRoomId === roomId)) {
+        this.destroyRoom(roomId);
+        this.sendToDmMembers(roomId, { type: 'dm_call_ended', dmChannelId: roomId });
+      }
+    }
+  }
+
   private finalizeDisconnect(userId: string) {
     // Double check they are still offline
     if (this.isUserOnline(userId)) return;
@@ -244,52 +271,6 @@ class ConnectionManager {
     console.log(`[ConnectionManager] Finalizing disconnect for user ${userId}`);
     const db = getDb();
     db.update(schema.users).set({ status: 'offline' }).where(eq(schema.users.id, userId)).run();
-
-    // Leave voice room if in one (handles both space and DM rooms)
-    const left = this.leaveCurrentRoom(userId);
-    this.clearVoiceUserStatus(userId);
-    this.voiceWs.delete(userId);
-    if (left) {
-      if (left.room.roomType === 'space') {
-        const meta = left.room.metadata as SpaceRoomMeta;
-        this.sendToSpace(meta.spaceId, {
-          type: 'voice_state_update',
-          channelId: left.roomId,
-          userId: userId,
-          action: 'leave',
-        });
-      } else {
-        // DM room — broadcast leave and auto-end if empty
-        this.sendToDmMembers(left.roomId, {
-          type: 'voice_state_update',
-          channelId: left.roomId,
-          userId: userId,
-          action: 'leave',
-        });
-        const updatedRoom = this.voiceRooms.get(left.roomId);
-        if (updatedRoom && updatedRoom.participants.size === 0 && (updatedRoom.metadata as DmRoomMeta).state === 'active') {
-          this.destroyRoom(left.roomId);
-          this.sendToDmMembers(left.roomId, {
-            type: 'dm_call_ended',
-            dmChannelId: left.roomId,
-          });
-        }
-      }
-    }
-
-    // Destroy any ringing DM rooms where this user is the caller
-    for (const [roomId, room] of this.voiceRooms) {
-      if (room.roomType === 'dm') {
-        const meta = room.metadata as DmRoomMeta;
-        if (meta.state === 'ringing' && meta.callerId === userId) {
-          this.destroyRoom(roomId);
-          this.sendToDmMembers(roomId, {
-            type: 'dm_call_ended',
-            dmChannelId: roomId,
-          });
-        }
-      }
-    }
 
     // Clear activity state
     this.clearUserActivities(userId);
@@ -301,12 +282,7 @@ class ConnectionManager {
     // Mirrors collectProfileBroadcastTargetIds (the recipient set used by
     // user_updated). Two locally-friended users with no shared space now see
     // each other's offline transitions live, instead of being space-only.
-    const offlinePayload = {
-      type: 'presence_update' as const,
-      userId,
-      status: 'offline' as const,
-      activities: [] as Activity[],
-    };
+    const offlinePayload = presenceUpdateFor(userId, 'offline', []);
     const offlineTargets = collectProfileBroadcastTargetIds(userId);
     for (const uid of offlineTargets) this.sendToUser(uid, offlinePayload);
 
@@ -414,6 +390,7 @@ class ConnectionManager {
       type: 'space_voice_state',
       spaceId,
       voiceStates: snapshot.voiceStates,
+      voiceChannelElapsedSeconds: snapshot.voiceChannelElapsedSeconds,
       voiceUserStates: snapshot.voiceUserStates,
       spaceVoiceStates: snapshot.spaceVoiceStates,
     });
@@ -441,11 +418,13 @@ class ConnectionManager {
    */
   buildSpaceVoiceState(spaceId: string, userId: string): {
     voiceStates: Record<string, string[]>;
+    voiceChannelElapsedSeconds: Record<string, number>;
     voiceUserStates: Record<string, { isMuted: boolean; isDeafened: boolean; isCameraOn: boolean; isScreenSharing: boolean }>;
     spaceVoiceStates: Record<string, { spaceMuted: boolean; spaceDeafened: boolean; permissionMuted: boolean }>;
   } {
     const db = getDb();
     const voiceStates: Record<string, string[]> = {};
+    const voiceChannelElapsedSeconds: Record<string, number> = {};
     const voiceUserStates: Record<string, { isMuted: boolean; isDeafened: boolean; isCameraOn: boolean; isScreenSharing: boolean }> = {};
     const spaceVoiceStates: Record<string, { spaceMuted: boolean; spaceDeafened: boolean; permissionMuted: boolean }> = {};
 
@@ -458,10 +437,11 @@ class ConnectionManager {
       const chPerms = computePermissions(userId, spaceId, ch.id);
       const hasView = (chPerms & PermissionBits.VIEW_CHANNEL) !== 0n || (chPerms & PermissionBits.ADMINISTRATOR) !== 0n;
       if (!hasView) continue;
-      const participants = this.getRoomParticipants(ch.id);
-      if (participants.size > 0) {
-        const ids = Array.from(participants);
+      const room = this.getRoom(ch.id);
+      if (room && room.participants.size > 0) {
+        const ids = Array.from(room.participants);
         voiceStates[ch.id] = ids;
+        voiceChannelElapsedSeconds[ch.id] = getVoiceRoomElapsedSeconds(room);
         for (const uid of ids) {
           const status = this.getVoiceUserStatus(uid);
           if (status) voiceUserStates[uid] = status;
@@ -499,7 +479,7 @@ class ConnectionManager {
       }
     }
 
-    return { voiceStates, voiceUserStates, spaceVoiceStates };
+    return { voiceStates, voiceChannelElapsedSeconds, voiceUserStates, spaceVoiceStates };
   }
 
   // ─── Unified VoiceRoom API ─────────────────────────────────────────────────
@@ -757,7 +737,12 @@ class ConnectionManager {
     const displaced: string[] = [];
     for (const userId of room.participants) {
       this.userToRoom.delete(userId);
+      this.cancelVoiceDisconnect(userId);
       displaced.push(userId);
+    }
+
+    if (room.roomType === 'dm') {
+      this.cancelVoiceDisconnect((room.metadata as DmRoomMeta).callerId);
     }
 
     this.voiceRooms.delete(roomId);
@@ -814,6 +799,7 @@ class ConnectionManager {
 
   /** Store which ws owns the voice session for this user. */
   setVoiceWs(userId: string, ws: WebSocket): void {
+    this.cancelVoiceDisconnect(userId);
     this.voiceWs.set(userId, ws);
   }
 
@@ -824,6 +810,7 @@ class ConnectionManager {
 
   /** Clear the voice ws binding for this user. */
   clearVoiceWs(userId: string): void {
+    this.cancelVoiceDisconnect(userId);
     this.voiceWs.delete(userId);
   }
 
@@ -993,7 +980,7 @@ class ConnectionManager {
     // Leave voice room if in one
     const left = this.leaveCurrentRoom(userId);
     this.clearVoiceUserStatus(userId);
-    this.voiceWs.delete(userId);
+    this.clearVoiceWs(userId);
     if (left) {
       if (left.room.roomType === 'space') {
         const meta = left.room.metadata as SpaceRoomMeta;
@@ -1084,6 +1071,77 @@ class ConnectionManager {
 
 export const connectionManager = new ConnectionManager();
 
+// The pong path runs every 30 seconds per socket, so a database that keeps
+// refusing this write would flood the log at one line per socket per pong. One
+// line per hour is the compromise: quiet enough that a persistent fault does
+// not bury everything else, loud enough that an outage lasting a week stays
+// visible for the whole week. A one-shot flag was the earlier form and it went
+// permanently silent after the first failure, so an outage that began before
+// anyone looked left no trace at all.
+const ACTIVITY_WARN_INTERVAL_MS = 60 * 60 * 1000;
+let activityWarnedAt = 0;
+
+/**
+ * The last UTC day each live connection recorded activity for.
+ *
+ * Keyed on the socket, so it dies with the socket and holds nothing across
+ * reconnects. `touchUserActivity` already refuses to rewrite a row that holds
+ * today, so this memo changes no stored value; what it avoids is the round
+ * trip. Without it an `UPDATE` runs for every socket on every pong, which on an
+ * instance holding a few hundred desktop clients open is constant write-lock
+ * churn on `users` for a column that moves once a day.
+ *
+ * A miss is always safe: a connection with no memo simply writes, and the
+ * statement's own predicate makes that a no-op when the day is already there.
+ */
+const activityDayByConnection: WeakMap<object, string> = new WeakMap();
+
+/**
+ * Day-coarse activity for the opt-in telemetry counts. `authMessage` is the
+ * parsed auth message on the auth path (its optional `client` field names the
+ * client kind) and null on a heartbeat pong, which touches the day only.
+ *
+ * A failed write is swallowed: this bookkeeping is optional, and it runs on the
+ * auth path (where a throw would look like a rejected token) and inside the
+ * 'pong' listener (where an uncaught throw would take the process down).
+ *
+ * `connection` is the socket, used as the key of a per-connection memo of the
+ * day already recorded. Given, a pong that has already recorded today returns
+ * without touching the database. Omitted, every call writes.
+ */
+export function recordConnectionActivity(
+  userId: string,
+  authMessage: Record<string, unknown> | null,
+  now: Date,
+  connection?: object,
+): void {
+  const today = utcDay(now);
+  // The auth path is never skipped: it carries the client kind, which can
+  // differ from what the row holds even on a day already recorded. Only the
+  // pong path, which touches the day and nothing else, has anything to skip.
+  if (authMessage === null && connection !== undefined
+    && activityDayByConnection.get(connection) === today) {
+    return;
+  }
+  try {
+    const db = getDb();
+    if (authMessage) {
+      touchUserActivity(db, userId, today, parseClientKind(authMessage.client));
+    } else {
+      touchUserActivity(db, userId, today);
+    }
+    // Recorded only after the write did not throw, so a failing database is
+    // retried on the next pong rather than memoised as done.
+    if (connection !== undefined) activityDayByConnection.set(connection, today);
+  } catch (err) {
+    const at = now.getTime();
+    if (activityWarnedAt === 0 || at - activityWarnedAt >= ACTIVITY_WARN_INTERVAL_MS) {
+      activityWarnedAt = at;
+      console.warn(`[ws] could not record activity: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+}
+
 // ─── WebSocket Rate Limiter (Token Bucket) ─────────────────────────────────
 
 class WsRateLimiter {
@@ -1121,11 +1179,13 @@ function buildReadyPayload(userId: string): {
   spaceLayout: SpaceLayoutItem[] | null;
   layoutUpdatedAt: number | null;
   voiceStates: Record<string, string[]>;
+  voiceChannelElapsedSeconds: Record<string, number>;
   voiceUserStates: Record<string, { isMuted: boolean; isDeafened: boolean; isCameraOn: boolean; isScreenSharing: boolean }>;
   spaceVoiceStates: Record<string, { spaceMuted: boolean; spaceDeafened: boolean; permissionMuted: boolean }>;
   readStates: ReadState[];
   activeCalls: ActiveCallInfo[];
   userActivities: Record<string, Activity[]>;
+  userActivityIdentities: Record<string, PresenceIdentity>;
   rejectedPeerOrigins: string[];
   awaitingApprovalPeerOrigins: string[];
   activePeerOrigins: string[];
@@ -1318,6 +1378,7 @@ function buildReadyPayload(userId: string): {
         ownerId: spaceRow.ownerId,
         inviteCode: spaceRow.inviteCode,
         visibility: (spaceRow.visibility ?? 'private') as SpaceWithChannelsAndMembers['visibility'],
+        directoryListed: spaceRow.directoryListed === 1,
         description: spaceRow.description ?? null,
         createdAt: spaceRow.createdAt,
         channels: visibleChannels,
@@ -1341,7 +1402,8 @@ function buildReadyPayload(userId: string): {
   // Store user's space IDs for broadcasting
   connectionManager.setUserSpaces(userId, spaceIds);
 
-  // Get DM channels
+  // Open DM memberships (active-call lookup below) and the DM channels
+  // themselves (the same list GET /api/dm serves).
   const dmMemberships = db.select()
     .from(schema.dmMembers)
     .where(and(
@@ -1349,110 +1411,7 @@ function buildReadyPayload(userId: string): {
       eq(schema.dmMembers.closed, 0),
     ))
     .all();
-
-  const dmChannelIds = dmMemberships.map(dm => dm.dmChannelId);
-  const dmChannels: DmChannel[] = [];
-
-  if (dmChannelIds.length > 0) {
-    // Batch: all DM channels (1 query, exclude soft-deleted)
-    const allDmChannelRows = batchInArray(
-      dmChannelIds,
-      ids => db.select().from(schema.dmChannels).where(and(inArray(schema.dmChannels.id, ids), isNull(schema.dmChannels.deletedAt))).all(),
-    );
-    const dmChannelMap = new Map(allDmChannelRows.map(c => [c.id, c]));
-
-    // Batch: all DM members across all channels (1 query)
-    const allDmMemberRows = batchInArray(
-      dmChannelIds,
-      ids => db.select().from(schema.dmMembers).where(inArray(schema.dmMembers.dmChannelId, ids)).all(),
-    );
-
-    // Batch: all unique users from DM members (1 query)
-    const allDmUserIds = [...new Set(allDmMemberRows.map(m => m.userId))];
-    const allDmUsers = allDmUserIds.length > 0
-      ? batchInArray(allDmUserIds, ids => db.select().from(schema.users).where(inArray(schema.users.id, ids)).all())
-      : [];
-    const dmUserMap = new Map(allDmUsers.map(u => [u.id, u]));
-
-    // Batch: last message per DM channel.
-    // Two-step approach (same as GET /api/dm): get MAX(created_at) per channel,
-    // then fetch the actual message rows matching those timestamps.
-    const dmMaxTimestamps = batchInArray(
-      dmChannelIds,
-      ids => db.select({
-        dmChannelId: schema.dmMessages.dmChannelId,
-        maxCreatedAt: sql<number>`MAX(${schema.dmMessages.createdAt})`.as('max_created_at'),
-      }).from(schema.dmMessages).where(inArray(schema.dmMessages.dmChannelId, ids)).groupBy(schema.dmMessages.dmChannelId).all(),
-    );
-    const dmLastMsgMap = new Map<string, typeof schema.dmMessages.$inferSelect>();
-    if (dmMaxTimestamps.length > 0) {
-      const conditions = dmMaxTimestamps.map(t =>
-        and(eq(schema.dmMessages.dmChannelId, t.dmChannelId), eq(schema.dmMessages.createdAt, t.maxCreatedAt!))
-      );
-      const dmLastMessages = db.select().from(schema.dmMessages).where(or(...conditions)).all();
-      for (const m of dmLastMessages) {
-        if (!dmLastMsgMap.has(m.dmChannelId)) {
-          dmLastMsgMap.set(m.dmChannelId, m);
-        }
-      }
-    }
-    const dmLastMsgIds = [...dmLastMsgMap.values()].map(m => m.id);
-
-    // Batch: attachments for last messages (1 query)
-    const dmLastMsgAttachments = dmLastMsgIds.length > 0
-      ? batchInArray(dmLastMsgIds, ids =>
-          db.select({
-            dmMessageId: schema.attachments.dmMessageId,
-            type: schema.attachments.mimetype,
-            filename: schema.attachments.originalName,
-          }).from(schema.attachments).where(inArray(schema.attachments.dmMessageId, ids)).all()
-        )
-      : [];
-    const dmLastMsgAttachmentMap = new Map<string, Array<{ type: string; filename: string }>>();
-    for (const a of dmLastMsgAttachments) {
-      if (!a.dmMessageId) continue;
-      const arr = dmLastMsgAttachmentMap.get(a.dmMessageId) ?? [];
-      arr.push({ type: a.type, filename: a.filename });
-      dmLastMsgAttachmentMap.set(a.dmMessageId, arr);
-    }
-
-    // Assemble DM channels with zero additional queries
-    for (const dm of dmMemberships) {
-      const dmChannel = dmChannelMap.get(dm.dmChannelId);
-      if (!dmChannel) continue;
-
-      const memberRows = allDmMemberRows.filter(m => m.dmChannelId === dm.dmChannelId);
-      const members = memberRows
-        .map(m => dmUserMap.get(m.userId))
-        .filter((u): u is NonNullable<typeof u> => u != null)
-        .map(u => sanitizeUser(u));
-
-      const last = dmLastMsgMap.get(dm.dmChannelId) ?? null;
-
-      dmChannels.push({
-        id: dmChannel.id,
-        federatedId: dmChannel.federatedId ?? null,
-        ownerId: dmChannel.ownerId ?? null,
-        ownerHomeUserId: dmChannel.ownerHomeUserId ?? null,
-        ownerHomeInstance: dmChannel.ownerHomeInstance ?? null,
-        createdAt: dmChannel.createdAt,
-        name: dmChannel.name ?? null,
-        icon: dmChannel.icon ?? null,
-        metadataUpdatedAt: dmChannel.metadataUpdatedAt ?? 0,
-        members,
-        lastMessage: last ? {
-          id: last.id,
-          dmChannelId: last.dmChannelId,
-          userId: last.userId,
-          content: last.content,
-          createdAt: last.createdAt,
-          type: last.type === 'system' ? 'system' : 'user',
-          attachments: dmLastMsgAttachmentMap.get(last.id) ?? [],
-        } : null,
-      });
-    }
-
-  }
+  const dmChannels = loadOpenDmChannels(db, userId, dmMemberships);
 
   // Include DM channel IDs in the visible set for read state filtering
   for (const dm of dmChannels) {
@@ -1525,10 +1484,12 @@ function buildReadyPayload(userId: string): {
   // The helper applies the same VIEW_CHANNEL filtering used when building the
   // `spaces` array above.
   const voiceStates: Record<string, string[]> = {};
+  const voiceChannelElapsedSeconds: Record<string, number> = {};
   const spaceVoiceStates: Record<string, { spaceMuted: boolean; spaceDeafened: boolean; permissionMuted: boolean }> = {};
   for (const space of spaces) {
     const snap = connectionManager.buildSpaceVoiceState(space.id, userId);
     Object.assign(voiceStates, snap.voiceStates);
+    Object.assign(voiceChannelElapsedSeconds, snap.voiceChannelElapsedSeconds);
     Object.assign(spaceVoiceStates, snap.spaceVoiceStates);
   }
 
@@ -1605,32 +1566,63 @@ function buildReadyPayload(userId: string): {
       lastReadMessageId: rs.lastReadMessageId,
     }));
 
-  // Build user activities snapshot for all visible users
+  // Build user activities snapshot for all visible users: space members, DM
+  // members and friends (a friend may share neither with the user). Keys are
+  // this instance's row ids; userActivityIdentities names each key's federated
+  // identity so the client can key it like every other view of that person.
   // Auto-inject customStatus as a 'custom' activity for users with no ephemeral activities
   const userActivities: Record<string, Activity[]> = {};
+  const userActivityIdentities: Record<string, PresenceIdentity> = {};
   const seenUserIds = new Set<string>();
 
-  function collectUserActivities(uid: string, customStatus: string | null) {
-    if (seenUserIds.has(uid)) return;
-    seenUserIds.add(uid);
-    let acts = connectionManager.getUserActivities(uid);
-    if (acts.length === 0 && customStatus) {
-      acts = [{ type: 'custom', name: customStatus }];
-    }
+  function collectUserActivities(
+    subject: { id: string; homeUserId: string | null; homeInstance: string | null; customStatus: string | null },
+  ) {
+    if (seenUserIds.has(subject.id)) return;
+    seenUserIds.add(subject.id);
+    const acts = snapshotActivities(connectionManager.getUserActivities(subject.id), subject.customStatus);
     if (acts.length > 0) {
-      userActivities[uid] = acts;
+      userActivities[subject.id] = acts;
+      userActivityIdentities[subject.id] = presenceIdentityOf(subject);
     }
   }
 
   for (const space of spaces) {
     for (const member of space.members) {
-      collectUserActivities(member.userId, member.user?.customStatus ?? null);
+      collectUserActivities({
+        id: member.userId,
+        homeUserId: member.user?.homeUserId ?? null,
+        homeInstance: member.user?.homeInstance ?? null,
+        customStatus: member.user?.customStatus ?? null,
+      });
     }
   }
   for (const dm of dmChannels) {
     for (const member of dm.members) {
-      collectUserActivities(member.id, member.customStatus ?? null);
+      collectUserActivities({
+        id: member.id,
+        homeUserId: member.homeUserId ?? null,
+        homeInstance: member.homeInstance ?? null,
+        customStatus: member.customStatus ?? null,
+      });
     }
+  }
+  const friendIds = db.select({ userId: schema.friends.userId, friendId: schema.friends.friendId })
+    .from(schema.friends)
+    .where(or(eq(schema.friends.userId, userId), eq(schema.friends.friendId, userId)))
+    .all()
+    .map(f => (f.userId === userId ? f.friendId : f.userId));
+  if (friendIds.length > 0) {
+    const friendRows = db.select({
+      id: schema.users.id,
+      homeUserId: schema.users.homeUserId,
+      homeInstance: schema.users.homeInstance,
+      customStatus: schema.users.customStatus,
+    })
+      .from(schema.users)
+      .where(inArray(schema.users.id, friendIds))
+      .all();
+    for (const friend of friendRows) collectUserActivities(friend);
   }
 
   // Rejected peer origins for unreachable member indicators
@@ -1667,7 +1659,7 @@ function buildReadyPayload(userId: string): {
     pendingApprovalCount = countResult?.count ?? 0;
   }
 
-  return { user, spaces, dmChannels, folders, spaceLayout, layoutUpdatedAt, voiceStates, voiceUserStates, spaceVoiceStates, readStates, activeCalls, userActivities, rejectedPeerOrigins, awaitingApprovalPeerOrigins, activePeerOrigins, pendingApprovalCount };
+  return { user, spaces, dmChannels, folders, spaceLayout, layoutUpdatedAt, voiceStates, voiceChannelElapsedSeconds, voiceUserStates, spaceVoiceStates, readStates, activeCalls, userActivities, userActivityIdentities, rejectedPeerOrigins, awaitingApprovalPeerOrigins, activePeerOrigins, pendingApprovalCount };
 }
 
 export async function registerWebSocket(app: FastifyInstance): Promise<void> {
@@ -1733,15 +1725,29 @@ export async function registerWebSocket(app: FastifyInstance): Promise<void> {
           isFederated = !!userRow.homeInstance;
           clearTimeout(authTimeout);
 
-          // Update user status to online
-          db.update(schema.users).set({ status: 'online' }).where(eq(schema.users.id, userId)).run();
+          // Publish the user's chosen status as their live presence. For a
+          // native row that is chosen_status (idle and dnd survive reconnects
+          // and restarts); for a replicated row it is the home instance's last
+          // projection. See utils/presenceStatus.ts.
+          const connectStatus = statusOnConnect(userRow);
+          db.update(schema.users).set({ status: connectStatus }).where(eq(schema.users.id, userId)).run();
 
           // Add connection
           connectionManager.addConnection(userId, ws);
 
+          // Captured for the pong closure: `userId` is a mutable outer binding, so
+          // its narrowing to a string does not survive into the callback.
+          const activeUserId = userId;
+          recordConnectionActivity(activeUserId, parsed, new Date());
+
           // Mark alive for heartbeat detection; browsers auto-respond to ping frames (RFC 6455)
           wsIsAlive.set(ws, true);
-          ws.on('pong', () => { wsIsAlive.set(ws, true); });
+          ws.on('pong', () => {
+            wsIsAlive.set(ws, true);
+            // `ws` is the memo key: this socket writes the day once and then
+            // stops asking until the day rolls over.
+            recordConnectionActivity(activeUserId, null, new Date(), ws);
+          });
 
           // Build and send ready payload
           const readyData = buildReadyPayload(userId);
@@ -1750,15 +1756,19 @@ export async function registerWebSocket(app: FastifyInstance): Promise<void> {
             ...readyData,
           }));
 
-          // Broadcast online to friends + DM co-members + space co-members.
-          const onlinePayload = { type: 'presence_update' as const, userId, status: 'online' as const };
-          const onlineTargets = collectProfileBroadcastTargetIds(userId);
-          for (const uid of onlineTargets) connectionManager.sendToUser(uid, onlinePayload);
+          // Broadcast the connect status to friends + DM co-members + space co-members.
+          const connectPayload = presenceUpdateFor(userId, connectStatus);
+          const connectTargets = collectProfileBroadcastTargetIds(userId);
+          for (const uid of connectTargets) connectionManager.sendToUser(uid, connectPayload);
 
-          // S2S: project online to all active peers (mirrors profile_update fanout).
+          // S2S: project it to all active peers (mirrors profile_update fanout).
+          // No-op for a replicated row: its home instance owns the projection.
+          // The relay is a full snapshot, so it carries the activities another
+          // session of this user already reported (none on a first connection).
           const _uid = userId;
+          const connectActivities = connectionManager.getUserActivities(_uid);
           void import('../utils/federationPresence.js').then(({ queuePresenceRelay }) => {
-            try { queuePresenceRelay(_uid, 'online', []); } catch (e) { console.warn('[ws] queuePresenceRelay(online) failed', e); }
+            try { queuePresenceRelay(_uid, connectStatus, connectActivities); } catch (e) { console.warn('[ws] queuePresenceRelay(connect) failed', e); }
           });
         } catch {
           ws.send(JSON.stringify({ type: 'error', message: 'Invalid token' }));

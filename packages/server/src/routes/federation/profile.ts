@@ -6,33 +6,52 @@ import { deleteUploadFile } from '../../utils/fileCleanup.js';
 import { sanitizeUser } from '../../utils/sanitize.js';
 import { generateSnowflake } from '../../utils/snowflake.js';
 import { collectProfileBroadcastTargetIds } from '../../utils/userDeletion.js';
+import { safeFetch } from '../../utils/ssrf.js';
 import { connectionManager } from '../../ws/handler.js';
 import { and, eq, or, sql } from 'drizzle-orm';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import type { FederationRelayEvent, FederationRelayProfileSnapshot } from '@backspace/shared';
-import { extractDomain } from './identity.js';
+import { extractDomain, resolveRelayActor } from './identity.js';
+import { announceUserUpdated, applyPlaceholderRename } from './stubName.js';
 
 /**
  * Hydrate a replicated user stub with profile data from a relay event.
- * Only updates fields that are currently null/empty on the local row,
- * so manually-set local values are preserved.
+ * Only fills fields that are still null/empty on the local row and never
+ * rewrites one. The snapshot carries no version, and a DM or friend event may
+ * carry one that a third instance built from its own, possibly stale, replica
+ * of the user, so it cannot tell whether it is newer than what is stored.
+ * Stored profile fields change only through the home's version-checked
+ * `profile_update` (`processProfileUpdateEvent`). The one rewrite is the
+ * username of a row that still carries a placeholder name
+ * (`applyPlaceholderRename`).
+ *
+ * When the row changed (renamed, or a field filled), the users who can see it
+ * get one `user_updated` with the final row (`announceUserUpdated`), after
+ * every field is written. A rename just before by `resolveOrCreateReplicatedUser`
+ * announced the row without the display name this fills, so this is the event
+ * that carries it.
  */
 export async function hydrateReplicatedUserProfile(
-  user: typeof schema.users.$inferSelect,
+  userIn: typeof schema.users.$inferSelect,
   profile: FederationRelayProfileSnapshot | undefined,
   db: ReturnType<typeof getDb>,
 ): Promise<typeof schema.users.$inferSelect> {
-  if (!profile) return user;
-  if (!user.homeInstance) return user; // Don't update native users
+  if (!profile) return userIn;
+  if (!userIn.homeInstance) return userIn; // Don't update native users
   // Detached accounts are sovereign local accounts: the home domain now belongs
   // to a different incarnation, so a relayed snapshot resolved via an old
   // homeUserId (tier-1 historical hit) must never fill this row's fields. No-op
   // return, mirroring the profile_update / presence_update / identity-delete
   // guards (detach spec §4.3).
-  if (user.federationHomeOrphaned === 1) return user;
+  if (userIn.federationHomeOrphaned === 1) return userIn;
 
-  const baseUrl = user.homeInstance.startsWith('http') ? user.homeInstance : `https://${user.homeInstance}`;
+  // A row still carrying a placeholder name takes the snapshot's username.
+  const user = applyPlaceholderRename(userIn, profile.username, db);
+  const renamed = user !== userIn;
+
+  const homeInstance = userIn.homeInstance;
+  const baseUrl = homeInstance.startsWith('http') ? homeInstance : `https://${homeInstance}`;
   const buildAbsoluteUrl = (value: string): string => {
     if (value.startsWith('http')) return value;
     const path = value.startsWith('/') ? value : `/api/uploads/${value}`;
@@ -55,25 +74,40 @@ export async function hydrateReplicatedUserProfile(
   // "user@instance.example" federation username.
   const effectiveDisplayName = profile.displayName || profile.username || null;
   if (effectiveDisplayName && !user.displayName) updates.displayName = effectiveDisplayName;
-  // Hydrate is best-effort: only fill empty fields. Never overwrite existing
-  // avatar/banner values — that is exclusively processProfileUpdateEvent's job
-  // (which carries a monotonic version). In particular, locally-downloaded
-  // bare filenames produced by that path must not be clobbered back to URLs.
+  // Hydrate is best-effort: only fill empty fields. Never overwrite an
+  // existing value: that is exclusively processProfileUpdateEvent's job (it
+  // carries a monotonic version and comes from the home). Overwriting from an
+  // unversioned snapshot let a third instance's stale replica flip a field
+  // back and forth, announcing each flip. Locally-downloaded bare filenames
+  // produced by that path must not be clobbered back to URLs either.
   if (profile.avatar && !user.avatar) updates.avatar = await resolveAsset(profile.avatar);
-  if (profile.avatarColor) updates.avatarColor = profile.avatarColor;
+  if (profile.avatarColor && !user.avatarColor) updates.avatarColor = profile.avatarColor;
   if (profile.banner && !user.banner) updates.banner = await resolveAsset(profile.banner);
   if (profile.bio && !user.bio) updates.bio = profile.bio;
 
-  if (Object.keys(updates).length === 0) return user;
+  if (Object.keys(updates).length === 0) {
+    if (renamed) announceUserUpdated(user);
+    return user;
+  }
 
   db.update(schema.users)
     .set(updates)
     .where(eq(schema.users.id, user.id))
     .run();
 
-  return { ...user, ...updates };
+  const hydrated = { ...user, ...updates };
+  announceUserUpdated(hydrated);
+  return hydrated;
 }
 
+
+/**
+ * Cap on a replicated avatar or banner. Peers are admin-approved but explicitly
+ * untrusted; without a cap a peer answers the download with an unbounded body
+ * and fills the instance's disk. 8 MiB is well above any real avatar and well
+ * below anything that matters on a volume.
+ */
+export const MAX_PROFILE_ASSET_BYTES = 8 * 1024 * 1024;
 
 /**
  * Download a profile image (avatar or banner) from a remote instance.
@@ -104,7 +138,10 @@ export async function downloadProfileAsset(
   const finalPath = path.join(config.uploadDir, finalFilename);
 
   try {
-    const response = await fetch(url, {
+    // safeFetch, not fetch: the hostname check above constrains the FIRST hop
+    // only, and bare fetch follows redirects without re-checking. safeFetch
+    // re-validates every hop, so a 302 into the local network is refused.
+    const response = await safeFetch(url, {
       signal: AbortSignal.timeout(10_000),
     });
 
@@ -119,11 +156,34 @@ export async function downloadProfileAsset(
       return null;
     }
 
+    // Content-Length is a claim, not a guarantee, but when it is present and
+    // already over the cap there is no reason to open the file at all.
+    const declared = Number(response.headers.get('content-length') ?? '');
+    if (Number.isFinite(declared) && declared > MAX_PROFILE_ASSET_BYTES) {
+      console.warn(`[federation] Profile asset rejected: declared ${declared} bytes exceeds cap`);
+      return null;
+    }
+
     // Ensure upload directory exists
     fs.mkdirSync(config.uploadDir, { recursive: true });
 
-    // Stream to temp file
-    const nodeStream = Readable.fromWeb(response.body as ReadableStream);
+    // Stream to temp file, counting bytes, so the cap is enforced on what
+    // actually arrives rather than on what the peer said it would send. The
+    // controller.error() below rejects the pipeline, and the catch block
+    // removes the partial temp file.
+    let received = 0;
+    const capped = new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        received += chunk.byteLength;
+        if (received > MAX_PROFILE_ASSET_BYTES) {
+          controller.error(new Error('Profile asset exceeds size cap'));
+          return;
+        }
+        controller.enqueue(chunk);
+      },
+    });
+
+    const nodeStream = Readable.fromWeb(response.body.pipeThrough(capped) as ReadableStream);
     const writeStream = fs.createWriteStream(tempPath);
     await pipeline(nodeStream, writeStream);
 
@@ -134,7 +194,7 @@ export async function downloadProfileAsset(
   } catch (err) {
     // Clean up temp file on any failure
     try { fs.unlinkSync(tempPath); } catch { /* may not exist */ }
-    console.warn(`[federation] Profile asset download failed for ${url}:`, (err as Error).message);
+    console.warn('[federation] Profile asset download failed for %s:', url, (err as Error).message);
     return null;
   }
 }
@@ -163,29 +223,16 @@ export async function processProfileUpdateEvent(
     return;
   }
 
-  // Look up the local replicated user by canonical identity
-  const localUser = db
-    .select()
-    .from(schema.users)
-    .where(
-      and(
-        eq(schema.users.homeUserId, payload.homeUserId),
-        eq(schema.users.isDeleted, 0),
-      ),
-    )
-    .get();
-
-  if (!localUser) {
-    // This peer has no replica of this user — silently accept
+  // The row updated is the one that IS the payload's identity, homed on the
+  // sending peer (`resolveRelayActor`). A native user of this instance is never
+  // one, so its profile is only ever changed here. No such row: accept as a
+  // no-op, this instance holds no replica of the user.
+  const identity = resolveRelayActor(payload, db);
+  if (identity.kind !== 'found' || !identity.user.homeInstance) {
     accepted.push(event.messageId);
     return;
   }
-
-  // Verify the homeInstance domain matches (guard against homeUserId collisions)
-  if (localUser.homeInstance && extractDomain(localUser.homeInstance) !== payloadDomain) {
-    accepted.push(event.messageId);
-    return;
-  }
+  const localUser = identity.user;
 
   // Detached accounts are sovereign: the domain now belongs to a different
   // incarnation, which must never overwrite the established account's profile

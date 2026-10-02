@@ -1,13 +1,14 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { useTranslation } from 'react-i18next';
 import { Modal } from '../ui/Modal';
 import { Avatar } from '../ui/Avatar';
 import { useUIStore } from '../../stores/uiStore';
-import { useSpaceStore } from '../../stores/spaceStore';
+import { useSpaceStore, dmCopyOnOrigin, getChannelOrigin } from '../../stores/spaceStore';
 import { useAuthStore } from '../../stores/authStore';
 import { useSocialStore, type TaggedFriend } from '../../stores/socialStore';
 import { api } from '../../api/client';
-import { isSelf, parseFederatedUsername } from '../../utils/identity';
+import { isSelf, parseFederatedUsername, deliveringHost } from '../../utils/identity';
 import { useCanonicalUserView } from '../../utils/userViewLookup';
 import type { User } from '@backspace/shared';
 
@@ -26,6 +27,7 @@ function AddDmFriendRow({
   isAdding: boolean;
   onToggle: (id: string) => void;
 }) {
+  const { t } = useTranslation(['dm', 'common']);
   const canonical = useCanonicalUserView(friend as unknown as User);
   const { baseName } = parseFederatedUsername(canonical.username);
   const friendDisplayName = canonical.displayName ?? baseName;
@@ -54,7 +56,7 @@ function AddDmFriendRow({
           {friendDisplayName}
         </div>
         <div className="text-[11px] text-txt-tertiary truncate">
-          {isInDm ? 'Already in this DM' : `@${canonical.username}`}
+          {isInDm ? t('dm:addMember.alreadyInDm') : `@${canonical.username}`}
         </div>
       </div>
       {!isInDm && (
@@ -77,6 +79,7 @@ function AddDmFriendRow({
 }
 
 export function AddDmMemberModal() {
+  const { t } = useTranslation(['dm', 'common']);
   const [query, setQuery] = useState('');
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [error, setError] = useState('');
@@ -85,7 +88,7 @@ export function AddDmMemberModal() {
   const modalData = useUIStore((s) => s.modalData);
   const closeModal = useUIStore((s) => s.closeModal);
   const dmChannels = useSpaceStore((s) => s.dmChannels);
-  const addDmChannel = useSpaceStore((s) => s.addDmChannel);
+  const upsertDmCopy = useSpaceStore((s) => s.upsertDmCopy);
   const friends = useSocialStore((s) => s.friends);
   const navigate = useNavigate();
   const myUser = useAuthStore((s) => s.user);
@@ -157,31 +160,51 @@ export function AddDmMemberModal() {
     if (!dmChannelId || !dmChannel || isAdding || selectedFriends.length === 0) return;
     setError('');
     setIsAdding(true);
+    // Both requests go to the home instance, which knows the conversation
+    // only as its own copy: its id and its members. The row may be pinned to
+    // another instance's copy, whose ids mean nothing there.
+    const homeCopy = dmCopyOnOrigin(dmChannelId, '');
     try {
       if (!dmChannel.ownerId) {
         // 1-on-1 DM → create a new group DM with all selected + existing other member
-        const otherMember = dmChannel.members.find(m => !isSelf(m, myUser));
-        if (!otherMember) {
-          setError('Could not determine the other member of this conversation.');
+        const partner = (homeCopy ?? dmChannel).members.find(m => !isSelf(m, myUser));
+        if (!partner) {
+          setError(t('dm:addMember.noOtherMember'));
           setIsAdding(false);
           return;
         }
+        // Home's own row for the partner when it holds the conversation;
+        // otherwise the partner by their home identity, which home resolves.
+        const partnerIdentity = homeCopy
+          ? { id: partner.id, homeUserId: partner.homeUserId, homeInstance: partner.homeInstance }
+          : {
+              id: partner.id,
+              homeUserId: partner.homeUserId ?? partner.id,
+              homeInstance: partner.homeInstance ?? deliveringHost(getChannelOrigin(dmChannelId)),
+            };
         const users = [
-          { id: otherMember.id, homeUserId: otherMember.homeUserId, homeInstance: otherMember.homeInstance },
+          partnerIdentity,
           ...selectedFriends.map((f) => ({
             id: f.id,
             homeUserId: f.homeUserId,
             homeInstance: f.homeInstance,
           })),
         ];
-        const newChannel = await api.dm.createGroup({ users, fromDmChannelId: dmChannelId });
-        addDmChannel(newChannel);
+        // Home checks the source 1-on-1 by its own id; without a home copy
+        // there is none to name.
+        const newChannel = await api.dm.createGroup({ users, fromDmChannelId: homeCopy?.id });
+        const rowId = upsertDmCopy('', newChannel, 'stated');
         closeModal();
-        navigate(`/channels/@me/${newChannel.id}`);
+        navigate(`/channels/@me/${rowId}`);
       } else {
-        // Existing group DM → add each friend sequentially
+        // Existing group DM → add each friend sequentially, on home's copy.
+        if (!homeCopy) {
+          setError(t('dm:addMember.failed'));
+          setIsAdding(false);
+          return;
+        }
         for (const friend of selectedFriends) {
-          await api.dm.addMember(dmChannelId, {
+          await api.dm.addMember(homeCopy.id, {
             userId: friend.homeInstance ? undefined : friend.id,
             homeUserId: friend.homeUserId ?? undefined,
             homeInstance: friend.homeInstance ?? undefined,
@@ -190,26 +213,26 @@ export function AddDmMemberModal() {
         closeModal();
       }
     } catch (err) {
-      setError((err as Error).message || 'Failed to add members');
+      setError((err as Error).message || t('dm:addMember.failed'));
     } finally {
       setIsAdding(false);
     }
   };
 
   const buttonText = selectedFriends.length === 0
-    ? 'Select Friends'
-    : `Add ${selectedFriends.length} Friend${selectedFriends.length > 1 ? 's' : ''}`;
+    ? t('dm:addMember.selectFriends')
+    : t('dm:addMember.addCount', { count: selectedFriends.length });
 
   return (
-    <Modal isOpen={isOpen} onClose={closeModal} title="Add Friends to DM" mobileStyle="sheet">
+    <Modal isOpen={isOpen} onClose={closeModal} title={t('dm:addMember.title')} mobileStyle="sheet">
       <div className="space-y-3">
         {/* Header with member count */}
         <div className="flex items-center justify-between">
           <p className="text-[13px] text-txt-tertiary">
-            Select friends to add to this conversation.
+            {t('dm:addMember.description')}
           </p>
           <span className="text-[12px] text-txt-tertiary flex-shrink-0 ml-2">
-            {memberCount}/{maxMembers}
+            {t('dm:addMember.capacity', { current: memberCount, max: maxMembers })}
           </span>
         </div>
 
@@ -239,13 +262,13 @@ export function AddDmMemberModal() {
           type="text"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          placeholder="Search friends..."
+          placeholder={t('dm:addMember.searchPlaceholder')}
           className="input-search w-full py-2 text-[14px]"
           disabled={remainingSlots <= 0}
         />
 
         {remainingSlots <= 0 && (
-          <p className="text-txt-danger text-[13px]">This group DM has reached the 10-member limit.</p>
+          <p className="text-txt-danger text-[13px]">{t('dm:addMember.limitReached', { max: maxMembers })}</p>
         )}
 
         {error && (
@@ -256,7 +279,7 @@ export function AddDmMemberModal() {
         <div className="max-h-[300px] overflow-y-auto space-y-[2px]">
           {filteredFriends.length === 0 && (
             <div className="py-4 text-center text-txt-tertiary text-[14px]">
-              {query.trim() ? 'No friends match your search' : 'No friends yet'}
+              {query.trim() ? t('dm:addMember.noMatch') : t('dm:addMember.noFriends')}
             </div>
           )}
 
@@ -284,7 +307,7 @@ export function AddDmMemberModal() {
           disabled={selectedFriends.length === 0 || isAdding}
           className="w-full py-2 rounded-md text-[13px] font-semibold transition-colors bg-accent-mint text-surface-base hover:bg-accent-mint/90 disabled:opacity-50 disabled:cursor-not-allowed"
         >
-          {isAdding ? 'Adding...' : buttonText}
+          {isAdding ? t('dm:addMember.adding') : buttonText}
         </button>
       </div>
     </Modal>

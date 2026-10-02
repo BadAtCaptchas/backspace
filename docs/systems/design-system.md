@@ -3,7 +3,7 @@
 Prototype (source of truth): `Backspace-design-prototype.html` (open in browser)
 Styles: `packages/web/src/styles/globals.css`
 Theme: `packages/web/tailwind.config.js`
-Font: DM Sans (primary) with system fallbacks
+Fonts: DM Sans by default; Inter for the Russian UI; the platform CJK stack for Chinese; system fallbacks (see `docs/systems/localization.md`, "The landing page")
 
 ---
 
@@ -14,6 +14,81 @@ Font: DM Sans (primary) with system fallbacks
 - Two-material system: solid matte panels for content (75%), frosted glass bubbles for persistent controls (25%)
 - `prefers-reduced-transparency` → fall back to solid surfaces
 - NOT a Discord clone — Backspace has its own visual identity
+
+## Settings organization
+
+Settings tabs split on ownership. **Appearance** holds preferences that belong
+to this browser or app: language and interface scale today, themes and display
+density later. They are stored locally and they work on the login screen, before
+there is an account. **Account** holds what lives on the server and follows the
+user to any device or instance: profile, credentials, deletion. Avatar and
+banner colours look like appearance and are not, because other people see them.
+A new presentation preference goes in Appearance, not in Account or in Desktop
+(the browser shows the Desktop tab only as a download offer, so a preference
+placed there would be unreachable outside the app).
+
+## Interface scale
+
+Appearance settings include a device-local interface scale: 50–250% in 25% steps,
+default/reset 100%. `interfaceScaleStore` persists the percentage under
+`backspace-interface-scale`; unsupported stored values fall back to 100%.
+`main.tsx` applies it before mounting React, including auth pages and portals.
+English, German, and Russian labels live in the `settings` namespace.
+
+50% is an opt-in density setting, not a recommended reading size: common 10–11px
+labels render at only 5–5.5px. The former 75% floor kept those labels at
+7.5–8.25px; the lower floor accommodates users who want more content on screen,
+but going lower would further compromise legibility. Default/reset remains 100%.
+
+The web and Electron clients share root CSS `zoom`. This is independent of the
+browser's own zoom controls. CSS viewport units do **not** compensate for CSS
+zoom, so viewport-constrained surfaces use `--app-vh`, `--app-dvh`, and `--app-vw`
+(one viewport unit divided by `--interface-scale`). Tailwind's `h-screen` and
+`min-h-screen` use the same units. Keep Electron's title-bar reservation in
+physical pixels using the shared `--titlebar-inset` (33px divided by the scale
+under Electron, zero in the browser). `App`, `SpaceSidebar` and `ImagePreview`
+must all use this property rather than separate fixed offsets.
+
+Safe-area and keyboard offsets use `--safe-top`, `--safe-bottom`, and
+`--keyboard-inset`, which divide the corresponding environment lengths by the
+scale. The viewport-token test rejects raw viewport units and environment
+functions outside these definitions in production source.
+
+`initializeInterfaceScale` updates `html[data-viewport="mobile|desktop"]` on
+resize and scale changes using the same predicate as AppLayout: mobile below
+768 layout pixels **or** below 600 unscaled viewport pixels (`window.innerWidth`).
+The narrow-viewport guard keeps 390–430px phones in MobileShell even at 50%,
+when their effective layout width is 780–860px. Wider windows retain the scaled
+768px breakpoint; 600px is the first width eligible for desktop at 50%.
+
+The guard also decides the outcome at 75%, not only at the new floor: it applies
+at any scale at or below 78.125%, so a 576–599px window renders MobileShell where
+the scaled breakpoint alone would have kept the desktop grid. That is intended.
+A physically narrow viewport is mobile regardless of scale; gating the guard on
+scale would reintroduce the scale-driven shell flip it exists to prevent.
+
+Use the `desktop:` Tailwind variant for app-shell responsiveness; raw media
+queries ignore root zoom. Auth pages without a JS layout branch may keep `md:`.
+When scale moves the appearance panel into MobileShell, route reconstruction
+places the current channel below settings and remains idempotent in StrictMode.
+
+`ImageCropModal` cancels root zoom only on the cropper container with
+`zoom: calc(1 / var(--interface-scale, 1))`. react-easy-crop mixes visual DOM
+measurements and pointer deltas with CSS pixels, so this subtree must operate
+at effective 100%. The surrounding dialog controls retain the interface scale.
+Validate both dragging and the exported crop pixels when changing this boundary.
+
+DOM rectangles and pointer coordinates are visual pixels. Convert them with
+`layoutPixels` / `layoutRect` before assigning CSS positions, sizes, or drag
+offsets. `computeFloatingPosition` accepts visual rectangles and dimensions and
+returns layout coordinates; its callers must not pre-convert them. Pure hit
+tests comparing two visual coordinates do not need conversion.
+For anchors created from layout constants, convert with `visualPixels` before
+calling `pointAnchor` so floating-position conversion does not shrink them twice.
+
+Changing scale dispatches `resize` to update floating surfaces and the effective
+mobile breakpoint. The account settings stay accessible when crossing that
+breakpoint. Native browser zoom and pinch gestures retain their normal behavior.
 
 ---
 
@@ -44,6 +119,68 @@ Font: DM Sans (primary) with system fallbacks
 
 ### Status
 `--status-online`, `--status-idle`, `--status-dnd`, `--status-offline`
+
+---
+
+## Brand
+
+The mark is the backspace-key glyph. Vector masters live in `assets/brand/`;
+every app icon, favicon, tray icon and social preview is generated from
+them, never hand-edited.
+
+The brand splits by surface, not by file type. UI surfaces (the site
+header, the in-app sidebar tile, favicons, and all tray icons) stay
+flat: a single flat fill, `#7c6cf6` on dark grounds or `#ffffff` on a
+lavender tile or badge shape, no gradient, stroke, glow, shadow, blur or
+blend anywhere the mark appears. The app-icon family, meaning every
+output where the OS shows this app as one launchable icon (dock,
+taskbar, Start menu, Alt-Tab, PWA install, iOS home screen, the
+maskable Android icon), is dimensional: the contributor's original
+badge composition, recoloured to the lavender system. The badge is a
+rounded rectangle with a corner radius of 22.37% of its side (Apple's
+own template radius, not the contributor's original ~36% squircle) on
+a vertical gradient from `#2a2740` (top) to `#12101d` (bottom), called
+"plum", carrying a drop shadow, an inner shadow and a soft-light stroke
+overlay; the glyph inside it is a white-to-`#7c6cf6` gradient, not a
+flat fill.
+
+On macOS specifically, the badge also sits on Apple's icon grid: the
+visible artwork occupies an 824px square centred on a 1024 canvas (a
+transparent margin of 100px each side), matching how every other Dock
+icon is framed. `packages/desktop/build/icon.icns` and
+`packages/desktop/build/icon.png` (the dev-mode Dock icon) are the only
+two outputs that carry this margin; every other app-icon output
+(Windows `.ico`, Linux `build/icons/*`, PWA `icon-192`/`icon-512`, the
+in-app `logo.png`, `apple-touch-icon.png`, the maskable icon,
+`app-icon-1024.png`) renders full-bleed to the badge's own edge, because
+those platforms apply their own icon framing. See `macIconPng` in
+`scripts/gen-icons.mjs`.
+
+| Master | Feeds |
+|--------|-------|
+| `app-icon.svg` | App icon outputs above 32px: the dimensional badge (plum gradient, filters, stroke overlay, 22.37%-radius corners) plus the white-to-`#7c6cf6` gradient glyph |
+| `app-icon-small.svg` | App icon outputs at 16/32px (bolder, simplified mark, same dimensional badge geometry) |
+| `mark-icon.svg` | The bare gradient glyph alone, transparent, no badge: the PWA maskable icon's inner mark and the social preview |
+| `mark.svg` | Standalone flat-lavender renders on dark UI-surface grounds |
+| `mark-small.svg` | Favicons, the colour tray icons (Windows `.ico`, Linux PNG; glyph inset in the tray cell and centred by alpha centroid), and any standalone render at 32px or smaller (flat) |
+| `mark-mono-light.svg` | `packages/web/public/icons/logo-mark.svg` (byte copy): the flat white glyph, for the in-app sidebar's lavender home tile |
+| `mark-tray.svg` | The macOS menu-bar template tray icon: a 16px silhouette on an 18x22 canvas (36x44 @2x), centred by alpha centroid so it sits and spaces like the system's own menu-bar glyphs |
+| `mark-mono-dark.svg` | Mono silhouette master; no pipeline output today |
+
+Regenerate icons with `pnpm gen-icons`; regenerate the social preview with
+`pnpm gen-social-preview`. Icon generation reads only from `assets/brand/`.
+The social preview also reads `scripts/social-preview.html` and the two
+webfonts in `site/assets/` (`fabio-xm-variable.ttf`, `dm-sans.woff2`)
+alongside the mark; its output is stable per Chrome build and font
+rasteriser, not per lockfile, so a Chrome or font upgrade can shift it
+even with no dependency change. See `scripts/gen-icons.README.md` and
+`docs/systems/desktop.md` for the full matrix.
+
+The brand primary is `#7c6cf6`. It is a web/app/desktop primary, not a
+pastel accent, and is exposed as `--accent-primary` (see Color Palette
+above). The plum gradient (`#2a2740`/`#12101d`) exists only as the
+app-icon family's ground; it is not a UI surface colour and has no CSS
+variable.
 
 ---
 
@@ -81,6 +218,8 @@ Font: DM Sans (primary) with system fallbacks
 }
 ```
 
+**Vendor prefix order is load-bearing.** In `globals.css`, write `-webkit-backdrop-filter` **first** and the unprefixed `backdrop-filter` **last**. Vite 8 minifies CSS with Lightning CSS, which folds a prefixed and an unprefixed declaration of the same property into one and keeps whichever came last. With the unprefixed line first, the build ships only `-webkit-backdrop-filter`, which Firefox does not implement, so every glass surface loses its blur there with nothing in the console. The same order applies to any other property written in both forms.
+
 ---
 
 ## Input Tiers
@@ -106,11 +245,39 @@ When introducing a new input or contenteditable surface, no extra work is needed
 
 ---
 
+## Unread and attention indicators
+
+| Colour | Meaning | Used by |
+|--------|---------|---------|
+| `accent-rose` / `bg-notification` | Someone is waiting on you: unread messages, mentions, pending friend requests | channel unread dots, mobile bottom-nav badges |
+| `accent-amber` | Informational, no one is blocked: an available instance update, pending federation approvals | settings tab and sidebar badges |
+
+A settings section carries a count (`SettingsSection.badgeCount`) when the number
+matters, or a dot (`SettingsSection.badgeDot`) when only the existence does. Both
+render in `SettingsTabBar` and in the desktop sidebar sub-links.
+
+Exception: the mobile bottom-nav "You" tab (`MobileBottomNav.tsx`) ORs the
+update dot into its existing rose dot rather than showing a separate amber
+one. That tab already means "something of yours needs attention" for incoming
+friend/DM activity, and splitting one dot into two colours by cause would read
+worse than a single dot with mixed causes — this is a deliberate exception to
+the amber-means-update rule above, not a bug.
+
+---
+
 ## Layout
 
 3-column grid: 312px channel sidebar | main content | 240px members sidebar
 Glass server strip overlays left 72px of channel sidebar.
 Channel sidebar fully opaque with gradient at left edge feeding glass.
+
+Card lists (Explore's Inner and Outer Space sections, the Friends page's
+discover list) share one class, `.card-grid` in `globals.css`: one full-width
+column below the desktop breakpoint, and above it
+`repeat(auto-fill, minmax(min(100%, 280px), 1fr))` with a 1rem gap. It is
+`auto-fill` and not `auto-fit` on purpose, because `auto-fit` collapses the
+empty tracks and stretches a list holding a single card over the whole row.
+Any new card list uses this class rather than its own template.
 
 ---
 
@@ -131,8 +298,8 @@ Channel sidebar fully opaque with gradient at left edge feeding glass.
 ### Core
 `fadeIn`, `slideUp`, `slideDown`, `typingFadeIn`, `gradientPulse`, `shimmer` (skeleton loading)
 
-### Search
-`search-flash`, `stepForward`, `stepBack`
+### Search and jump
+`message-jump-flash` (class `.message-jump-highlight`: the row a search result or reply preview jumped to), `stepForward`, `stepBack`
 
 ### Call
 `callRippleLiquid`, `callGlowSoft`, `callRefraction`, `callButtonBreath`
@@ -198,6 +365,39 @@ interface AvatarStackProps {
 **Status dots are deliberately omitted** regardless of member count — a group is a group. The 1-on-1 path keeps its presence dot via the direct `Avatar` component.
 
 **Hooks-in-loop safety:** each rendered slot is its own `<AvatarTile>` component so `useCanonicalUserView` is called exactly once per slot, never inside a variable-length `.map()`.
+
+### Avatar vs ProfileAvatar
+
+Two components, one deliberate split:
+
+| Component | Role |
+|---|---|
+| `Avatar` (`ui/Avatar.tsx`) | Purely presentational. Takes `user` for the gradient, avatar colour, `homeUserId` and status dot. Clicking it does nothing unless the caller passes `onClick`. |
+| `ProfileAvatar` (`ui/ProfileAvatar.tsx`) | `Avatar` plus the profile card. Opens `UserProfilePopout` anchored to its own box, stops propagation so it wins over an enclosing row handler, and stays inert while `user` is undefined. |
+
+**Rule:** an avatar is only a profile trigger when it is a `ProfileAvatar`. Never re-add an implicit "open the profile if a `user` prop is present" branch to `Avatar` — passing `user` is how *every* avatar gets its colour, so that branch silently turns the picture inside the profile card, the settings preview, the avatar-upload button and every row in a modal into a trigger. It also made the card re-anchor to its own picture and walk across the screen on repeated clicks (issue #37).
+
+Use `ProfileAvatar` when the avatar is the primary way to reach that person's profile and nothing else owns the click. Use `Avatar` when an enclosing row, button or list item already handles clicks, or when the avatar depicts the surface it already sits on.
+
+**Escalation chain.** Clicking a face always moves one step deeper, never sideways and never nowhere:
+
+| Surface | Picture click |
+|---|---|
+| Member tile / row / message author | Opens the preview card (`UserProfilePopout`) |
+| Preview card | Opens the full profile modal (`UserProfileModal`) and closes the card |
+| Full profile modal | Nothing — this is the terminus |
+
+The middle step matters: an inert picture on the preview card is a dead end that forces the user down to the *View Full Profile* link. What it must never do is reopen the card itself — that is the drift bug from issue #37.
+
+### Floating placement
+
+Every floating surface places itself with `computeFloatingPosition` (`hooks/useFloatingPosition.ts`): preferred side → flip when it would overflow → clamp into the viewport, with an 8px viewport padding.
+
+- Components with a live anchor element use the `useFloatingPosition` hook (tooltips, mention/search popovers, voice popovers).
+- Components opened from a store keep the anchor's **rect** instead of an element — `uiStore.openUserProfile(user, anchor, placement)` stores `AnchorRect` + `Placement`, and `UserProfilePopout` measures itself and places off that. `pointAnchor(x, y)` builds a zero-size rect for the rare caller with no anchor element.
+- `align: 'start'` lines the surface's leading edge up with the anchor; the default centres it on the anchor.
+
+**Callers never compute coordinates.** A surface that is handed a finished `{ top, left }` cannot account for its own measured size, and any caller-side constant (an assumed card height, a hardcoded sidebar width) drifts the moment the content or the layout changes.
 
 **Tile geometry contract.** Each `AvatarTile` renders at `size × size` with a 2px border (`box-sizing: border-box` from Tailwind preflight), so its content area is `(size − 4) × (size − 4)`. The inner `Avatar` is sized to that content area (`size − 2 · TILE_BORDER_WIDTH`) and centered geometrically on the tile via `flex items-center justify-center`, **not** by inline-flow placement. Both corrections are required: sizing the Avatar to the outer dimensions overflows the padding box and gets clipped off-center (visible disc remains centered, but the avatar's contents — image crop, initials gradient + letter — anchor at the padding-edge top-left and visibly drift toward the lower-right of the visible disc); relying on `Avatar`'s `inline-flex` placement makes the Avatar drift vertically by whatever the inherited `line-height` adds, independent of border. `TILE_BORDER_WIDTH` is exported from `AvatarStack.tsx` as the single source of truth for the `border-2` width and must be updated in lockstep with any future change to that class.
 

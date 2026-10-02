@@ -2,23 +2,26 @@ import type { WebSocket } from 'ws';
 import { eq, inArray, and } from 'drizzle-orm';
 import { getDb, schema } from '../db/index.js';
 import { generateSnowflake } from '../utils/snowflake.js';
-import { connectionManager } from './handler.js';
+import { connectionManager, getVoiceRoomElapsedSeconds } from './handler.js';
 import type { VoiceRoom, DmRoomMeta, SpaceRoomMeta } from './handler.js';
 import { isMember, getChannelSpaceId, isDmMember, isDeadOneOnOne, hasPermission, computePermissions, PermissionBits } from '../utils/permissions.js';
-import { broadcastDmMessage, getDmMessageWithUser } from '../routes/dm.js';
-import { MAX_MESSAGE_LENGTH, type MessageWithUser, type Attachment, type DmMessageWithUser, type Embed, type Activity, type ActivityType, type ActivityTimestamps, type ActivityAssets, type ServerEvent, type DmCallUndeliverableFailure, type DmCallUndeliverableReason } from '@backspace/shared';
+import { broadcastDmMessage, getDmMessageWithUser, isDmReplyTargetInChannel, reopenForClosedMembers } from '../routes/dm.js';
+import { fetchReplyToMessages, isReplyTargetInChannel } from '../routes/messages.js';
+import { MAX_MESSAGE_LENGTH, isChosenUserStatus, type MessageWithUser, type Attachment, type DmMessageWithUser, type Embed, type ServerEvent, type DmCallUndeliverableFailure, type DmCallUndeliverableReason } from '@backspace/shared';
 import type { CallRelayResult, CallFanoutFailure } from '../utils/federationOutbox.js';
 import { mapCallReasonToEventReason } from '../utils/federationOutbox.js';
-import { ACTIVITY_LIMITS } from '@backspace/shared/src/activities.js';
 import { sanitizeUser } from '../utils/sanitize.js';
 import { collectProfileBroadcastTargetIds } from '../utils/userDeletion.js';
+import { applyChosenStatus } from './presence.js';
+import { presenceUpdateFor, validateActivities } from './presenceEvent.js';
 import { deleteAttachmentFiles } from '../utils/fileCleanup.js';
 import { resolveEmbeds, reResolveEmbeds, embedRowToEmbed } from '../utils/embedResolver.js';
-import { appendMutationLog, queueOutboxEvent, queueDmRelay, getGroupDmTargetOrigins, sendCallRelay, computeFederatedId, sendTypingRelay, queueReadStateRelay } from '../utils/federationOutbox.js';
-import { getOurOrigin } from '../utils/federationAuth.js';
+import { appendMutationLog, dmMessageFederationRef, dmMessageMutationTarget, queueOutboxEvent, queueDmRelay, queueDmMessageDeleteRelay, getGroupDmTargetOrigins, sendCallRelay, sendTypingRelay, queueReadStateRelay } from '../utils/federationOutbox.js';
+import { canonicalizeHomeInstance, getOurOrigin, normalizeOriginForCompare } from '../utils/federationAuth.js';
 import { generateFederatedCallToken } from '../routes/livekit.js';
 import { config } from '../config.js';
-import crypto from 'node:crypto';
+import { canActOnMemberInSpace } from '../utils/roleHierarchy.js';
+import { ERROR_MESSAGES } from '../utils/httpErrors.js';
 
 /**
  * Re-evaluate SPEAK permission for all participants in voice channels
@@ -96,28 +99,12 @@ function getMessageWithUser(messageId: string): MessageWithUser | null {
     .where(eq(schema.embeds.messageId, messageId))
     .all();
 
+  // Reply targets are confined to the message's own channel. This is the same
+  // helper the REST read paths use, so both stay on one rule.
   let replyTo: MessageWithUser | null = null;
   if (message.replyToId) {
-    // Simple fetch for replyTo (one level deep to avoid recursion loops)
-    const replyMsg = db.select().from(schema.messages).where(eq(schema.messages.id, message.replyToId)).get();
-    if (replyMsg) {
-      const replyUser = db.select().from(schema.users).where(eq(schema.users.id, replyMsg.userId)).get();
-      if (replyUser) {
-        replyTo = {
-          id: replyMsg.id,
-          channelId: replyMsg.channelId,
-          userId: replyMsg.userId,
-          replyToId: replyMsg.replyToId,
-          content: replyMsg.content,
-          editedAt: replyMsg.editedAt,
-          createdAt: replyMsg.createdAt,
-          user: sanitizeUser(replyUser),
-          attachments: [], // Don't fetch attachments for replies to save bandwidth
-          embeds: [],
-          reactions: [], // Don't fetch reactions for replies
-        };
-      }
-    }
+    const replyToMap = fetchReplyToMessages(message.channelId, [message]);
+    replyTo = replyToMap.get(message.replyToId) ?? null;
   }
 
   return {
@@ -184,10 +171,10 @@ export function handleClientEvent(
       handleDmMessageDelete(event, userId);
       break;
     case 'reaction_add':
-      handleReactionAdd(event, userId, isFederated);
+      handleReactionAdd(event, userId);
       break;
     case 'reaction_remove':
-      handleReactionRemove(event, userId, isFederated);
+      handleReactionRemove(event, userId);
       break;
     case 'channel_ack':
       handleChannelAck(event, userId, isFederated);
@@ -214,7 +201,7 @@ export function handleClientEvent(
       );
       break;
     case 'voice_status':
-      handleVoiceStatus(event, userId);
+      handleVoiceStatus(event, userId, ws);
       break;
     case 'voice_space_mute':
       handleVoiceSpaceMute(event, userId);
@@ -267,6 +254,12 @@ function handleMessageCreate(event: Record<string, unknown>, userId: string): vo
 
   if (!hasPermission(userId, spaceId, PermissionBits.SEND_MESSAGES, channelId)) {
     connectionManager.sendToUser(userId, { type: 'error', message: 'Missing SEND_MESSAGES permission' });
+    return;
+  }
+
+  // A reply may only target a message in the channel it is posted into.
+  if (replyToId && !isReplyTargetInChannel(channelId, replyToId)) {
+    connectionManager.sendToUser(userId, { type: 'error', message: 'Invalid reply target' });
     return;
   }
 
@@ -437,85 +430,12 @@ function handleTypingStart(event: Record<string, unknown>, userId: string, usern
   typingTimeouts.set(key, timeout);
 }
 
-// ─── Activity Validation ──────────────────────────────────────────────────
-
-const VALID_ACTIVITY_TYPES = new Set<string>(['custom', 'playing', 'listening', 'watching', 'streaming']);
-const MAX_TIMESTAMP = 4102444800000;
-
-function validateActivities(raw: unknown): Activity[] | null {
-  if (!Array.isArray(raw)) return null;
-  if (raw.length > ACTIVITY_LIMITS.MAX_ACTIVITIES_PER_USER) return null;
-
-  const validated: Activity[] = [];
-  for (const item of raw) {
-    if (!item || typeof item !== 'object') return null;
-    const obj = item as Record<string, unknown>;
-    if (!VALID_ACTIVITY_TYPES.has(obj.type as string)) return null;
-    if (typeof obj.name !== 'string') return null;
-    if (obj.name.length === 0 || obj.name.length > ACTIVITY_LIMITS.MAX_NAME_LENGTH) return null;
-
-    const activity: Activity = { type: obj.type as ActivityType, name: (obj.name as string).trim() };
-
-    if (typeof obj.details === 'string' && obj.details.length <= ACTIVITY_LIMITS.MAX_DETAILS_LENGTH) activity.details = obj.details.trim();
-    if (typeof obj.state === 'string' && obj.state.length <= ACTIVITY_LIMITS.MAX_STATE_LENGTH) activity.state = obj.state.trim();
-    if (typeof obj.url === 'string' && obj.url.length <= ACTIVITY_LIMITS.MAX_URL_LENGTH) {
-      if (obj.url.startsWith('https://') || obj.url.startsWith('http://')) activity.url = obj.url;
-    }
-
-    if (obj.timestamps && typeof obj.timestamps === 'object') {
-      const tsObj = obj.timestamps as Record<string, unknown>;
-      const ts: ActivityTimestamps = {};
-      if (typeof tsObj.start === 'number' && tsObj.start >= 0 && tsObj.start <= MAX_TIMESTAMP) ts.start = tsObj.start;
-      if (typeof tsObj.end === 'number' && tsObj.end >= 0 && tsObj.end <= MAX_TIMESTAMP) ts.end = tsObj.end;
-      if (ts.start !== undefined || ts.end !== undefined) activity.timestamps = ts;
-    }
-
-    if (obj.assets && typeof obj.assets === 'object') {
-      const aObj = obj.assets as Record<string, unknown>;
-      const assets: ActivityAssets = {};
-      if (typeof aObj.largeImage === 'string' && aObj.largeImage.length <= ACTIVITY_LIMITS.MAX_URL_LENGTH) assets.largeImage = aObj.largeImage;
-      if (typeof aObj.largeText === 'string' && aObj.largeText.length <= ACTIVITY_LIMITS.MAX_ASSET_TEXT_LENGTH) assets.largeText = aObj.largeText;
-      if (typeof aObj.smallImage === 'string' && aObj.smallImage.length <= ACTIVITY_LIMITS.MAX_URL_LENGTH) assets.smallImage = aObj.smallImage;
-      if (typeof aObj.smallText === 'string' && aObj.smallText.length <= ACTIVITY_LIMITS.MAX_ASSET_TEXT_LENGTH) assets.smallText = aObj.smallText;
-      if (Object.keys(assets).length > 0) activity.assets = assets;
-    }
-
-    validated.push(activity);
-  }
-  return validated;
-}
-
 function handlePresenceUpdate(event: Record<string, unknown>, userId: string): void {
-  const status = event.status as string;
-
-  if (!status || !['online', 'idle', 'dnd'].includes(status)) {
+  if (!isChosenUserStatus(event.status)) {
     connectionManager.sendToUser(userId, { type: 'error', message: 'Status must be "online", "idle", or "dnd"' });
     return;
   }
-
-  const db = getDb();
-  db.update(schema.users).set({ status }).where(eq(schema.users.id, userId)).run();
-
-  connectionManager.setUserStatus(userId, status);
-  const activities = connectionManager.getUserActivities(userId);
-
-  // Broadcast to friends + DM co-members + space co-members.
-  const payload = {
-    type: 'presence_update' as const,
-    userId,
-    status,
-    ...(activities.length > 0 ? { activities } : {}),
-  };
-  const targets = collectProfileBroadcastTargetIds(userId);
-  for (const uid of targets) connectionManager.sendToUser(uid, payload);
-
-  // Also send to self (other tabs)
-  connectionManager.sendToUser(userId, payload);
-
-  // S2S: project to all active peers
-  void import('../utils/federationPresence.js').then(({ queuePresenceRelay }) => {
-    try { queuePresenceRelay(userId, status as 'online' | 'idle' | 'dnd', activities); } catch (e) { console.warn('[ws] queuePresenceRelay(manual) failed', e); }
-  });
+  applyChosenStatus(userId, event.status);
 }
 
 function handleActivityUpdate(event: Record<string, unknown>, userId: string): void {
@@ -534,7 +454,7 @@ function handleActivityUpdate(event: Record<string, unknown>, userId: string): v
   connectionManager.setUserActivities(userId, activities);
   const status = connectionManager.getUserStatus(userId);
 
-  const payload = { type: 'presence_update' as const, userId, status, activities };
+  const payload = presenceUpdateFor(userId, status, activities);
   const targets = collectProfileBroadcastTargetIds(userId);
   for (const uid of targets) connectionManager.sendToUser(uid, payload);
   connectionManager.sendToUser(userId, payload);
@@ -576,6 +496,24 @@ function broadcastRoomLeave(roomId: string, room: VoiceRoom, userId: string): vo
   }
 }
 
+/**
+ * A refused join is terminal for the client, so it must be terminal on the
+ * server too. When the refusal concerns the room the user is still holding —
+ * the resume-after-reconnect case, where CONNECT was revoked or the channel
+ * deleted mid-grace — leaving them parked there until the grace period expires
+ * would keep them listed in a voice channel they have already been told they
+ * are out of. A refusal aimed at any *other* channel leaves the live session
+ * alone, which is what it has always done.
+ */
+function rejectVoiceJoin(userId: string, channelId: string): void {
+  if (connectionManager.getUserRoom(userId)?.roomId === channelId) {
+    handleVoiceLeave(userId);
+  }
+  connectionManager.sendToUser(userId, {
+    type: 'voice_disconnected', userId, channelId, reason: 'rejected',
+  });
+}
+
 function handleVoiceJoin(event: Record<string, unknown>, userId: string, ws: WebSocket): void {
   const channelId = event.channelId as string;
 
@@ -587,11 +525,13 @@ function handleVoiceJoin(event: Record<string, unknown>, userId: string, ws: Web
   const spaceId = getChannelSpaceId(channelId);
   if (!spaceId) {
     connectionManager.sendToUser(userId, { type: 'error', message: 'Channel not found' });
+    rejectVoiceJoin(userId, channelId);
     return;
   }
 
   if (!hasPermission(userId, spaceId, PermissionBits.CONNECT, channelId)) {
     connectionManager.sendToUser(userId, { type: 'error', message: 'Missing CONNECT permission' });
+    rejectVoiceJoin(userId, channelId);
     return;
   }
 
@@ -714,11 +654,13 @@ function handleVoiceJoin(event: Record<string, unknown>, userId: string, ws: Web
   connectionManager.joinRoom(channelId, userId);
 
   // Broadcast join
+  const joinedRoom = connectionManager.getRoom(channelId);
   connectionManager.sendToRoom(channelId, {
     type: 'voice_state_update',
     channelId,
     userId,
     action: 'join',
+    channelElapsedSeconds: joinedRoom ? getVoiceRoomElapsedSeconds(joinedRoom) : undefined,
   });
 
   // Also broadcast current voice status if it exists (persisted during moves)
@@ -792,7 +734,7 @@ function handleVoiceLeave(userId: string): void {
   connectionManager.clearVoiceUserStatus(userId);
 }
 
-function handleVoiceStatus(event: Record<string, unknown>, userId: string): void {
+function handleVoiceStatus(event: Record<string, unknown>, userId: string, ws: WebSocket): void {
   const isMuted = event.isMuted === true;
   const isDeafened = event.isDeafened === true;
   const isCameraOn = event.isCameraOn === true;
@@ -802,6 +744,10 @@ function handleVoiceStatus(event: Record<string, unknown>, userId: string): void
   // This now works for both server channels AND DM calls.
   const userRoom = connectionManager.getUserRoom(userId);
   if (!userRoom) return;
+  // Space sessions must resume through voice_join so an ordinary tab cannot
+  // keep a stale session alive merely by sending status. DM calls have no
+  // voice_join event, so voice_status is their explicit resume signal.
+  if (userRoom.room.roomType === 'dm') connectionManager.setVoiceWs(userId, ws);
 
   let isSpaceMuted = false;
   let isSpaceDeafened = false;
@@ -859,6 +805,12 @@ function handleDmMessageCreate(event: Record<string, unknown>, userId: string): 
 
   if (!isDmMember(dmChannelId, userId)) {
     connectionManager.sendToUser(userId, { type: 'error', message: 'Not a member of this DM channel' });
+    return;
+  }
+
+  // A reply may only target a message in the channel it is posted into.
+  if (replyToId && !isDmReplyTargetInChannel(dmChannelId, replyToId)) {
+    connectionManager.sendToUser(userId, { type: 'error', message: 'Invalid reply target' });
     return;
   }
 
@@ -1048,6 +1000,10 @@ function handleDmMessageDelete(event: Record<string, unknown>, userId: string): 
     return;
   }
 
+  // The relay names the message by its shared coordinates, read from the row
+  // before it is gone.
+  const relayTarget = dmMessageMutationTarget(msg, userId);
+
   // Collect attachment filenames before deletion
   const dmAttachmentRows = db.select({ filename: schema.attachments.filename })
     .from(schema.attachments).where(eq(schema.attachments.dmMessageId, messageId)).all();
@@ -1082,14 +1038,12 @@ function handleDmMessageDelete(event: Record<string, unknown>, userId: string): 
   }
 
   // Federation: log mutation and queue for relay
-  appendMutationLog(messageId, msg.dmChannelId, 'delete');
-  const targetOrigins = getGroupDmTargetOrigins(msg.dmChannelId);
-  queueOutboxEvent(messageId, msg.dmChannelId, 'delete', JSON.stringify({ deleted: true }), targetOrigins);
+  queueDmMessageDeleteRelay(messageId, msg.dmChannelId, relayTarget);
 }
 
 // ─── Reaction Handlers ─────────────────────────────────────────────────────
 
-function handleReactionAdd(event: Record<string, unknown>, userId: string, isFederated: boolean): void {
+function handleReactionAdd(event: Record<string, unknown>, userId: string): void {
   const messageId = event.messageId as string;
   const emoji = event.emoji as string;
 
@@ -1134,8 +1088,9 @@ function handleReactionAdd(event: Record<string, unknown>, userId: string, isFed
     return;
   }
 
-  // Fall through to DM message
-  if (isFederated) return;
+  // Fall through to DM message. A federated account reacts here like anyone
+  // else: it is a member of the DM on this instance, and the relay carries its
+  // home identity back to its home instance.
   const dmMsg = db.select().from(schema.dmMessages).where(eq(schema.dmMessages.id, messageId)).get();
   if (!dmMsg || !isDmMember(dmMsg.dmChannelId, userId)) return;
   // Read-only enforcement: a dead 1-on-1 thread (partner tombstoned) accepts no
@@ -1163,9 +1118,9 @@ function handleReactionAdd(event: Record<string, unknown>, userId: string, isFed
       reaction: { id: reactionId, messageId, userId, emoji, createdAt: now, user: userObj },
     });
 
-    // Federation: log reaction mutation and queue for relay
-    const canonicalMessageId = dmMsg.sourceMessageId || messageId;
-    const messageHomeInstance = dmMsg.sourceInstance || getOurOrigin();
+    // Federation: log reaction mutation and queue for relay. The relay names
+    // the message in shared coordinates; `messageId` is only local here.
+    const target = dmMessageFederationRef(dmMsg);
     appendMutationLog(messageId, dmMsg.dmChannelId, 'reaction_add', JSON.stringify({
       userId,
       homeUserId: reactionUser?.homeUserId || userId,
@@ -1176,8 +1131,8 @@ function handleReactionAdd(event: Record<string, unknown>, userId: string, isFed
     const reactionAddTargetOrigins = getGroupDmTargetOrigins(dmMsg.dmChannelId);
     queueOutboxEvent(reactionId, dmMsg.dmChannelId, 'reaction_add', JSON.stringify({
       reaction: {
-        messageId: canonicalMessageId,
-        messageHomeInstance,
+        messageId: target.messageId,
+        messageHomeInstance: target.messageHomeInstance,
         userId,
         homeUserId: reactionUser?.homeUserId || userId,
         homeInstance: reactionUser?.homeInstance || getOurOrigin(),
@@ -1190,7 +1145,7 @@ function handleReactionAdd(event: Record<string, unknown>, userId: string, isFed
   }
 }
 
-function handleReactionRemove(event: Record<string, unknown>, userId: string, isFederated: boolean): void {
+function handleReactionRemove(event: Record<string, unknown>, userId: string): void {
   const messageId = event.messageId as string;
   const emoji = event.emoji as string;
 
@@ -1223,8 +1178,9 @@ function handleReactionRemove(event: Record<string, unknown>, userId: string, is
     return;
   }
 
-  // Fall through to DM message
-  if (isFederated) return;
+  // Fall through to DM message. A federated account reacts here like anyone
+  // else: it is a member of the DM on this instance, and the relay carries its
+  // home identity back to its home instance.
   const dmMsg = db.select().from(schema.dmMessages).where(eq(schema.dmMessages.id, messageId)).get();
   if (!dmMsg || !isDmMember(dmMsg.dmChannelId, userId)) return;
   // Read-only enforcement: a dead 1-on-1 thread (partner tombstoned) accepts no
@@ -1249,8 +1205,7 @@ function handleReactionRemove(event: Record<string, unknown>, userId: string, is
 
     // Federation: log reaction removal and queue for relay
     const removingUser = db.select().from(schema.users).where(eq(schema.users.id, userId)).get();
-    const canonicalMessageId = dmMsg.sourceMessageId || messageId;
-    const messageHomeInstance = dmMsg.sourceInstance || getOurOrigin();
+    const target = dmMessageFederationRef(dmMsg);
     appendMutationLog(messageId, dmMsg.dmChannelId, 'reaction_remove', JSON.stringify({
       userId,
       homeUserId: removingUser?.homeUserId || userId,
@@ -1264,8 +1219,8 @@ function handleReactionRemove(event: Record<string, unknown>, userId: string, is
       'reaction_remove',
       JSON.stringify({
         reaction: {
-          messageId: canonicalMessageId,
-          messageHomeInstance,
+          messageId: target.messageId,
+          messageHomeInstance: target.messageHomeInstance,
           userId,
           homeUserId: removingUser?.homeUserId || userId,
           homeInstance: removingUser?.homeInstance || getOurOrigin(),
@@ -1449,6 +1404,11 @@ function handleDmCallStart(event: Record<string, unknown>, userId: string, usern
   // Bind voice session to this socket so removeConnection can clean up
   // if the caller closes the tab while the call is ringing
   connectionManager.setVoiceWs(userId, ws);
+
+  // A member who has the conversation closed (a new 1-on-1's recipient before
+  // its first message, #360) gets it back first, so the call has a
+  // conversation to open in and survives a reconnect.
+  reopenForClosedMembers(dmChannelId);
 
   // Ring other members
   connectionManager.sendToDmMembers(dmChannelId, {
@@ -1798,16 +1758,17 @@ async function sendFederatedCallStart(
   const db = getDb();
   const ourOrigin = getOurOrigin();
 
-  // Look up DM channel for federatedId
-  const channel = db.select({
-    federatedId: schema.dmChannels.federatedId,
-    ownerId: schema.dmChannels.ownerId,
-  })
+  // The conversation key names the call on every instance. Call start reads
+  // it and never computes or mints one (ADR 0002): every 1-on-1 is keyed at
+  // insert, and a group without a key has no copy on any peer, so a row
+  // without one is not announced.
+  const channel = db.select({ federatedId: schema.dmChannels.federatedId })
     .from(schema.dmChannels)
     .where(eq(schema.dmChannels.id, dmChannelId))
     .get();
 
-  if (!channel) return;
+  if (!channel?.federatedId) return;
+  const federatedId = channel.federatedId;
 
   // Get all DM members with their user records
   const members = db.select({
@@ -1822,45 +1783,31 @@ async function sendFederatedCallStart(
     .where(eq(schema.dmMembers.dmChannelId, dmChannelId))
     .all();
 
-  // Compute or reuse federatedId
-  let federatedId = channel.federatedId;
-  if (!federatedId) {
-    if (!channel.ownerId) {
-      const callerMember = members.find(m => m.userId === callerId);
-      const otherMember = members.find(m => m.userId !== callerId);
-      if (!callerMember || !otherMember) return;
-      federatedId = computeFederatedId(
-        callerMember.homeUserId || callerMember.userId,
-        otherMember.homeUserId || otherMember.userId,
-      );
-    } else {
-      federatedId = crypto.randomUUID();
-    }
-    db.update(schema.dmChannels)
-      .set({ federatedId })
-      .where(eq(schema.dmChannels.id, dmChannelId))
-      .run();
-  }
-
-  // Classify members relative to this instance.
+  // Classify members relative to this instance. `homeInstance` is stored in two
+  // shapes (bare host and full URL), so every comparison goes through
+  // normalizeOriginForCompare; the peer-facing origin is canonicalized.
+  const ourOriginKey = normalizeOriginForCompare(ourOrigin);
   const remoteMembers = members.filter(m => {
-    if (!m.homeInstance) return false;
-    const normalized = m.homeInstance.startsWith('http') ? m.homeInstance : `https://${m.homeInstance}`;
-    return normalized !== ourOrigin;
+    const key = normalizeOriginForCompare(m.homeInstance);
+    return key !== null && key !== ourOriginKey;
   });
+
+  // A purely local call has no federated recipient. Relaying it anyway would
+  // hand every peered instance the call's existence, its participant roster and
+  // room credentials for a conversation none of them hosts a party to.
+  if (remoteMembers.length === 0) return;
+
   const localNonCallerMembers = members.filter(m => {
     if (m.userId === callerId) return false;
-    const home = m.homeInstance
-      ? (m.homeInstance.startsWith('http') ? m.homeInstance : `https://${m.homeInstance}`)
-      : ourOrigin;
-    return home === ourOrigin;
+    return (normalizeOriginForCompare(m.homeInstance) ?? ourOriginKey) === ourOriginKey;
   });
   const hasConnectedLocalRingee = localNonCallerMembers.some(m =>
     connectionManager.isUserOnline(m.userId),
   );
 
   // ─── LiveKit pre-flight ────────────────────────────────────────────────────
-  if ((!config.livekit.apiKey || !config.livekit.apiSecret) && remoteMembers.length > 0) {
+  // Reached only with at least one remote member, so a missing key is fatal here.
+  if (!config.livekit.apiKey || !config.livekit.apiSecret) {
     console.warn('[federation] Cannot start federated call: LiveKit not configured');
     emitUndeliverableAndMaybeDestroy({
       callerId,
@@ -1884,54 +1831,65 @@ async function sendFederatedCallStart(
     displayName: m.displayName || m.username,
   }));
 
-  // Generate tokens for ALL members upfront
-  const allTokens: Record<string, string> = {};
-  for (const m of members) {
-    const homeUserId = m.homeUserId || m.userId;
-    const name = m.displayName || m.username;
-    allTokens[homeUserId] = await generateFederatedCallToken(federatedId, homeUserId, name);
-  }
-
   const callerHomeUserId = members.find(m => m.userId === callerId)?.homeUserId || callerId;
 
-  // Build the relay event template (reused for all peers)
-  const buildRelayEvent = () => ({
-    eventType: 'dm_call_start' as const,
-    messageId: generateSnowflake(),
-    encryptionVersion: 0 as const,
-    timestamp: Date.now(),
-    federatedId,
-    call: {
-      livekitUrl,
-      tokens: allTokens,
-      caller: {
-        homeUserId: callerHomeUserId,
-        homeInstance: ourOrigin,
-        displayName: callerName,
-      },
-      participants,
-    },
-  });
-
-  // Group remote members by home instance (targeted peers)
-  const targetedPeers = new Map<string, string[]>();
+  // Group remote members by the instance that homes them. Each bucket is the
+  // exact set of identities its peer is entitled to act for.
+  const targetedPeers = new Map<string, typeof members>();
   for (const m of remoteMembers) {
-    const origin = m.homeInstance!.startsWith('http') ? m.homeInstance! : `https://${m.homeInstance!}`;
+    const origin = canonicalizeHomeInstance(m.homeInstance);
+    if (!origin) continue;
     const bucket = targetedPeers.get(origin) ?? [];
-    bucket.push(m.userId);
+    bucket.push(m);
     targetedPeers.set(origin, bucket);
   }
 
-  // Single query for all peers — derives both active-peer list and label map
+  /**
+   * Build the `dm_call_start` payload for one recipient peer.
+   *
+   * A LiveKit token is a bearer credential: it grants `roomJoin` + `canPublish`
+   * on the call room to whoever holds it, under the identity it was minted for.
+   * So a peer is only ever handed tokens for the members it actually homes —
+   * never the caller's (both inbound paths skip the caller), never a local
+   * member's, never another peer's. Keying the map per recipient also removes
+   * the cross-instance `homeUserId` ambiguity of a single shared map.
+   *
+   * `participants` is the non-secret roster and stays complete: the recipient
+   * needs it for Path B identity matching when the DM has no local row yet.
+   */
+  const buildRelayEvent = async (recipients: typeof members) => {
+    const tokens: Record<string, string> = {};
+    for (const m of recipients) {
+      const homeUserId = m.homeUserId || m.userId;
+      const name = m.displayName || m.username;
+      tokens[homeUserId] = await generateFederatedCallToken(federatedId, homeUserId, name);
+    }
+    return {
+      eventType: 'dm_call_start' as const,
+      messageId: generateSnowflake(),
+      encryptionVersion: 0 as const,
+      timestamp: Date.now(),
+      federatedId,
+      call: {
+        livekitUrl,
+        tokens,
+        caller: {
+          homeUserId: callerHomeUserId,
+          homeInstance: ourOrigin,
+          displayName: callerName,
+        },
+        participants,
+      },
+    };
+  };
+
+  // Peer labels for the undeliverable surface.
   const peerRows = db.select({
     origin: schema.federationPeers.origin,
     instanceName: schema.federationPeers.instanceName,
-    status: schema.federationPeers.status,
   })
     .from(schema.federationPeers)
     .all();
-
-  const allPeers = peerRows.filter(r => r.status === 'active');
 
   const peerLabelByOrigin = new Map<string, string>();
   for (const row of peerRows) {
@@ -1944,8 +1902,8 @@ async function sendFederatedCallStart(
   //   ok=true, messageId IN undeliverable     → new: no_recipient failure (#18)
   //   ok=false                                → existing failure reasons
   const targetedResults = await Promise.all(
-    Array.from(targetedPeers.keys()).map(async peerOrigin => {
-      const relayEvent = buildRelayEvent();
+    Array.from(targetedPeers.entries()).map(async ([peerOrigin, recipients]) => {
+      const relayEvent = await buildRelayEvent(recipients);
       const result = await sendCallRelay(peerOrigin, [relayEvent]);
       if (result.ok) {
         if (result.undeliverable.includes(relayEvent.messageId)) {
@@ -1965,17 +1923,6 @@ async function sendFederatedCallStart(
     }),
   );
 
-  // ─── All-peers broadcast: fire-and-forget; failures NOT surfaced ───────────
-  for (const peer of allPeers) {
-    if (targetedPeers.has(peer.origin)) continue;
-    if (peer.origin === ourOrigin) continue;
-    sendCallRelay(peer.origin, [buildRelayEvent()]).then(result => {
-      if (!result.ok) {
-        console.debug(`[federation] All-peers dm_call_start to ${peer.origin}: ${result.reason} ${result.error}`);
-      }
-    }).catch(err => console.warn('[federation] all-peers broadcast threw:', err));
-  }
-
   // ─── Aggregate failures → dm_call_undeliverable ───────────────────────────
   const failedTargeted = targetedResults.filter(
     (r): r is Extract<typeof r, { ok: false }> => !r.ok,
@@ -1986,7 +1933,7 @@ async function sendFederatedCallStart(
   const plausibleRecipientRemains = anyTargetedSuccess || hasConnectedLocalRingee;
 
   const failures: DmCallUndeliverableFailure[] = failedTargeted.map(r => {
-    const affectedUserIds = targetedPeers.get(r.origin) ?? [];
+    const affectedUserIds = (targetedPeers.get(r.origin) ?? []).map(m => m.userId);
     return {
       reason: r.reason,
       peerOrigin: r.origin,
@@ -2233,6 +2180,19 @@ async function sendFederatedCallEnd(
 
 // ─── Voice Moderation Handlers ──────────────────────────────────────────────
 
+/**
+ * Voice moderation of another member follows the role hierarchy, like kick and
+ * ban (permissions.md, "Role hierarchy"). Sends the refusal and returns true
+ * when `actorId` does not outrank `targetId`; acting on oneself is not
+ * moderation and is left to each handler's own rules.
+ */
+function refusedByRoleHierarchy(spaceId: string, actorId: string, targetId: string): boolean {
+  if (actorId === targetId) return false;
+  if (canActOnMemberInSpace(spaceId, actorId, targetId)) return false;
+  connectionManager.sendToUser(actorId, { type: 'error', message: ERROR_MESSAGES.role_hierarchy, code: 'role_hierarchy' });
+  return true;
+}
+
 function handleVoiceSpaceMute(event: Record<string, unknown>, userId: string): void {
   const targetUserId = event.userId as string;
   const muted = event.muted === true;
@@ -2260,6 +2220,8 @@ function handleVoiceSpaceMute(event: Record<string, unknown>, userId: string): v
     connectionManager.sendToUser(userId, { type: 'error', message: 'Cannot space-mute yourself' });
     return;
   }
+
+  if (refusedByRoleHierarchy(meta.spaceId, userId, targetUserId)) return;
 
   connectionManager.setSpaceMuted(meta.spaceId, targetUserId, muted);
 
@@ -2319,6 +2281,8 @@ function handleVoiceSpaceDeafen(event: Record<string, unknown>, userId: string):
     return;
   }
 
+  if (refusedByRoleHierarchy(meta.spaceId, userId, targetUserId)) return;
+
   connectionManager.setSpaceDeafened(meta.spaceId, targetUserId, deafened);
 
   // Persist to DB
@@ -2376,6 +2340,8 @@ function handleVoiceMove(event: Record<string, unknown>, userId: string): void {
     return;
   }
 
+  if (refusedByRoleHierarchy(meta.spaceId, userId, targetUserId)) return;
+
   // Verify target channel exists and is a voice/video channel in the same space
   const db = getDb();
   const targetChannel = db.select().from(schema.channels).where(eq(schema.channels.id, targetChannelId)).get();
@@ -2409,12 +2375,19 @@ function handleVoiceMove(event: Record<string, unknown>, userId: string): void {
   connectionManager.createRoom(targetChannelId, 'space', { type: 'space', spaceId: meta.spaceId });
   connectionManager.joinRoom(targetChannelId, targetUserId);
 
+  // Read the room after the join: an empty voice channel has no room at all
+  // (leaveRoom tears space rooms down when the last participant leaves), so
+  // looking it up any earlier reports no duration for the channel this move
+  // just occupied.
+  const targetRoom = connectionManager.getRoom(targetChannelId);
+
   // Broadcast join to new channel
   connectionManager.sendToSpace(meta.spaceId, {
     type: 'voice_state_update',
     channelId: targetChannelId,
     userId: targetUserId,
     action: 'join',
+    channelElapsedSeconds: targetRoom ? getVoiceRoomElapsedSeconds(targetRoom) : undefined,
   });
 
   // Notify the moved user so they reconnect to LiveKit
@@ -2465,6 +2438,8 @@ function handleVoiceDisconnect(event: Record<string, unknown>, userId: string): 
     connectionManager.sendToUser(userId, { type: 'error', message: 'Missing DISCONNECT_MEMBERS permission' });
     return;
   }
+
+  if (refusedByRoleHierarchy(meta.spaceId, userId, targetUserId)) return;
 
   const channelId = currentRoom.roomId;
 

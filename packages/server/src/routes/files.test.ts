@@ -54,7 +54,7 @@ function applyMigrations(db: Database.Database): void {
 // Override config paths to use the test-local tmpDir so tus file I/O is isolated.
 // We do this by mocking the config module.
 vi.mock('../config.js', async () => {
-  // Grab the real config first (runs dotenv so JWT_SECRET etc. are set)
+  // Grab the real config first (test/setup-env.ts has already set JWT_SECRET)
   const real = await import('../config.js');
   // We'll patch the directory fields; the proxy below reads `tmpDir` at
   // call time, which is reassigned in each beforeEach.
@@ -151,6 +151,31 @@ describe('POST /api/files — tus upload endpoint', () => {
     expect(res.statusCode).toBe(201);
     expect(res.headers['location']).toBeTruthy();
     expect(res.headers['upload-expires']).toBeTruthy();
+  });
+
+  it('Location is a path, so a proxy that rewrites Host cannot corrupt it', async () => {
+    // Behind a reverse proxy the server only sees whatever Host / X-Forwarded-Host
+    // the proxy chose to send. nginx's `$host`, for example, drops the port, and a
+    // Location built from it points at a port the client never used (#44). The
+    // client knows which origin it uploaded to; the server must not guess.
+    const token = signJwt({ userId: USER_A_ID, username: 'user_a' });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/files',
+      headers: {
+        'authorization': `Bearer ${token}`,
+        'tus-resumable': '1.0.0',
+        'upload-length': '512',
+        'upload-metadata': tusMetadata({ originalName: 'test.png' }),
+        'content-length': '0',
+        'host': 'chat.example.com',
+        'x-forwarded-host': 'chat.example.com',
+        'x-forwarded-proto': 'https',
+      },
+    });
+    expect(res.statusCode).toBe(201);
+    expect(res.headers['location']).toMatch(/^\/api\/files\/[A-Za-z0-9_-]+$/);
   });
 
   it('non-owner PATCH returns 403', async () => {

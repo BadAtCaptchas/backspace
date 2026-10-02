@@ -2,11 +2,12 @@ import { getDb } from '../db/index.js';
 import * as schema from '../db/schema.js';
 import { eq, and, inArray } from 'drizzle-orm';
 import { generateSnowflake } from './snowflake.js';
-import crypto from 'node:crypto';
-import type { FederationRelayEvent, FederationRelayParticipant, FederationRelayAttachment, DmMessageWithUser, FederationRelayRequest, DmCallUndeliverableReason } from '@backspace/shared';
-import { getOurOrigin, buildFederationHeaders, generateHmacSecret } from './federationAuth.js';
-import { extractDomain } from '../routes/federation.js';
-import { racePeering, ensurePeered } from './federationPeering.js';
+import type { FederationRelayEvent, FederationRelayParticipant, FederationRelayAttachment, DmMessageWithUser, FederationRelayRequest, DmCallUndeliverableReason, FederationMessageRef, FederationMessageTarget } from '@backspace/shared';
+import { getOurOrigin, buildFederationHeaders } from './federationAuth.js';
+import { extractDomain, relayActorOfUser } from '../routes/federation.js';
+import { racePeering, ensurePeered, createAutoPlaceholderPeer } from './federationPeering.js';
+import { relayMentionsOf } from './federationMentions.js';
+import { federationFetch } from './federationFetch.js';
 
 // ─── Settings Cache ──────────────────────────────────────────────────────────
 
@@ -124,15 +125,104 @@ export function appendMutationLog(
   }
 }
 
+// ─── Merging, and rows on the wire ──────────────────────────────────────────
+
+/**
+ * The event type one outbox row carries when a newer event for an entity is
+ * merged into an older one the peer has NOT received. Null: the two cancel out
+ * and the row goes.
+ * - create, then delete: nothing to tell the peer, it never saw the entity.
+ * - create, then anything else: still a create, with the newer payload, so the
+ *   peer receives the whole entity rather than a change to something it lacks.
+ * - otherwise: the newer event.
+ */
+function mergeUndeliveredEvent(olderType: string, newerType: string): string | null {
+  if (olderType === 'create') return newerType === 'delete' ? null : 'create';
+  return newerType;
+}
+
+/**
+ * Outbox rows the delivery worker has put on the wire and not yet settled,
+ * keyed by outbox id. When `queueOutboxEvent` first writes a newer event into
+ * one meanwhile, the row is superseded and `sentCreatedAt` records the
+ * `createdAt` it was sent with (null until then).
+ *
+ * While a row is on the wire nobody knows whether the peer will take its event,
+ * so the merge rule above cannot be applied yet: its create-then-delete and
+ * keep-the-create cases assume the peer never saw the older event. The newer
+ * event is stored as itself instead, and the worker settles the pair when the
+ * answer arrives (`finishOutboxDelivery`, `requeueAfterUndeliveredSend`).
+ *
+ * Kept in memory: the worker is the only sender and runs in this process, and
+ * better-sqlite3 is synchronous, so a check here and the write it guards
+ * cannot interleave with a merge. If the process dies with a request out, a
+ * superseded row keeps the newer event as written and goes out as that after
+ * the restart.
+ */
+const rowsOnTheWire = new Map<string, { sentCreatedAt: number | null }>();
+
+/** The worker is about to send these rows, as it has just read them. */
+export function beginOutboxDelivery(outboxIds: readonly string[]): void {
+  for (const id of outboxIds) rowsOnTheWire.set(id, { sentCreatedAt: null });
+}
+
+/**
+ * The answer for these rows is in (or will never come). Clears them and
+ * returns the ids a newer event was written into meanwhile, each with the
+ * `createdAt` the row had when it was sent. A superseded row holds that newer
+ * event and must not be deleted or backed off as the one that was sent: if the
+ * peer took the sent event, the row is simply the next one to send; if not,
+ * pass it to `requeueAfterUndeliveredSend`.
+ */
+export function finishOutboxDelivery(outboxIds: readonly string[]): Map<string, number> {
+  const superseded = new Map<string, number>();
+  for (const id of outboxIds) {
+    const sentCreatedAt = rowsOnTheWire.get(id)?.sentCreatedAt;
+    if (sentCreatedAt !== undefined && sentCreatedAt !== null) superseded.set(id, sentCreatedAt);
+    rowsOnTheWire.delete(id);
+  }
+  return superseded;
+}
+
+/**
+ * A superseded row whose sent event (`sentEventType`, created at
+ * `sentCreatedAt`) the peer did not take: merge the two now, as
+ * `queueOutboxEvent` would have had the send never happened. That includes the
+ * row's original `createdAt`, so it keeps its place ahead of rows queued after
+ * it (a reaction on the message it creates, say). The row stays due
+ * immediately.
+ */
+export function requeueAfterUndeliveredSend(outboxId: string, sentEventType: string, sentCreatedAt: number): void {
+  const db = getDb();
+  const row = db
+    .select({ eventType: schema.federationOutbox.eventType })
+    .from(schema.federationOutbox)
+    .where(eq(schema.federationOutbox.id, outboxId))
+    .get();
+  if (!row) return;
+  const merged = mergeUndeliveredEvent(sentEventType, row.eventType);
+  if (merged === null) {
+    db.delete(schema.federationOutbox).where(eq(schema.federationOutbox.id, outboxId)).run();
+  } else {
+    db.update(schema.federationOutbox)
+      .set({ eventType: merged, createdAt: sentCreatedAt })
+      .where(eq(schema.federationOutbox.id, outboxId))
+      .run();
+  }
+}
+
 /**
  * Queue an outbox event for all active federation peers.
  *
- * Performs per-peer coalescing inside a transaction:
- * - If a 'create' already exists and a 'delete' arrives, the entry is removed
- *   (net effect: message was never relayed).
- * - If an entry already exists, it is updated with the latest payload/event type,
- *   preserving the original 'create' event type if applicable.
- * - Otherwise a new entry is inserted.
+ * Keeps one row per (peer, entity), inside a transaction:
+ * - No row yet: insert one.
+ * - A row the peer has not received: merge into it (`mergeUndeliveredEvent`):
+ *   a create and a later delete cancel out, a create stays a create with the
+ *   latest payload, anything else becomes the newer event.
+ * - A row on the wire (`rowsOnTheWire`): store the newer event as itself and
+ *   leave the merge to the worker, which knows the outcome once the peer
+ *   answers.
+ * Every write leaves the row due now with no attempts.
  *
  * No-op if federation relay is disabled.
  * Failures are logged but never propagate — federation must not break DM flow.
@@ -147,6 +237,19 @@ export function queueOutboxEvent(
 ): void {
   try {
     if (!isFederationRelayEnabled()) {
+      return;
+    }
+
+    // DM traffic is participant-scoped: it may only ever reach instances that
+    // host a participant. An omitted target list means "broadcast to every
+    // peer", which is correct for profile/presence but never for a
+    // conversation, so refuse it rather than fan the event out. Callers derive
+    // their targets from getGroupDmTargetOrigins(), which returns [] when the
+    // conversation is entirely local.
+    if (contextType === 'dm' && !targetPeerOrigins) {
+      console.error(
+        `[federation] queueOutboxEvent: refusing to broadcast dm event ${eventType} (${entityId}) with no target origins`,
+      );
       return;
     }
 
@@ -169,11 +272,13 @@ export function queueOutboxEvent(
       ? peers.filter(p => targetPeerOrigins.includes(p.origin))
       : peers;
 
-    // For targeted origins with no existing peer record, create pending placeholders.
-    // autoAcceptPeering controls INCOMING acceptance, not outgoing initiation —
-    // when a local user sends a DM requiring relay, the server creates the placeholder
-    // regardless of the setting. The peer/accept gate on the REMOTE side decides
-    // whether to accept or queue our request.
+    // For targeted origins with no existing peer record, create pending
+    // placeholders — but only through createAutoPlaceholderPeer(), which applies
+    // the same outbound-peering gate ensurePeered() applies. A placeholder is
+    // not a neutral bookkeeping row: the outbound worker resolves it into a real
+    // handshake, and the remote's /peer/accept reads it as evidence our admin
+    // asked to peer. When the gate refuses, the origin is skipped and the DM
+    // replays from the mutation log if peering is approved later.
     if (targetPeerOrigins) {
       const matchedOrigins = new Set(matchedPeers.map(p => p.origin));
 
@@ -187,18 +292,10 @@ export function queueOutboxEvent(
           .get();
 
         if (!existingPeer) {
-          // No peer row — create pending placeholder, handshake fires on next tick
-          const peerId = generateSnowflake();
-          const now = Date.now();
-          db.insert(schema.federationPeers).values({
-            id: peerId,
-            origin,
-            hmacSecret: generateHmacSecret(),
-            status: 'pending',
-            createdAt: now,
-          }).run();
-          const newPeer = db.select().from(schema.federationPeers)
-            .where(eq(schema.federationPeers.id, peerId)).get();
+          // No peer row — create pending placeholder, handshake fires on next
+          // tick. Returns null when the outbound-peering gate refuses, in which
+          // case nothing is queued for this origin.
+          const newPeer = createAutoPlaceholderPeer(origin);
           if (newPeer) {
             matchedPeers = [...matchedPeers, newPeer];
             console.log(`[federation] queueOutboxEvent: created pending placeholder for ${origin}`);
@@ -283,25 +380,36 @@ export function queueOutboxEvent(
           )
           .get();
 
-        if (eventType === 'delete' && existing?.eventType === 'create') {
-          // Entity created and deleted before relay — net effect is nothing
-          tx.delete(schema.federationOutbox)
-            .where(eq(schema.federationOutbox.id, existing.id))
-            .run();
-        } else if (existing) {
-          // Coalesce: update existing entry with latest state.
-          // If the original was a 'create', keep it as 'create' so the peer
-          // receives the full message on first relay rather than an update/delete
-          // for something it never saw.
+        const onTheWire = existing ? rowsOnTheWire.get(existing.id) : undefined;
+        if (existing && onTheWire) {
+          // A fresh createdAt, as a row inserted after the delivery would
+          // have: the worker stamps each event with its row's createdAt, and
+          // a receiver that orders by it (read state is last-writer-wins on a
+          // strictly greater timestamp) must see this event as newer than the
+          // one on the wire.
           tx.update(schema.federationOutbox)
             .set({
-              eventType: existing.eventType === 'create' ? 'create' : eventType,
+              eventType,
               payload,
               attempts: 0,
               nextRetryAt: now,
+              createdAt: Math.max(now, existing.createdAt + 1),
             })
             .where(eq(schema.federationOutbox.id, existing.id))
             .run();
+          onTheWire.sentCreatedAt ??= existing.createdAt;
+        } else if (existing) {
+          const merged = mergeUndeliveredEvent(existing.eventType, eventType);
+          if (merged === null) {
+            tx.delete(schema.federationOutbox)
+              .where(eq(schema.federationOutbox.id, existing.id))
+              .run();
+          } else {
+            tx.update(schema.federationOutbox)
+              .set({ eventType: merged, payload, attempts: 0, nextRetryAt: now })
+              .where(eq(schema.federationOutbox.id, existing.id))
+              .run();
+          }
         } else {
           // No existing entry — insert new
           tx.insert(schema.federationOutbox)
@@ -326,24 +434,6 @@ export function queueOutboxEvent(
   } catch (err) {
     console.error('[federation-outbox] Failed to queue outbox event:', err);
   }
-}
-
-/**
- * Compute a federated ID for a DM channel.
- *
- * For 1-on-1 DMs: deterministic SHA-256 hash of 2 sorted home user IDs (backward compatible).
- * For group DMs: call with no arguments to generate a new UUID.
- */
-export function computeFederatedId(homeUserIdA: string, homeUserIdB: string): string;
-export function computeFederatedId(): string;
-export function computeFederatedId(homeUserIdA?: string, homeUserIdB?: string): string {
-  if (homeUserIdA && homeUserIdB) {
-    // 1-on-1: deterministic pair hash (backward compatible with canonicalDmPairId)
-    const sorted = [homeUserIdA, homeUserIdB].sort();
-    return crypto.createHash('sha256').update(sorted.join(':')).digest('hex').slice(0, 32);
-  }
-  // Group: origin-assigned UUID
-  return crypto.randomUUID();
 }
 
 /**
@@ -400,34 +490,40 @@ export function getDmParticipants(dmChannelId: string): FederationRelayParticipa
 }
 
 /**
- * Compute which peer origins need to receive events for a group DM.
- * Returns undefined for 1-on-1 DMs (broadcast to all).
- * Returns a list of origins for group DMs (participant-aware routing).
+ * Compute which peer origins need to receive events for a DM.
+ *
+ * Always participant-derived — both 1-on-1 and group DMs. The result is the set
+ * of instances that host a participant, minus our own origin.
+ *
+ * Returns an empty array when every participant is local. `[]` is a *target
+ * list*, not an absence of one: `queueOutboxEvent` takes the targeted branch
+ * and matches zero peers, so a conversation that never left this instance is
+ * never relayed anywhere. Never return `undefined` here — `queueOutboxEvent`
+ * reads `undefined` as "broadcast to every peer", which for DM content would
+ * hand a local-only conversation to unrelated instances.
  */
-export function getGroupDmTargetOrigins(dmChannelId: string): string[] | undefined {
-  const db = getDb();
-  const channel = db
-    .select({ ownerId: schema.dmChannels.ownerId })
-    .from(schema.dmChannels)
-    .where(eq(schema.dmChannels.id, dmChannelId))
-    .get();
+export function getGroupDmTargetOrigins(dmChannelId: string): string[] {
+  return relayTargetOrigins(getDmParticipants(dmChannelId));
+}
 
-  // Always compute target origins from participants — both 1-on-1 and group DMs.
-  // Returning undefined (broadcast to all) would skip the pending-placeholder creation
-  // in queueOutboxEvent(), preventing relay when no peer exists yet.
-  const participants = getDmParticipants(dmChannelId);
+/**
+ * The peer origins a conversation among `members` is relayed to: every
+ * instance that hosts one of them, minus our own origin. A member without a
+ * `homeInstance` is homed here. `getGroupDmTargetOrigins` is this applied to a
+ * stored conversation's members; the relay receiver also applies it to the two
+ * people a 1-on-1 is between before any local copy of it exists.
+ */
+export function relayTargetOrigins(members: ReadonlyArray<{ homeInstance: string | null }>): string[] {
   const ourOrigin = getOurOrigin();
 
   const origins = new Set<string>();
-  for (const p of participants) {
-    const normalized = p.homeInstance.startsWith('http') ? p.homeInstance : `https://${p.homeInstance}`;
+  for (const m of members) {
+    const home = m.homeInstance || ourOrigin;
+    const normalized = home.startsWith('http') ? home : `https://${home}`;
     if (normalized !== ourOrigin) {
       origins.add(normalized);
     }
   }
-
-  // No remote participants — no relay needed
-  if (origins.size === 0) return undefined;
 
   return Array.from(origins);
 }
@@ -475,15 +571,82 @@ export function queueDmRelay(
     .where(eq(schema.dmChannels.id, dmChannelId))
     .get();
 
+  // An edit names the message it changes; the editor is its author (the
+  // edit paths are author-only).
+  const target = eventType === 'update'
+    ? dmMessageMutationTarget({
+      id: message.id,
+      dmChannelId,
+      sourceInstance: message.sourceInstance ?? null,
+      sourceMessageId: message.sourceMessageId ?? null,
+    }, message.userId)
+    : null;
+
   appendMutationLog(message.id, dmChannelId, eventType);
   queueOutboxEvent(message.id, dmChannelId, eventType, JSON.stringify({
     ...(channel?.federatedId && channel.ownerId ? { federatedId: channel.federatedId } : {}),
+    ...(target ? { target } : {}),
     message: {
-      ...buildRelayPayload(message, message.user),
+      ...buildRelayPayload(message, message.user, dmReplyRefForRelay(dmChannelId, message.replyToId)),
       attachments: attachments.length > 0 ? attachments : undefined,
     },
     participants,
   }), targetOrigins);
+}
+
+/**
+ * Queue a DM message deletion for federation relay.
+ *
+ * Single source of truth for the delete relay — the REST and WebSocket delete
+ * paths both call this so neither can drift from the participant-scoped
+ * targeting (a delete carries the channel and message coordinates, which are
+ * only ever another participant instance's business).
+ */
+export function queueDmMessageDeleteRelay(
+  messageId: string,
+  dmChannelId: string,
+  target: FederationMessageTarget | null,
+): void {
+  // The mutation log keeps the target too: the row is gone by the time the
+  // sync endpoint replays this delete, so it cannot be rebuilt then.
+  appendMutationLog(messageId, dmChannelId, 'delete', target ? JSON.stringify({ target }) : undefined);
+  queueOutboxEvent(
+    messageId,
+    dmChannelId,
+    'delete',
+    JSON.stringify({ deleted: true, ...(target ? { target } : {}) }),
+    getGroupDmTargetOrigins(dmChannelId),
+  );
+}
+
+/**
+ * The `target` an edit or delete relay carries (`FederationMessageTarget`):
+ * the message in shared coordinates, the conversation's `federatedId`, and the
+ * acting user's federated identity. Null when the conversation has no
+ * `federatedId` or the actor has no comparable identity; the event then goes
+ * out in the old shape, matched by the sender's local id.
+ *
+ * Callers that delete must build it before removing the row.
+ */
+export function dmMessageMutationTarget(
+  row: { id: string; dmChannelId: string; sourceInstance: string | null; sourceMessageId: string | null },
+  actorUserId: string,
+): FederationMessageTarget | null {
+  const db = getDb();
+  const channel = db
+    .select({ federatedId: schema.dmChannels.federatedId })
+    .from(schema.dmChannels)
+    .where(eq(schema.dmChannels.id, row.dmChannelId))
+    .get();
+  if (!channel?.federatedId) return null;
+  const actorRow = db
+    .select({ id: schema.users.id, homeUserId: schema.users.homeUserId, homeInstance: schema.users.homeInstance })
+    .from(schema.users)
+    .where(eq(schema.users.id, actorUserId))
+    .get();
+  const actor = actorRow ? relayActorOfUser(actorRow) : null;
+  if (!actor) return null;
+  return { message: dmMessageFederationRef(row), federatedId: channel.federatedId, actor };
 }
 
 /**
@@ -520,13 +683,62 @@ export function getFriendEventTargets(
 }
 
 /**
- * Build the relay payload object for a DM message.
- * Used internally by queueDmRelay and the sync endpoint.
+ * Name a DM message row in federation coordinates (`FederationMessageRef`).
+ *
+ * Each instance holds its own copy of a federated message under its own local
+ * id. A row this instance created is named by its id and our origin; a relayed
+ * copy is named by the id and origin it arrived with, which is the message's
+ * id on the instance that created it. Every relay event that points at an
+ * existing message (reply, reaction) names it this way, and the receiver turns
+ * it back into its own row with `resolveLocalDmMessage`.
+ */
+export function dmMessageFederationRef(row: {
+  id: string;
+  sourceInstance: string | null;
+  sourceMessageId: string | null;
+}): FederationMessageRef {
+  if (row.sourceInstance && row.sourceMessageId) {
+    return { messageId: row.sourceMessageId, messageHomeInstance: row.sourceInstance };
+  }
+  return { messageId: row.id, messageHomeInstance: getOurOrigin() };
+}
+
+/**
+ * The reply reference a relayed message carries: the replied-to message in
+ * federation coordinates, or null when the message is not a reply or its
+ * target is not in `dmChannelId` (the create paths refuse that, and a row
+ * predating the check is not relayed as one).
+ */
+export function dmReplyRefForRelay(
+  dmChannelId: string,
+  replyToId: string | null | undefined,
+): FederationMessageRef | null {
+  if (!replyToId) return null;
+  const target = getDb()
+    .select({
+      id: schema.dmMessages.id,
+      sourceInstance: schema.dmMessages.sourceInstance,
+      sourceMessageId: schema.dmMessages.sourceMessageId,
+    })
+    .from(schema.dmMessages)
+    .where(and(eq(schema.dmMessages.id, replyToId), eq(schema.dmMessages.dmChannelId, dmChannelId)))
+    .get();
+  return target ? dmMessageFederationRef(target) : null;
+}
+
+/**
+ * Build the message part of a relayed DM message event, without attachments.
+ * The live relay (`queueDmRelay`) and the sync endpoint's replay both use it,
+ * so a replayed message reaches a peer in the same shape as a live one.
+ * `replyTo` comes from `dmReplyRefForRelay`: `replyToId` is this instance's
+ * local id and only `replyTo` means anything to the receiver. `mentions`
+ * (`relayMentionsOf`) names the users the content's `<@id>` tokens stand for,
+ * for the same reason.
  */
 export function buildRelayPayload(
   message: {
     id: string;
-    type?: 'user' | 'system' | null;
+    type?: string | null;
     content: string | null;
     replyToId?: string | null;
     editedAt?: number | null;
@@ -537,7 +749,9 @@ export function buildRelayPayload(
     homeUserId: string | null;
     homeInstance: string | null;
   },
+  replyTo: FederationMessageRef | null = null,
 ): NonNullable<FederationRelayEvent['message']> {
+  const mentions = relayMentionsOf(message);
   return {
     userId: user.id,
     homeUserId: user.homeUserId || user.id,
@@ -545,6 +759,8 @@ export function buildRelayPayload(
     ...(message.type === 'system' ? { type: 'system' as const } : {}),
     content: message.content,
     replyToId: message.replyToId ?? null,
+    ...(replyTo ? { replyTo } : {}),
+    ...(mentions ? { mentions } : {}),
     editedAt: message.editedAt ?? null,
     createdAt: message.createdAt,
   };
@@ -672,12 +888,12 @@ export async function sendCallRelay(
   const headers = buildFederationHeaders(bodyStr, signingSecret, ourOrigin);
 
   try {
-    const res = await fetch(`${targetPeerOrigin}/api/federation/relay`, {
+    const res = await federationFetch(targetPeerOrigin, '/api/federation/relay', {
       method: 'POST',
       headers,
       body: bodyStr,
       signal: AbortSignal.timeout(10_000),
-    });
+    }, 'approved');
 
     if (res.ok) {
       // Parse response body to surface the undeliverable bucket. Old peers

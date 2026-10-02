@@ -2,7 +2,17 @@
 
 // Recovery mode types (Task 11)
 type RecoveryReasonCode = 'load-failed' | 'render-gone' | 'unresponsive' | 'renderer-stalled';
-type UpdateState = 'idle' | 'checking' | 'downloading' | 'downloaded' | 'error';
+// 'available-manual': an update exists but this build cannot install it in
+// place, so the recovery surface offers a download rather than a Restart button
+// that would do nothing. See packages/desktop/src/updateCapability.ts.
+type UpdateState =
+  | 'idle'
+  | 'checking'
+  | 'downloading'
+  | 'available-manual'
+  | 'external'
+  | 'downloaded'
+  | 'error';
 interface RecoveryState {
   mode: 'normal' | 'recovery';
   reason: { code: RecoveryReasonCode; detail: string } | null;
@@ -27,26 +37,75 @@ interface ElectronScreenSource {
   isScreen: boolean;               // true = display, false = window
 }
 
+/**
+ * Where the desktop updater currently is.
+ *
+ * Declared without `export` on purpose: this file is a global ambient
+ * declaration that augments `interface Window`. A single `export` would turn it
+ * into a module and drop that augmentation across the whole package.
+ *
+ * Mirrors `UpdateStatus` in `packages/desktop/src/updateStatus.ts`. The two are
+ * separate declarations on purpose: this is a wire contract across a process
+ * boundary between two packages that ship and version independently, and the
+ * web client must not take a build dependency on the Electron package. The
+ * runtime guard in `updateStore.ts` is what keeps them honest.
+ */
+type DesktopUpdateStatus =
+  | { phase: 'idle' }
+  | { phase: 'checking' }
+  | { phase: 'available'; version: string }
+  | { phase: 'downloading'; version: string; percent: number; bytesPerSecond: number }
+  | { phase: 'ready'; version: string }
+  | { phase: 'failed'; version: string | null; message: string }
+  | { phase: 'up-to-date'; checkedAt: number };
+
+/**
+ * `auto` means this build can install its own updates. `manual` means it cannot
+ * and the user has to download a new build, which is the case for ad-hoc signed
+ * macOS builds. The renderer never reasons about code signing; it reads this.
+ */
+type DesktopUpdateCapability = 'auto' | 'manual' | 'external';
+
+interface DesktopUpdateSnapshot {
+  capability: DesktopUpdateCapability;
+  dismissedVersion: string | null;
+  status: DesktopUpdateStatus;
+}
+
 interface BackspaceElectronAPI {
   // Platform info
   platform: NodeJS.Platform;
-
   // Window controls
   minimize: () => void;
   maximize: () => void;
   close: () => void;
 
   // Notifications & badge
-  showNotification: (title: string, body: string) => void;
+  showNotification: (title: string, body: string, options?: import('./notifications').NotificationOptions) => void;
+  onNotificationClick?: (callback: (options: import('./notifications').NotificationOptions) => void) => () => void;
   setBadgeCount: (count: number) => void;
 
-  // Auto-update (Task 2.1)
+  // Auto-update, legacy per-event channels.
+  //
+  // Kept because the desktop app and the instance it connects to version
+  // independently. Unused by this client; the snapshot API below replaces them.
   onUpdateAvailable: (callback: (info: { version: string }) => void) => void;
   onUpdateDownloaded: (callback: (info: { version: string }) => void) => void;
   onUpdateError: (callback: (error: { message: string; releaseUrl: string }) => void) => void;
   installUpdate: () => void;
   checkForUpdates: () => void;
   getVersion: () => Promise<string>;
+
+  // Auto-update, current surface.
+  //
+  // Optional because an older desktop app does not expose them. A client served
+  // by a newer instance can find itself running inside an older app, so every
+  // call site must feature-detect. See updateStore.ts.
+  getUpdateStatus?: () => Promise<unknown>;
+  isSandboxed?: () => Promise<boolean>;
+  onUpdateStatusChanged?: (callback: (snapshot: unknown) => void) => (() => void);
+  dismissUpdate?: (version: string) => void;
+  openReleasePage?: () => void;
 
   // Window focus (Task 2.2)
   onWindowFocusChange: (callback: (focused: boolean) => void) => void;
@@ -61,11 +120,30 @@ interface BackspaceElectronAPI {
   // Screen share picker coordination
   onScreenShareSources: (callback: (sources: ElectronScreenSource[]) => void) => void;
   selectScreenSource: (sourceId: string | null, shareAudio?: boolean) => void;
+  /**
+   * Optional: desktop builds before the setup-screen flow lack these two. The
+   * web client feature-detects them and falls back to the prompted flow
+   * (getDisplayMedia → onScreenShareSources → selectScreenSource).
+   */
+  getScreenSources?: () => Promise<ElectronScreenSource[]>;
+  preselectScreenSource?: (sourceId: string, shareAudio?: boolean) => Promise<void>;
+  /**
+   * 'system' when the OS picks the source (Wayland screencast portal): the
+   * renderer shows a "choose" card that triggers the portal on click instead
+   * of listing sources, which would prompt on every open. 'app' elsewhere.
+   */
+  getScreenSharePickerMode?: () => Promise<'app' | 'system'>;
+  /** System-picker captures carry no preselection; this tells main whether to add loopback audio. */
+  setScreenShareAudioPreference?: (shareAudio: boolean) => void;
 
   // Instance URL management
   getInstanceUrl: () => Promise<string | null>;
   setInstanceUrl: (url: string) => Promise<void>;
   clearInstanceUrl: () => Promise<void>;
+
+  // Language: the renderer owns the choice; main relabels its tray and menus.
+  // Optional because an older desktop app does not expose it.
+  setLanguage?: (language: string) => void;
 
   // Auto-launch settings
   getAutoLaunchSettings: () => Promise<{ openAtLogin: boolean; startMinimized: boolean }>;
@@ -77,7 +155,11 @@ interface BackspaceElectronAPI {
   getCurrentActivity: () => Promise<unknown>;
 
   // Keybind support
-  syncKeybinds: (keybinds: Array<{ actionId: string; keys: number[]; mouseButton?: number }>) => void;
+  getKeybindPortalStatus?: () => Promise<KeybindPortalStatus | null>;
+  onKeybindPortalStatus?: (callback: (status: KeybindPortalStatus) => void) => () => void;
+  retryKeybindPortal?: () => void;
+  // Older installed shells use send-based IPC and return void.
+  syncKeybinds: (keybinds: Array<{ actionId: string; keys: number[]; mouseButton?: number }>) => Promise<boolean> | void;
   onKeybindAction: (callback: (action: { actionId: string; pressed: boolean }) => void) => (() => void);
   onAccessibilityStatus: (callback: (status: { trusted: boolean }) => void) => (() => void);
   onKeybindHookError: (callback: (error: { message: string }) => void) => (() => void);
@@ -92,4 +174,9 @@ interface BackspaceElectronAPI {
 
 interface Window {
   backspace?: BackspaceElectronAPI;
+}
+
+interface KeybindPortalStatus {
+  state: 'idle' | 'pending' | 'ready' | 'unavailable';
+  shortcuts: Record<string, string>;
 }

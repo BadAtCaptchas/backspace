@@ -8,7 +8,7 @@ import { and, eq, isNull, or, sql } from 'drizzle-orm';
 import type { CallFanoutFailure } from '../../../utils/federationOutbox.js';
 import type { DmRoomMeta, FederatedCallEntry } from '../../../ws/handler.js';
 import type { DmCallUndeliverableFailure, FederationRelayEvent, ServerEvent } from '@backspace/shared';
-import { extractDomain, resolveLocalUser, resolveOrCreateReplicatedUser, verifyAttribution } from '../identity.js';
+import { extractDomain, resolveOrCreateReplicatedUser, resolveRelayActor, attributionRefusal } from '../identity.js';
 
 export function processDmCallStartEvent(
   event: FederationRelayEvent,
@@ -24,9 +24,10 @@ export function processDmCallStartEvent(
   }
 
   // Attribution: caller must belong to source instance
-  if (!verifyAttribution(event.call.caller.homeInstance, sourceInstance)) {
-    console.warn(`[federation] Attribution mismatch in dm_call_start: caller=${extractDomain(event.call.caller.homeInstance)} source=${extractDomain(sourceInstance)}`);
-    rejected.push({ messageId: event.messageId, reason: 'attribution_mismatch' });
+  const refusal = attributionRefusal(event.call.caller, sourceInstance, db);
+  if (refusal) {
+    console.warn(`[federation] Attribution refused (${refusal}) in dm_call_start: caller=${extractDomain(event.call.caller.homeInstance)} source=${extractDomain(sourceInstance)}`);
+    rejected.push({ messageId: event.messageId, reason: refusal });
     return;
   }
 
@@ -36,12 +37,13 @@ export function processDmCallStartEvent(
     .where(eq(schema.dmChannels.federatedId, event.federatedId))
     .get();
 
-  // Resolve caller to local stub
+  // Resolve caller to local stub. The call payload carries only a display
+  // name, which is not a handle, so no username hint: a caller met here first
+  // gets the `<homeUserId>@<domain>` name until a real username arrives.
   const callerStub = resolveOrCreateReplicatedUser(
     event.call.caller.homeUserId,
     event.call.caller.homeInstance,
     db,
-    { username: event.call.caller.displayName },
   );
   if (!callerStub) {
     rejected.push({ messageId: event.messageId, reason: 'participant_not_found' });
@@ -74,7 +76,14 @@ export function processDmCallStartEvent(
       // symmetric in what counts as "ringed."
       if (connectionManager.getUserConnections(member.userId).size === 0) continue;
 
+      // The host mints a token only for the members IT considers ours. A local
+      // member homed on a third instance (client-federation) is rung by their
+      // own home instance, not by us — without a token there is nothing to ring
+      // them with, so skip rather than dispatch an unusable `dm_call_incoming`.
+      // Mirrors the same guard on Path B below.
       const token = event.call!.tokens![homeUserId];
+      if (!token) continue;
+
       connectionManager.sendToUser(member.userId, {
         type: 'dm_call_incoming',
         dmChannelId: localDmChannelId,
@@ -211,8 +220,9 @@ export function processDmCallAcceptEvent(
     return;
   }
 
-  if (!verifyAttribution(event.call.acceptor.homeInstance, sourceInstance)) {
-    rejected.push({ messageId: event.messageId, reason: 'attribution_mismatch' });
+  const refusal = attributionRefusal(event.call.acceptor, sourceInstance, db);
+  if (refusal) {
+    rejected.push({ messageId: event.messageId, reason: refusal });
     return;
   }
 
@@ -295,8 +305,9 @@ export function processDmCallRejectEvent(
     return;
   }
 
-  if (!verifyAttribution(event.call.rejector.homeInstance, sourceInstance)) {
-    rejected.push({ messageId: event.messageId, reason: 'attribution_mismatch' });
+  const refusal = attributionRefusal(event.call.rejector, sourceInstance, db);
+  if (refusal) {
+    rejected.push({ messageId: event.messageId, reason: refusal });
     return;
   }
 
@@ -355,8 +366,9 @@ export function processDmCallEndEvent(
     return;
   }
 
-  if (!verifyAttribution(event.call.endedBy.homeInstance, sourceInstance)) {
-    rejected.push({ messageId: event.messageId, reason: 'attribution_mismatch' });
+  const refusal = attributionRefusal(event.call.endedBy, sourceInstance, db);
+  if (refusal) {
+    rejected.push({ messageId: event.messageId, reason: refusal });
     return;
   }
 
@@ -419,6 +431,13 @@ export function processDmTypingStartEvent(
     return;
   }
 
+  // Attribution: the peer must be entitled to speak for the typing identity.
+  const refusal = attributionRefusal(event.typing, sourceInstance, db);
+  if (refusal) {
+    rejected.push({ messageId: event.messageId, reason: refusal });
+    return;
+  }
+
   // Look up local channel by federatedId
   const channel = db.select()
     .from(schema.dmChannels)
@@ -434,13 +453,20 @@ export function processDmTypingStartEvent(
     return;
   }
 
-  // Resolve the typing user (read-only — don't create stubs for ephemeral events)
-  const typingUser = resolveLocalUser(event.typing.homeUserId, db);
-  if (!typingUser) {
+  // Resolve the typing user (read-only, no stubs for ephemeral events).
+  // Matched on homeUserId + homeInstance; see `resolveRelayActor`.
+  const typer = resolveRelayActor(event.typing, db);
+  if (typer.kind === 'mismatch') {
+    console.warn('[federation] Refused dm_typing_start: the typing homeUserId names a local user of another identity');
+    rejected.push({ messageId: event.messageId, reason: 'attribution_mismatch' });
+    return;
+  }
+  if (typer.kind === 'unknown') {
     // User stub doesn't exist — discard silently
     accepted.push(event.messageId);
     return;
   }
+  const typingUser = typer.user;
 
   // Broadcast dm_typing to local DM members (excluding the typer)
   const dmMembers = db.select()
@@ -475,6 +501,13 @@ export function processDmTypingStopEvent(
     return;
   }
 
+  // Attribution: the peer must be entitled to speak for the typing identity.
+  const refusal = attributionRefusal(event.typing, sourceInstance, db);
+  if (refusal) {
+    rejected.push({ messageId: event.messageId, reason: refusal });
+    return;
+  }
+
   // Look up local channel by federatedId
   const channel = db.select()
     .from(schema.dmChannels)
@@ -489,12 +522,18 @@ export function processDmTypingStopEvent(
     return;
   }
 
-  // Resolve the typing user (read-only)
-  const typingUser = resolveLocalUser(event.typing.homeUserId, db);
-  if (!typingUser) {
+  // Resolve the typing user (read-only), matched on homeUserId + homeInstance
+  const typer = resolveRelayActor(event.typing, db);
+  if (typer.kind === 'mismatch') {
+    console.warn('[federation] Refused dm_typing_stop: the typing homeUserId names a local user of another identity');
+    rejected.push({ messageId: event.messageId, reason: 'attribution_mismatch' });
+    return;
+  }
+  if (typer.kind === 'unknown') {
     accepted.push(event.messageId);
     return;
   }
+  const typingUser = typer.user;
 
   // Broadcast dm_typing_stop to local DM members
   const dmMembers = db.select()

@@ -1,8 +1,14 @@
 name: Security
 
-# Report-only in this plan: every scanner is non-blocking and uploads SARIF to
-# the Security tab. Enforcement (fail on fixable HIGH/CRITICAL, block on secrets)
-# is flipped on in Plan E after the remediation pass.
+# Enforcing. Every scanner uploads SARIF to the Security tab AND fails the job on
+# a finding that the tiered policy says must block: a gitleaks secret hit, a
+# HIGH/CRITICAL Trivy config or license finding, and any dependency vulnerability
+# that is not listed in osv-scanner.toml.
+#
+# osv-scanner.toml is a ratchet, not a waiver. It holds the backlog that existed
+# when enforcement was turned on, each entry with a reason and an expiry date, so
+# a NEW vulnerability blocks while the documented backlog stays visible. See
+# docs/systems/security-scanning.md.
 
 on:
   pull_request:
@@ -24,16 +30,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Harden the runner
-        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: audit
       - name: Checkout (full history)
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0 # gitleaks scans the whole git history, not just the diff
       - name: Run gitleaks
-        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
-        continue-on-error: true # report-only; enforcement flipped on in Plan E
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -45,22 +50,25 @@ jobs:
       security-events: write # upload SARIF to code scanning
     steps:
       - name: Harden the runner
-        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: audit
       - name: Checkout
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Run OSV-Scanner
-        uses: google/osv-scanner-action/osv-scanner-action@9a498708959aeaef5ef730655706c5a1df1edbc2 # v2.3.8
-        continue-on-error: true # report-only; enforcement flipped on in Plan E
+        uses: google/osv-scanner-action/osv-scanner-action@a345acffa64b0eaede81a3d9aae6141214d9c8fc # v2.6.0
         with:
+          # Exits non-zero on any vulnerability that osv-scanner.toml does not
+          # already account for. That file is the ratchet: the backlog is listed
+          # with reasons and expiry dates, so anything new fails this job.
           scan-args: |-
+            --config=osv-scanner.toml
             --lockfile=./pnpm-lock.yaml
             --format=sarif
             --output=osv-results.sarif
       - name: Upload OSV SARIF
         if: always()
-        uses: github/codeql-action/upload-sarif@02c5e83432fe5497fd85b873b6c9f16a8578e1d9 # v3.37.0
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
         with:
           sarif_file: osv-results.sarif
           category: osv-scanner
@@ -73,22 +81,29 @@ jobs:
       security-events: write
     steps:
       - name: Harden the runner
-        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: audit
       - name: Checkout
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Trivy config scan (Dockerfile + docker-compose)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        continue-on-error: true # report-only; enforcement flipped on in Plan E
         with:
           scan-type: config
           scan-ref: .
+          # Named explicitly rather than relying on the default working
+          # directory. Every entry in that file carries its reason.
+          trivyignores: .trivyignore
           format: sarif
           output: trivy-config.sarif
+          # In sarif mode Trivy exits 0 whatever it finds, so removing
+          # continue-on-error is not by itself enforcement. exit-code is.
+          # Scoped to HIGH/CRITICAL to match the tiered policy.
+          severity: 'HIGH,CRITICAL'
+          exit-code: '1'
       - name: Upload Trivy config SARIF
         if: always()
-        uses: github/codeql-action/upload-sarif@02c5e83432fe5497fd85b873b6c9f16a8578e1d9 # v3.37.0
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
         with:
           sarif_file: trivy-config.sarif
           category: trivy-config
@@ -101,23 +116,26 @@ jobs:
       security-events: write
     steps:
       - name: Harden the runner
-        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: audit
       - name: Checkout
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Trivy license scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        continue-on-error: true # report-only; enforcement flipped on in Plan E
         with:
           scan-type: fs
           scan-ref: .
           scanners: license
           format: sarif
           output: trivy-license.sarif
+          # As above: sarif mode exits 0 on its own. HIGH/CRITICAL here means a
+          # license Trivy classifies as forbidden or restricted.
+          severity: 'HIGH,CRITICAL'
+          exit-code: '1'
       - name: Upload Trivy license SARIF
         if: always()
-        uses: github/codeql-action/upload-sarif@02c5e83432fe5497fd85b873b6c9f16a8578e1d9 # v3.37.0
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
         with:
           sarif_file: trivy-license.sarif
           category: trivy-license

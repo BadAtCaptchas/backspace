@@ -1,10 +1,11 @@
 import React, { useRef } from 'react';
+import { useTranslation } from 'react-i18next';
 import type { User } from '@backspace/shared';
-import { Avatar } from '../ui/Avatar';
-import { Username } from '../ui/Username';
+import { ProfileAvatar } from '../ui/ProfileAvatar';
 import { Tooltip } from '../ui/Tooltip';
 import { parseFederatedUsername, isFederationGlobeApplicable } from '../../utils/identity';
 import { useCanonicalUserView } from '../../utils/userViewLookup';
+import { replaceEmojiShortcodes } from '../../utils/emojiShortcodes';
 import {
   useContextMenuStore,
   type ContextMenuItem,
@@ -86,6 +87,7 @@ export function DmMemberRow({
   alwaysShowKebab = false,
   onMenuAction,
 }: DmMemberRowProps) {
+  const { t } = useTranslation(['dm', 'common']);
   const canonical = useCanonicalUserView(member);
   const openContextMenu = useContextMenuStore((s) => s.open);
   const rowRef = useRef<HTMLDivElement>(null);
@@ -101,17 +103,14 @@ export function DmMemberRow({
     items.push({
       key: 'profile',
       type: 'action',
-      label: 'View Profile',
+      label: t('dm:memberRow.viewProfile'),
       onClick: () => {
         // Anchor the popout to this row's bounding rect — matches the
-        // MemberSidebar pattern (see MemberSidebar.tsx:158-165). On mobile
-        // the position arg is ignored by the store (full-screen push).
+        // MemberSidebar pattern (see MemberSidebar.tsx). On mobile the anchor
+        // is ignored by the store (full-screen push).
         const rect = rowRef.current?.getBoundingClientRect();
         if (rect) {
-          useUIStore.getState().openUserProfile(canonical, {
-            top: Math.min(rect.top, window.innerHeight - 450),
-            left: rect.left - 316,
-          });
+          useUIStore.getState().openUserProfile(canonical, rect, 'left');
         } else {
           // Fallback: defer to the consumer if we can't compute a rect
           // (shouldn't happen in practice, but keeps the contract intact).
@@ -128,7 +127,7 @@ export function DmMemberRow({
       items.push({
         key: 'transfer',
         type: 'action',
-        label: 'Transfer Ownership',
+        label: t('dm:memberRow.transferOwnership'),
         onClick: () => onMenuAction('transfer', canonical),
       });
     }
@@ -137,7 +136,7 @@ export function DmMemberRow({
       items.push({
         key: 'kick',
         type: 'action',
-        label: 'Remove from Group',
+        label: t('dm:memberRow.removeFromGroup'),
         danger: true,
         onClick: () => onMenuAction('kick', canonical),
       });
@@ -151,7 +150,7 @@ export function DmMemberRow({
       items.push({
         key: 'remove-friend',
         type: 'action',
-        label: 'Remove Friend',
+        label: t('dm:memberRow.removeFriend'),
         danger: true,
         onClick: () => onMenuAction('remove-friend', canonical),
       });
@@ -183,23 +182,25 @@ export function DmMemberRow({
       className="group flex items-center gap-2.5 px-2 py-1.5 rounded-[6px] hover:bg-interactive-hover transition-colors select-none"
     >
       <div className="flex-shrink-0">
-        <Avatar
+        <ProfileAvatar
           src={canonical.avatar}
           name={displayName}
           size={32}
           status={isOffline ? null : canonical.status}
           user={canonical}
+          placement="left"
         />
       </div>
 
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-1.5 min-w-0">
-          <Username
-            username={displayName}
+          <span
             className={`text-[13.5px] leading-[1.2] font-medium truncate ${
               isOffline ? 'text-txt-tertiary' : 'text-txt-primary'
             }`}
-          />
+          >
+            {displayName}
+          </span>
           {showGlobe && (
             <Tooltip content={canonical.username} position="top">
               <span data-federation-globe className="inline-flex">
@@ -208,7 +209,7 @@ export function DmMemberRow({
             </Tooltip>
           )}
           {isOwner && (
-            <Tooltip content="Group Owner" position="top">
+            <Tooltip content={t('dm:memberRow.ownerTooltip')} position="top">
               <span data-owner-crown className="inline-flex">
                 <CrownIcon />
               </span>
@@ -224,7 +225,7 @@ export function DmMemberRow({
 
         {!isOffline && canonical.customStatus && (
           <div className="text-[11px] leading-[1.3] text-txt-tertiary truncate">
-            {canonical.customStatus}
+            {replaceEmojiShortcodes(canonical.customStatus)}
           </div>
         )}
       </div>
@@ -232,7 +233,7 @@ export function DmMemberRow({
       {showKebab && (
         <button
           type="button"
-          aria-label="Member actions"
+          aria-label={t('dm:memberRow.actions')}
           data-dm-member-kebab
           onClick={handleKebabClick}
           onContextMenu={(e) => {

@@ -9,11 +9,12 @@ Source: `packages/server/src/ws/handler.ts`, `packages/server/src/ws/events.ts`
 ## Auth Flow
 
 1. Client connects to `/ws`
-2. Client sends `{ type: 'auth', token: '<jwt>' }` within 10 seconds
+2. Client sends `{ type: 'auth', token: '<jwt>', client?: 'web' | 'desktop' | 'mobile' }` within 10 seconds. `client` is optional; a missing or unrecognised value is read as `web`. The wire type is the `auth` variant of `ClientEvent` in `packages/shared/src/types.ts`, where the field is typed `ClientKind`
 3. Server validates token (rejects deleted users, tokens issued before `passwordChangedAt`)
 4. Server responds with `ready` event containing full client state
-5. Server updates user status to `online`, broadcasts `presence_update` to friends + DM co-members + space co-members (via `collectProfileBroadcastTargetIds`); for native users, also queues a S2S `presence_update` relay to all active peers
+5. Server sets the user's live status to their chosen status (`users.chosen_status` for an account that owns its choice, native or detached; for a replicated user the home instance's last projection, or `online` if there is none) and carries it in the `ready` payload's `user.status`, broadcasts `presence_update` to friends + DM co-members + space co-members (via `collectProfileBroadcastTargetIds`); for native users, also queues a S2S `presence_update` relay to all active peers
 6. Heartbeat: server pings every 30s (RFC 6455 ping frames), dead connections detected after ~65s
+7. Activity: the auth message writes `users.last_client` (from `client`) and `users.last_active_day`; the first heartbeat pong of each UTC day per connection writes `users.last_active_day` alone, so a client left open for days keeps the day current. Both are day precision (UTC `YYYY-MM-DD`) and the write is skipped once the stored day already equals today, so a user's row is touched at most once per day
 
 ---
 
@@ -22,7 +23,7 @@ Source: `packages/server/src/ws/handler.ts`, `packages/server/src/ws/events.ts`
 ### Messages
 | type | fields | notes |
 |------|--------|-------|
-| `message_create` | channelId, content, replyToId? | SEND_MESSAGES perm |
+| `message_create` | channelId, content, replyToId? | SEND_MESSAGES perm; `replyToId` must name a message in the same channel |
 | `message_edit` | messageId, content | author only |
 | `message_delete` | messageId | author or MANAGE_MESSAGES |
 | `typing_start` | channelId | 5s auto-expire |
@@ -30,7 +31,7 @@ Source: `packages/server/src/ws/handler.ts`, `packages/server/src/ws/events.ts`
 ### DM Messages
 | type | fields | notes |
 |------|--------|-------|
-| `dm_message_create` | dmChannelId, content?, attachments?, replyToId? | member |
+| `dm_message_create` | dmChannelId, content?, attachments?, replyToId? | member; `replyToId` must name a message in the same DM channel |
 | `dm_message_edit` | messageId, content | author only |
 | `dm_message_delete` | messageId | author only |
 | `dm_typing_start` | dmChannelId | 5s auto-expire |
@@ -50,7 +51,7 @@ Source: `packages/server/src/ws/handler.ts`, `packages/server/src/ws/events.ts`
 ### Presence & Activity
 | type | fields | notes |
 |------|--------|-------|
-| `presence_update` | status: online/idle/dnd | persisted to DB |
+| `presence_update` | status: online/idle/dnd | stored as the user's chosen status and published while connected; same path as `PATCH /api/users/@me { status }` (activity-presence.md "DB Persistence") |
 | `activity_update` | activities: Activity[] | rate-limited 3s, respects showActivity |
 
 ### Voice (Space Channels)
@@ -67,6 +68,8 @@ Source: `packages/server/src/ws/handler.ts`, `packages/server/src/ws/events.ts`
 | `voice_space_deafen` | userId, deafened | DEAFEN_MEMBERS |
 | `voice_move` | userId, targetChannelId | MOVE_MEMBERS |
 | `voice_disconnect` | userId | DISCONNECT_MEMBERS |
+
+All four also need the actor to outrank the target (permissions.md, "Role hierarchy"); a refusal is an `error` with `code: 'role_hierarchy'`.
 
 ### DM Calls
 | type | fields | notes |
@@ -91,18 +94,24 @@ Source: `packages/server/src/ws/handler.ts`, `packages/server/src/ws/events.ts`
 |------|--------|-------|
 | `ready` | (see Ready Payload below) | user |
 | `pong` | — | user |
-| `error` | message | user |
+| `error` | message, code? | user |
 
 ### Messages
 | type | fields | scope |
 |------|--------|-------|
 | `message_created` | message: MessageWithUser | channel (VIEW_CHANNEL) |
-| `message_updated` | message: MessageWithUser | channel |
-| `message_deleted` | messageId, channelId | channel |
-| `typing` | channelId, userId, username | channel (excludes sender) |
-| `reaction_added` | messageId, reaction (includes user) | channel |
-| `reaction_removed` | messageId, userId, emoji | channel |
-| `embeds_resolved` | messageId, channelId, embeds[] | channel |
+| `message_updated` | message: MessageWithUser | channel (VIEW_CHANNEL) |
+| `message_deleted` | messageId, channelId | channel (VIEW_CHANNEL) |
+| `typing` | channelId, userId, username | channel (VIEW_CHANNEL, excludes sender) |
+| `reaction_added` | messageId, reaction (includes user) | channel (VIEW_CHANNEL) |
+| `reaction_removed` | messageId, userId, emoji | channel (VIEW_CHANNEL) |
+| `embeds_resolved` | messageId, channelId, embeds[] | channel (VIEW_CHANNEL) |
+
+In a space channel every event above is emitted with
+`connectionManager.sendToChannel`, from the REST route and from the WebSocket
+handler alike, so both paths reach the same audience. (`reaction_added` and
+`reaction_removed` are reused on the DM path, where they go out with
+`sendToDmMembers`.) See permissions.md, "Broadcast audience".
 
 ### DM Messages
 | type | fields | scope |
@@ -123,7 +132,7 @@ Source: `packages/server/src/ws/handler.ts`, `packages/server/src/ws/events.ts`
 ### Presence & Activity
 | type | fields | scope |
 |------|--------|-------|
-| `presence_update` | userId, status, activities? | friends + DM co-members + space co-members of the user (via `collectProfileBroadcastTargetIds`), plus self for multi-tab sync. For federated stubs, the local instance receives status via S2S `presence_update` relay from the home (see `federation.md` §10 — Presence Sync) and re-broadcasts to the same recipient set. |
+| `presence_update` | userId, status, activities?, homeUserId?, homeInstance? | friends + DM co-members + space co-members of the user (via `collectProfileBroadcastTargetIds`), plus self for multi-tab sync. For federated stubs, the local instance receives status and activities via S2S `presence_update` relay from the home (see `federation.md` §10 — Presence Sync) and re-broadcasts to the same recipient set, with `activities` whenever the relay changed them (empty clears). `activities` absent = unchanged. `homeUserId`/`homeInstance` are the subject row's federated identity, both null for a row native to this instance; the client keys activities and friend status by that identity (activity-presence.md "Keying"). Every emitter builds the event with `presenceUpdateFor`/`presenceUpdateEvent` (`ws/presenceEvent.ts`). Also sent when a friendship is created: each side gets the other's current status and activities (activity-presence.md "Friendship Snapshot"). Servers that predate the identity fields omit them. |
 | `user_updated` | user | user |
 
 ### Space / Channel Management
@@ -154,9 +163,9 @@ Source: `packages/server/src/ws/handler.ts`, `packages/server/src/ws/events.ts`
 ### Voice
 | type | fields | scope |
 |------|--------|-------|
-| `voice_state_update` | channelId, userId, action: join/leave | space |
+| `voice_state_update` | channelId, userId, action: join/leave, channelElapsedSeconds? | space |
 | `voice_status_update` | userId, channelId, isMuted, isDeafened, isCameraOn, isScreenSharing | room |
-| `space_voice_state` | spaceId, voiceStates, voiceUserStates, spaceVoiceStates | the joining user. Scoped per-space voice-presence snapshot pushed when a user joins a space mid-session (see below). |
+| `space_voice_state` | spaceId, voiceStates, voiceChannelElapsedSeconds, voiceUserStates, spaceVoiceStates | the joining user. Scoped per-space voice-presence snapshot pushed when a user joins a space mid-session (see below). |
 | `voice_space_muted` | userId, channelId, spaceId, muted | space |
 | `voice_space_deafened` | userId, channelId, spaceId, deafened | space |
 | `voice_permission_muted` | userId, spaceId, muted | space |
@@ -216,20 +225,22 @@ reason: `'displaced'` (new tab) | `'session_closed'`
   spaceLayout?: SpaceLayoutItem[] | null,
   layoutUpdatedAt?: number,
   voiceStates?: Record<channelId, userId[]>,
+  voiceChannelElapsedSeconds?: Record<channelId, number>,
   voiceUserStates?: Record<string, { isMuted, isDeafened, isCameraOn, isScreenSharing }>,
   spaceVoiceStates?: Record<string, { spaceMuted, spaceDeafened, permissionMuted }>,
   readStates?: ReadState[],
   activeCalls?: ActiveCallInfo[],  // includes federatedCallHost?, livekitUrl?, livekitToken? for federated calls
-  userActivities?: Record<userId, Activity[]>,
+  userActivities?: Record<userId, Activity[]>,  // space members, DM members and friends; keys are this instance's row ids
+  userActivityIdentities?: Record<userId, { homeUserId: string | null, homeInstance: string | null }>,  // identity of each userActivities key; null pair = native row
   rejectedPeerOrigins: string[],         // origins with status 'rejected'; used for DM unreachable indicators
   awaitingApprovalPeerOrigins: string[], // origins with status 'awaiting_approval'
   pendingApprovalCount: number           // count of peer_approval_requests rows; only non-zero for admins
 }
 ```
 
-**Federation filtering:** When the connecting user is federated (`homeInstance` is set), the server omits all DM-related data from the ready payload. `dmChannels` and `activeCalls` are sent as empty arrays, and `readStates` is filtered to only include space channel entries. Federated users receive their DM data from their home instance's ready payload instead.
+**Federated users:** When the connecting user is federated (`homeInstance` is set), the ready payload carries their DMs on this instance like anyone else's: `dmChannels` (this instance's copies, each with its `federatedId`, which is how the client shows a conversation it also gets from the user's home once) and `activeCalls` for those memberships. `readStates` is filtered to the space channels and DMs in the payload, and a DM with messages but no read state yet gets one at its newest message, so conversations mirrored here before the user first connected do not show as unread.
 
-**Voice-state assembly:** `voiceStates` / `voiceUserStates` / `spaceVoiceStates` for each of the user's spaces are produced by `ConnectionManager.buildSpaceVoiceState(spaceId, userId)` — the single source of truth shared with the mid-session join push (see below). Voice presence is VIEW_CHANNEL-filtered per `computePermissions`: a user is never told who occupies a voice channel they cannot see.
+**Voice-state assembly:** `voiceStates` / `voiceChannelElapsedSeconds` / `voiceUserStates` / `spaceVoiceStates` for each of the user's spaces are produced by `ConnectionManager.buildSpaceVoiceState(spaceId, userId)` — the single source of truth shared with the mid-session join push (see below). `voiceChannelElapsedSeconds` is a whole-second duration computed from the in-memory `VoiceRoom.startedAt`; clients advance that duration from receipt time, so server/client clock skew cannot change the value. It disappears when the room becomes empty. Because rooms are intentionally in-memory, a server restart clears both occupancy and its duration until participants reconnect; this is not persisted to the database. Voice presence is VIEW_CHANNEL-filtered per `computePermissions`: a user is never told who occupies a voice channel they cannot see.
 
 ### Mid-session space join — `space_voice_state` push
 

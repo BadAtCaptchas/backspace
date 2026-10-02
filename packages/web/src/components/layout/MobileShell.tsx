@@ -1,7 +1,10 @@
 import React, { useEffect } from 'react';
+import { useTranslation } from 'react-i18next';
+import i18n from '../../i18n';
 import { useUIStore } from '../../stores/uiStore';
 import { useVoiceStore } from '../../stores/voiceStore';
 import { useLocation } from 'react-router-dom';
+import { useMobileRouteSync } from '../../hooks/useMobileRouteSync';
 import { MobileScreenStack } from './MobileScreenStack';
 import { MobileBottomNav } from './MobileBottomNav';
 import { useSwipeGesture } from '../../hooks/useSwipeGesture';
@@ -20,14 +23,21 @@ import { MobileVoiceFullScreen } from './MobileVoiceFullScreen';
 import { MobileMembersScreen } from './MobileMembersScreen';
 import { MobileGroupDmInfo } from './MobileGroupDmInfo';
 import { FriendsPage } from '../chat/FriendsPage';
+import { ProjectHubPage } from '../projectHub/ProjectHubPage';
+import type { ProjectLinks } from '../../utils/projectLinks';
 import { ExplorePage } from '../chat/ExplorePage';
 import { UserProfileModal } from '../modals/UserProfileModal';
-import { GeneralPanel } from '../modals/instanceSettingsPanels/GeneralPanel';
-import { RegistrationPanel } from '../modals/instanceSettingsPanels/RegistrationPanel';
-import { FederationPanel } from '../modals/instanceSettingsPanels/FederationPanel';
-import { StreamingPanel } from '../modals/instanceSettingsPanels/StreamingPanel';
-import { StoragePanel } from '../modals/instanceSettingsPanels/StoragePanel';
-import { UsersPanel } from '../modals/instanceSettingsPanels/UsersPanel';
+import {
+  GeneralPanel,
+  UpdatesPanel,
+  TelemetryPanel,
+  RegistrationPanel,
+  FederationPanel,
+  StreamingPanel,
+  StoragePanel,
+  UsersPanel,
+  SettingsPanelSuspense,
+} from '../modals/lazySettingsPanels';
 
 /**
  * Wrapper for the Federation sub-panel that forwards FederationPanel's
@@ -36,22 +46,42 @@ import { UsersPanel } from '../modals/instanceSettingsPanels/UsersPanel';
  * the panel approving/denying requests.
  */
 function MobileFederationPanelWrapper() {
+  const { t } = useTranslation('settings');
   const setApprovalCount = useUIStore((s) => s.setFederationApprovalCount);
   return (
     <div className="flex flex-col h-full bg-surface-base">
-      <MobileScreenHeader title="Federation" rightActions={<TransferIndicator />} />
+      <MobileScreenHeader title={t('instance.tabs.federation')} rightActions={<TransferIndicator />} />
       <div className="flex-1 overflow-y-auto p-4">
-        <FederationPanel onApprovalCountChange={setApprovalCount} />
+        <SettingsPanelSuspense><FederationPanel onApprovalCountChange={setApprovalCount} /></SettingsPanelSuspense>
       </div>
     </div>
   );
 }
 
-const screenMap: Record<string, (params?: Record<string, string>) => React.ReactNode> = {
+/**
+ * The Backspace page as a pushed screen: the screen header in place of the
+ * page's own top bar. `links` defaults to the real constant, as on the page;
+ * the design workbench passes filled-in values.
+ */
+export function MobileBackspaceScreen({ links }: { links?: ProjectLinks }) {
+  const { t } = useTranslation('project');
+  return (
+    <div className="flex flex-col h-full bg-surface-base">
+      <MobileScreenHeader title={t('nav.label')} />
+      {/* min-h-0 lets this fill only what the header leaves: the page's root
+          is h-full, which as a direct flex item would floor its height at the
+          whole screen and push its last 48px under the stack's clip. */}
+      <div className="flex-1 min-h-0 flex flex-col"><ProjectHubPage links={links} showTopBar={false} /></div>
+    </div>
+  );
+}
+
+export const mobileScreenMap: Readonly<Record<string, (params?: Record<string, string>) => React.ReactNode>> = {
   'channel-chat': (params) => <MobileChatScreen params={params} />,
   'friends': () => <FriendsPage mobile />,
   'settings': () => <MobileSettingsScreen />,
   'settings-account': () => <MobileSettingsScreen initialPanel="account" />,
+  'settings-appearance': () => <MobileSettingsScreen initialPanel="appearance" />,
   'settings-voice': () => <MobileSettingsScreen initialPanel="voice" />,
   'settings-privacy': () => <MobileSettingsScreen initialPanel="privacy" />,
   'settings-connections': () => <MobileSettingsScreen initialPanel="connections" />,
@@ -60,44 +90,62 @@ const screenMap: Record<string, (params?: Record<string, string>) => React.React
   'settings-instance': () => <MobileInstancePanel />,
   'settings-instance-general': () => (
     <div className="flex flex-col h-full bg-surface-base">
-      <MobileScreenHeader title="General" rightActions={<TransferIndicator />} />
-      <div className="flex-1 overflow-y-auto p-4"><GeneralPanel /></div>
+      <MobileScreenHeader title={i18n.t('settings:instance.tabs.general')} rightActions={<TransferIndicator />} />
+      <div className="flex-1 overflow-y-auto p-4"><SettingsPanelSuspense><GeneralPanel /></SettingsPanelSuspense></div>
     </div>
   ),
   'settings-instance-registration': () => (
     <div className="flex flex-col h-full bg-surface-base">
-      <MobileScreenHeader title="Registration" rightActions={<TransferIndicator />} />
-      <div className="flex-1 overflow-y-auto p-4"><RegistrationPanel /></div>
+      <MobileScreenHeader title={i18n.t('settings:instance.tabs.registration')} rightActions={<TransferIndicator />} />
+      <div className="flex-1 overflow-y-auto p-4"><SettingsPanelSuspense><RegistrationPanel /></SettingsPanelSuspense></div>
     </div>
   ),
   'settings-instance-federation': () => <MobileFederationPanelWrapper />,
   'settings-instance-streaming': () => (
     <div className="flex flex-col h-full bg-surface-base">
-      <MobileScreenHeader title="Streaming" rightActions={<TransferIndicator />} />
-      <div className="flex-1 overflow-y-auto p-4"><StreamingPanel /></div>
+      <MobileScreenHeader title={i18n.t('settings:instance.tabs.streaming')} rightActions={<TransferIndicator />} />
+      <div className="flex-1 overflow-y-auto p-4"><SettingsPanelSuspense><StreamingPanel /></SettingsPanelSuspense></div>
     </div>
   ),
   'settings-instance-storage': () => (
     <div className="flex flex-col h-full bg-surface-base">
-      <MobileScreenHeader title="Storage" rightActions={<TransferIndicator />} />
-      <div className="flex-1 overflow-y-auto p-4"><StoragePanel /></div>
+      <MobileScreenHeader title={i18n.t('settings:instance.tabs.storage')} rightActions={<TransferIndicator />} />
+      <div className="flex-1 overflow-y-auto p-4"><SettingsPanelSuspense><StoragePanel /></SettingsPanelSuspense></div>
+    </div>
+  ),
+  'settings-instance-updates': () => (
+    <div className="flex flex-col h-full bg-surface-base">
+      <MobileScreenHeader title={i18n.t('settings:instance.tabs.updates')} rightActions={<TransferIndicator />} />
+      <div className="flex-1 overflow-y-auto p-4"><SettingsPanelSuspense><UpdatesPanel /></SettingsPanelSuspense></div>
     </div>
   ),
   'settings-instance-users': () => (
     <div className="flex flex-col h-full bg-surface-base">
-      <MobileScreenHeader title="Users" rightActions={<TransferIndicator />} />
-      <div className="flex-1 overflow-y-auto p-4"><UsersPanel /></div>
+      <MobileScreenHeader title={i18n.t('settings:instance.tabs.users')} rightActions={<TransferIndicator />} />
+      <div className="flex-1 overflow-y-auto p-4"><SettingsPanelSuspense><UsersPanel /></SettingsPanelSuspense></div>
+    </div>
+  ),
+  'settings-instance-telemetry': () => (
+    <div className="flex flex-col h-full bg-surface-base">
+      <MobileScreenHeader title={i18n.t('settings:instance.tabs.telemetry')} rightActions={<TransferIndicator />} />
+      <div className="flex-1 overflow-y-auto p-4"><SettingsPanelSuspense><TelemetryPanel /></SettingsPanelSuspense></div>
     </div>
   ),
   'members': (params) => <MobileMembersScreen params={params} />,
   'group-dm-info': (params) => <MobileGroupDmInfo params={params} />,
   'voice-full': () => <MobileVoiceFullScreen />,
   'explore': () => <ExplorePage />,
+  'backspace': () => <MobileBackspaceScreen />,
   'user-profile': (params) => {
     // Open the user profile modal with the userId from params
     if (params?.userId) {
-      // Set modalData so UserProfileModal can read it
-      useUIStore.getState().openModal('userProfile', { userId: params.userId });
+      // Set modalData so UserProfileModal can read it. A profile opened for a
+      // space member carries that member, so the modal can show their roles
+      // and read their user from the space rather than the home instance.
+      const member = params.spaceId && params.memberUserId
+        ? { spaceId: params.spaceId, userId: params.memberUserId }
+        : null;
+      useUIStore.getState().openModal('userProfile', { userId: params.userId, member });
     }
     return <UserProfileModal />;
   },
@@ -106,7 +154,6 @@ const screenMap: Record<string, (params?: Record<string, string>) => React.React
 export function MobileShell() {
   const mobileScreen = useUIStore((s) => s.mobileScreen);
   const popMobileScreen = useUIStore((s) => s.popMobileScreen);
-  const pushMobileScreen = useUIStore((s) => s.pushMobileScreen);
   const mobileStack = useUIStore((s) => s.mobileStack);
   const currentVoiceChannelId = useVoiceStore((s) => s.currentVoiceChannelId);
   const location = useLocation();
@@ -121,52 +168,7 @@ export function MobileShell() {
     enabled: mobileStack.length > 0,
   });
 
-  // Reconstruct mobile stack from URL on mount AND on subsequent pathname
-  // changes (deep link, refresh, programmatic navigate from SpaceInviteCard
-  // Join, joinByCode flows, etc.).
-  //
-  // Subscribes to `location.pathname` only — NOT to `mobileStack`. This is
-  // important because pushing an unrelated screen (e.g. settings) must not
-  // re-trigger this effect; otherwise we would re-push the channel-chat on
-  // top of every newly-pushed screen, since pathname is still `/channels/...`.
-  // We read the current stack imperatively via `useUIStore.getState()` for
-  // the idempotency guard.
-  //
-  // Idempotency guard: callers like MobileSpacesScreen call BOTH
-  // `pushMobileScreen('channel-chat', …)` AND `navigate('/channels/…')`.
-  // The pushMobileScreen call alone doesn't change pathname (history.pushState
-  // with no URL preserves it), but the navigate call does — and that pathname
-  // change re-runs this effect after the screen is already on top. The guard
-  // below catches that case by inspecting the topmost stack entry. We also
-  // guard against the popstate path: when the user navigates back, popstate
-  // pops both the browser history AND our stack; the resulting pathname change
-  // matches the new top entry, so we skip.
-  useEffect(() => {
-    const path = location.pathname;
-    const match = path.match(/^\/channels\/([^/]+)\/([^/]+)$/);
-    if (!match) return;
-    const spaceId = match[1] ?? '';
-    const channelId = match[2] ?? '';
-    const normalizedSpaceId = spaceId === '@me' ? '@me' : spaceId;
-
-    // Read current stack imperatively to avoid re-firing on stack changes.
-    const currentStack = useUIStore.getState().mobileStack;
-    const top = currentStack[currentStack.length - 1];
-    if (
-      top &&
-      top.screen === 'channel-chat' &&
-      top.params?.channelId === channelId &&
-      top.params?.spaceId === normalizedSpaceId
-    ) {
-      return;
-    }
-
-    // If the stack has channel-chat entries for OTHER channels, we still push
-    // — this preserves back-stack semantics for in-app navigation (e.g. tapping
-    // a SpaceInviteCard Join button while inside a chat should stack the new
-    // channel on top so back returns to the originating chat).
-    pushMobileScreen('channel-chat', { channelId, spaceId: normalizedSpaceId });
-  }, [location.pathname, pushMobileScreen]);
+  useMobileRouteSync(location.pathname);
 
   // Sync browser back button with mobile stack
   useEffect(() => {
@@ -180,8 +182,8 @@ export function MobileShell() {
   }, [popMobileScreen]);
 
   const rootScreens: Record<string, React.ReactNode> = {
-    spaces: <MobileSpacesScreen />,
-    dms: <MobileDmsScreen />,
+    spaces: <MobileSpacesScreen />, // i18n-check: allow-literal (object keys, not JSX text)
+    dms: <MobileDmsScreen />, // i18n-check: allow-literal (object keys, not JSX text)
     you: <MobileYouScreen />,
   };
 
@@ -194,13 +196,13 @@ export function MobileShell() {
   // the iOS-PWA-specific fallback (focusin polling) that updates `height`
   // even when no `resize` event ever lands.
   const { keyboardOpen, height: vvHeight } = useVisualViewportInset();
-  const shellHeight = keyboardOpen && vvHeight !== null ? `${vvHeight}px` : '100dvh';
+  const shellHeight = keyboardOpen && vvHeight !== null ? `${vvHeight}px` : 'calc(100*var(--app-dvh))';
 
   return (
     <div className="flex flex-col" style={{ height: shellHeight }}>
       <MobileScreenStack
         rootScreen={rootScreens[mobileScreen]}
-        screenMap={screenMap}
+        screenMap={mobileScreenMap}
       />
 
       {/* Voice mini-bar — shown when in a voice call */}

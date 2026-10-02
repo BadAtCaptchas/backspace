@@ -12,22 +12,63 @@ export interface ScreenShareConfig {
   mode: 'gaming' | 'text';
   customBitrateKbps: number | null;
   shareAudio: boolean;
+  codec: 'vp9' | 'h264';
+}
+
+/**
+ * What the live screen share has in the way of system audio. Kept apart from
+ * `ScreenShareConfig.shareAudio`, which is the user's preference: a share can
+ * want audio and have none (a browser capture without it, a failed loopback).
+ *
+ * - `published`: the audio track is on the publication.
+ * - `held`: captured, but withdrawn by the toggle; turning it on republishes it.
+ * - `acquiring`: a loopback capture for the running share is being taken.
+ * - `acquirable`: nothing captured, and the desktop app can add loopback audio
+ *   for the same source without a prompt.
+ * - `unavailable`: nothing captured and no silent way to add it (browsers
+ *   grant audio only with the capture; portal and prompted desktop pickers
+ *   would ask again).
+ */
+export type ScreenShareAudioState = 'published' | 'held' | 'acquiring' | 'acquirable' | 'unavailable';
+
+export type VoiceConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'reconnecting';
+export type VoiceConnectionQuality = 'excellent' | 'good' | 'poor' | 'lost' | 'unknown';
+
+export interface VoiceChannelElapsed {
+  /** Whole seconds reported by the server when this snapshot was received. */
+  elapsedSeconds: number;
+  /** Local receipt time; only subsequent progression uses the client clock. */
+  observedAt: number;
 }
 
 interface VoiceState {
   voiceUsers: Map<string, string[]>; // channelId → userIds
+  voiceChannelElapsedSeconds: Map<string, VoiceChannelElapsed>; // channelId → server duration + local observation time
   currentVoiceChannelId: string | null;
   isMuted: boolean;
   isDeafened: boolean;
   isCameraOn: boolean;
   isScreenSharing: boolean;
+  /**
+   * Origin of the instance that issued the current LiveKit token (`''` = home),
+   * recorded by `useLiveKit.connect`. That instance hosts the room, so its
+   * streaming limits are the ones a screen share obeys. Null when the token was
+   * relayed from an instance this client holds no session with (a federated DM
+   * call hosted elsewhere): its limits cannot be asked for. Not persisted.
+   */
+  livekitHostOrigin: string | null;
+  /** System audio of the live share; null while not sharing. Not persisted. */
+  screenShareAudio: ScreenShareAudioState | null;
   participants: ParticipantInfo[];
   speakingParticipantIds: Set<string>;
   speakingUserIds: Set<string>;
   connectionError: string | null;
   isLiveKitConnected: boolean;
-  connectionQuality: 'excellent' | 'good' | 'poor' | 'lost' | 'unknown';
-  setConnectionQuality: (q: 'excellent' | 'good' | 'poor' | 'lost' | 'unknown') => void;
+  voiceConnectionStatus: VoiceConnectionStatus;
+  setVoiceConnectionStatus: (status: VoiceConnectionStatus) => void;
+  connectionQuality: VoiceConnectionQuality;
+  connectionQualities: Map<string, VoiceConnectionQuality>;
+  setConnectionQuality: (q: VoiceConnectionQuality, identity?: string) => void;
   inputVolume: number;  // 0-200 (100 = default)
   outputVolume: number; // 0-200 (100 = default)
   inputDeviceId: string;
@@ -35,6 +76,13 @@ interface VoiceState {
   cameraDeviceId: string | null; // null = auto-select on next camera enable
   focusedParticipantId: string | null;
   screenShareConfig: ScreenShareConfig;
+  /**
+   * The source shared last time, so the setup screen can stage it again
+   * without being asked. Desktop only: browsers do not let the page name a
+   * source. Screen ids survive a restart, window ids do not, so a remembered
+   * window simply stops matching and the grid is shown instead.
+   */
+  lastScreenShareSourceId: string | null;
   // Per-participant volume (userId → 0-200, 100 = default)
   participantVolumes: Map<string, number>;
   setParticipantVolume: (userId: string, volume: number) => void;
@@ -55,6 +103,8 @@ interface VoiceState {
   setSoundEffectVolume: (volume: number) => void;
   messageSoundAllChannels: boolean;          // false (default) = DM + mention only; true = every channel
   setMessageSoundAllChannels: (allChannels: boolean) => void;
+  pipEnabled: boolean;                       // true (default) = floating window shows while browsing other channels
+  setPipEnabled: (enabled: boolean) => void;
   streamAttenuationEnabled: boolean;        // global toggle, default true
   streamAttenuationStrength: number;        // 0-100, default 50
   setStreamVolume: (userId: string, volume: number) => void;
@@ -83,6 +133,7 @@ interface VoiceState {
   setFederatedCallId: (id: string | null) => void;
   setCallOrigin: (origin: string | null) => void;
   setVoiceUsers: (channelId: string, userIds: string[]) => void;
+  setVoiceChannelElapsedSeconds: (channelId: string, elapsedSeconds: number | null) => void;
   addVoiceUser: (channelId: string, userId: string) => void;
   removeVoiceUser: (channelId: string, userId: string) => void;
   setCurrentVoiceChannel: (channelId: string | null) => void;
@@ -105,8 +156,7 @@ interface VoiceState {
   toggleDeafen: () => void;
   setFocusedParticipant: (id: string | null) => void;
   setScreenShareConfig: (config: Partial<ScreenShareConfig>) => void;
-  hwOverdrive: boolean;
-  setHwOverdrive: (enabled: boolean) => void;
+  setLastScreenShareSourceId: (sourceId: string | null) => void;
   noiseSuppression: boolean;
   echoCancellation: boolean;
   autoGainControl: boolean;
@@ -153,30 +203,59 @@ interface VoiceState {
   reset: () => void;
 }
 
+/**
+ * True while this client is in a voice session that a page reload would end:
+ * - a LiveKit room that is live, being joined or reconnecting;
+ * - a DM call ringing in either direction. The caller is not in LiveKit until
+ *   `dm_call_accepted`, and the server tears the ringing room down when the
+ *   caller's socket goes away; the callee's ring prompt lives only in this
+ *   store and is not replayed after a reload;
+ * - an accepted DM call on its way into LiveKit (the caller between
+ *   `dm_call_accepted` and the connect setting 'connecting').
+ *
+ * Not a session: a space channel or DM call kept after LiveKit gave up
+ * reconnecting (status 'disconnected' with a `connectionError`). The store
+ * keeps them only so the UI can offer a retry, nothing is live, and a laptop
+ * that slept in a call would otherwise count as in one for days.
+ */
+export function hasVoiceSession(
+  state: Pick<VoiceState, 'voiceConnectionStatus' | 'connectionError' | 'activeDmCall' | 'outgoingCall' | 'incomingCall'>,
+): boolean {
+  if (state.voiceConnectionStatus !== 'disconnected') return true;
+  if (state.outgoingCall !== null || state.incomingCall !== null) return true;
+  return state.activeDmCall !== null && state.connectionError === null;
+}
+
 export const useVoiceStore = create<VoiceState>()(
   persist(
     (set, get) => ({
       voiceUsers: new Map(),
+      voiceChannelElapsedSeconds: new Map(),
       currentVoiceChannelId: null,
       isMuted: false,
       pttActive: false,
       isDeafened: false,
       isCameraOn: false,
       isScreenSharing: false,
+      screenShareAudio: null,
+      livekitHostOrigin: '',
       micPermissionDenied: false,
       participants: [],
       speakingParticipantIds: new Set(),
       speakingUserIds: new Set(),
       connectionError: null,
       isLiveKitConnected: false,
+      voiceConnectionStatus: 'disconnected',
       connectionQuality: 'unknown',
+      connectionQualities: new Map(),
       inputVolume: 100,
       outputVolume: 100,
       inputDeviceId: 'default',
       outputDeviceId: 'default',
       cameraDeviceId: null,
       focusedParticipantId: null,
-      screenShareConfig: { height: 720, fps: 60, mode: 'gaming', customBitrateKbps: null, shareAudio: !isElectron() },
+      screenShareConfig: { height: 720, fps: 60, mode: 'gaming', customBitrateKbps: null, shareAudio: !isElectron(), codec: 'vp9' },
+      lastScreenShareSourceId: null,
       participantVolumes: new Map(),
       setParticipantVolume: (userId, volume) => {
         set((state) => {
@@ -200,6 +279,8 @@ export const useVoiceStore = create<VoiceState>()(
       setSoundEffectVolume: (volume) => set({ soundEffectVolume: volume }),
       messageSoundAllChannels: false,
       setMessageSoundAllChannels: (allChannels) => set({ messageSoundAllChannels: allChannels }),
+      pipEnabled: true,
+      setPipEnabled: (enabled) => set({ pipEnabled: enabled }),
 
       // Stream widget state
       streamVolumes: new Map(),
@@ -329,6 +410,21 @@ export const useVoiceStore = create<VoiceState>()(
         });
       },
 
+      setVoiceChannelElapsedSeconds: (channelId, elapsedSeconds) => {
+        set((state) => {
+          const next = new Map(state.voiceChannelElapsedSeconds);
+          if (elapsedSeconds === null) {
+            next.delete(channelId);
+          } else if (Number.isFinite(elapsedSeconds)) {
+            next.set(channelId, {
+              elapsedSeconds: Math.max(0, Math.floor(elapsedSeconds)),
+              observedAt: Date.now(),
+            });
+          }
+          return { voiceChannelElapsedSeconds: next };
+        });
+      },
+
       addVoiceUser: (channelId, userId) => {
         set((state) => {
           const newMap = new Map(state.voiceUsers);
@@ -344,8 +440,13 @@ export const useVoiceStore = create<VoiceState>()(
         set((state) => {
           const newMap = new Map(state.voiceUsers);
           const current = newMap.get(channelId) ?? [];
-          newMap.set(channelId, current.filter(id => id !== userId));
-          return { voiceUsers: newMap };
+          const remaining = current.filter(id => id !== userId);
+          newMap.set(channelId, remaining);
+          if (remaining.length > 0) return { voiceUsers: newMap };
+
+          const voiceChannelElapsedSeconds = new Map(state.voiceChannelElapsedSeconds);
+          voiceChannelElapsedSeconds.delete(channelId);
+          return { voiceUsers: newMap, voiceChannelElapsedSeconds };
         });
       },
 
@@ -365,7 +466,13 @@ export const useVoiceStore = create<VoiceState>()(
       },
       setConnectionError: (error) => set({ connectionError: error }),
       setIsLiveKitConnected: (connected) => set({ isLiveKitConnected: connected }),
-      setConnectionQuality: (quality) => set({ connectionQuality: quality }),
+      setVoiceConnectionStatus: (voiceConnectionStatus) => set({ voiceConnectionStatus }),
+      setConnectionQuality: (quality, identity) => set((state) => {
+        if (!identity) return { connectionQuality: quality };
+        const connectionQualities = new Map(state.connectionQualities);
+        connectionQualities.set(identity, quality);
+        return { connectionQualities };
+      }),
 
       setInputVolume: (volume) => {
         set({ inputVolume: volume });
@@ -438,12 +545,10 @@ export const useVoiceStore = create<VoiceState>()(
       toggleScreenShare: () => set((state) => ({ isScreenSharing: !state.isScreenSharing })),
 
       setFocusedParticipant: (id) => set({ focusedParticipantId: id }),
+      setLastScreenShareSourceId: (sourceId) => set({ lastScreenShareSourceId: sourceId }),
       setScreenShareConfig: (config) => set((state) => ({
         screenShareConfig: { ...state.screenShareConfig, ...config },
       })),
-      // Hardware H.264 override — transient (intentionally excluded from partialize for non-persisted behavior)
-      hwOverdrive: false,
-      setHwOverdrive: (enabled) => set({ hwOverdrive: enabled }),
       noiseSuppression: true,
       echoCancellation: true,
       autoGainControl: true,
@@ -508,12 +613,16 @@ export const useVoiceStore = create<VoiceState>()(
 
       getVoiceUsers: (channelId) => get().voiceUsers.get(channelId) ?? [],
 
-      clearAllVoiceUsers: () => set({ voiceUsers: new Map(), voiceUserStates: new Map() }),
+      clearAllVoiceUsers: () => set({
+        voiceUsers: new Map(),
+        voiceChannelElapsedSeconds: new Map(),
+        voiceUserStates: new Map(),
+      }),
 
       resetSession: () => set({
         // Connection state
-        hwOverdrive: false,
         voiceUsers: new Map(),
+        voiceChannelElapsedSeconds: new Map(),
         voiceUserStates: new Map(),
         currentVoiceChannelId: null,
         participants: [],
@@ -521,7 +630,9 @@ export const useVoiceStore = create<VoiceState>()(
         speakingUserIds: new Set(),
         connectionError: null,
         isLiveKitConnected: false,
+        voiceConnectionStatus: 'disconnected',
         connectionQuality: 'unknown',
+        connectionQualities: new Map(),
         focusedParticipantId: null,
         // Call state
         incomingCall: null,
@@ -552,12 +663,14 @@ export const useVoiceStore = create<VoiceState>()(
         const { channelOriginMap } = useSpaceStore.getState();
         set((state) => {
           const newVoiceUsers = new Map(state.voiceUsers);
+          const voiceChannelElapsedSeconds = new Map(state.voiceChannelElapsedSeconds);
           for (const [channelId] of newVoiceUsers) {
             if ((channelOriginMap.get(channelId) ?? '') === origin) {
               newVoiceUsers.delete(channelId);
+              voiceChannelElapsedSeconds.delete(channelId);
             }
           }
-          return { voiceUsers: newVoiceUsers };
+          return { voiceUsers: newVoiceUsers, voiceChannelElapsedSeconds };
         });
       },
 
@@ -568,17 +681,20 @@ export const useVoiceStore = create<VoiceState>()(
 
         set((state) => {
           // Optimistic: immediately remove self from the channel's voice users
-          const voiceUsers = (channelId && myId)
-            ? (() => {
-                const m = new Map(state.voiceUsers);
-                m.set(channelId, (m.get(channelId) ?? []).filter(id => id !== myId));
-                return m;
-              })()
-            : state.voiceUsers;
+          let voiceUsers = state.voiceUsers;
+          let voiceChannelElapsedSeconds = state.voiceChannelElapsedSeconds;
+          if (channelId && myId) {
+            const remaining = (state.voiceUsers.get(channelId) ?? []).filter(id => id !== myId);
+            voiceUsers = new Map(state.voiceUsers);
+            voiceUsers.set(channelId, remaining);
+            if (remaining.length === 0) {
+              voiceChannelElapsedSeconds = new Map(state.voiceChannelElapsedSeconds);
+              voiceChannelElapsedSeconds.delete(channelId);
+            }
+          }
 
           return {
             currentVoiceChannelId: null,
-            hwOverdrive: false,
             isCameraOn: false,
             isScreenSharing: false,
             participants: [],
@@ -586,7 +702,9 @@ export const useVoiceStore = create<VoiceState>()(
             speakingUserIds: new Set(),
             connectionError: null,
             isLiveKitConnected: false,
+            voiceConnectionStatus: 'disconnected',
             connectionQuality: 'unknown',
+            connectionQualities: new Map(),
             focusedParticipantId: null,
             activeDmCall: null,
             outgoingCall: null,
@@ -602,6 +720,7 @@ export const useVoiceStore = create<VoiceState>()(
             unwatchedCameras: new Set(),
             streamWatchers: new Map(),
             voiceUsers,
+            voiceChannelElapsedSeconds,
             // Reset mic permission flag on leave so the next join attempts a
             // fresh getUserMedia (the user may have granted permission via
             // OS settings while disconnected).
@@ -625,7 +744,6 @@ export const useVoiceStore = create<VoiceState>()(
       handleForceDisconnect: () => {
         set({
           currentVoiceChannelId: null,
-          hwOverdrive: false,
           isCameraOn: false,
           isScreenSharing: false,
           participants: [],
@@ -633,7 +751,9 @@ export const useVoiceStore = create<VoiceState>()(
           speakingUserIds: new Set(),
           connectionError: null,
           isLiveKitConnected: false,
+          voiceConnectionStatus: 'disconnected',
           connectionQuality: 'unknown',
+          connectionQualities: new Map(),
           focusedParticipantId: null,
           activeDmCall: null,
           outgoingCall: null,
@@ -654,6 +774,7 @@ export const useVoiceStore = create<VoiceState>()(
 
       reset: () => set({
         voiceUsers: new Map(),
+        voiceChannelElapsedSeconds: new Map(),
         currentVoiceChannelId: null,
         isMuted: false,
         isDeafened: false,
@@ -664,7 +785,9 @@ export const useVoiceStore = create<VoiceState>()(
         speakingUserIds: new Set(),
         connectionError: null,
         isLiveKitConnected: false,
+        voiceConnectionStatus: 'disconnected',
         connectionQuality: 'unknown',
+        connectionQualities: new Map(),
         inputVolume: 100,
         outputVolume: 100,
         inputDeviceId: 'default',
@@ -695,7 +818,7 @@ export const useVoiceStore = create<VoiceState>()(
     }),
     {
       name: 'backspace-voice-settings',
-      version: 13,
+      version: 14,
       migrate: (persistedState: any, version: number) => {
         if (version === 0) {
           persistedState.streamAttenuationEnabled = false;
@@ -756,6 +879,14 @@ export const useVoiceStore = create<VoiceState>()(
             delete persistedState.screenShareConfig.codec;
           }
         }
+        if (version < 14) {
+          // Guard like every other screenShareConfig migration: creating the
+          // object here would hand `merge` a partial config, and its shallow
+          // spread replaces the defaults wholesale rather than filling them in.
+          if (persistedState.screenShareConfig) {
+            persistedState.screenShareConfig.codec = 'vp9';
+          }
+        }
         return persistedState;
       },
       storage: createJSONStorage(() => localStorage),
@@ -771,11 +902,13 @@ export const useVoiceStore = create<VoiceState>()(
         outputDeviceId: state.outputDeviceId,
         cameraDeviceId: state.cameraDeviceId,
         screenShareConfig: state.screenShareConfig,
+        lastScreenShareSourceId: state.lastScreenShareSourceId,
         echoCancellation: state.echoCancellation,
         autoGainControl: state.autoGainControl,
         rnnoiseEnabled: state.rnnoiseEnabled,
         soundEffectVolume: state.soundEffectVolume,
         messageSoundAllChannels: state.messageSoundAllChannels,
+        pipEnabled: state.pipEnabled,
         streamAttenuationEnabled: state.streamAttenuationEnabled,
         streamAttenuationStrength: state.streamAttenuationStrength,
         // Per-user preferences (Map → plain object for JSON)
@@ -789,11 +922,13 @@ export const useVoiceStore = create<VoiceState>()(
         merged.spaceDeafenedUserIds = currentState.spaceDeafenedUserIds;
         merged.permissionMutedUserIds = currentState.permissionMutedUserIds;
         merged.voiceUsers = currentState.voiceUsers;
+        merged.voiceChannelElapsedSeconds = currentState.voiceChannelElapsedSeconds;
         merged.participants = currentState.participants;
         merged.speakingParticipantIds = currentState.speakingParticipantIds;
         merged.speakingUserIds = currentState.speakingUserIds;
         merged.deafenedUserIds = currentState.deafenedUserIds;
         merged.voiceUserStates = currentState.voiceUserStates;
+        merged.connectionQualities = currentState.connectionQualities;
         merged.participantVolumes = persistedState?.participantVolumes
           ? new Map(Object.entries(persistedState.participantVolumes))
           : currentState.participantVolumes;

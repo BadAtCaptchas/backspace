@@ -1,4 +1,5 @@
 import '@testing-library/jest-dom/vitest';
+import { initI18n } from '../i18n';
 
 // Node 20+ ships a built-in `localStorage`/`sessionStorage` stub on globalThis
 // that has no methods unless `--localstorage-file=PATH` is provided. Vitest's
@@ -112,3 +113,25 @@ const OriginalResponse = globalThis.Response;
     return b;
   }
 };
+
+// jsdom does not implement ResizeObserver. Floating surfaces (tooltips,
+// popovers, the profile card) observe their own box so they can re-place
+// themselves when their content grows. Provide an inert stub — tests drive
+// layout explicitly by stubbing getBoundingClientRect.
+if (!('ResizeObserver' in globalThis)) {
+  class NoopResizeObserver implements ResizeObserver {
+    observe(): void {}
+    unobserve(): void {}
+    disconnect(): void {}
+  }
+  Object.defineProperty(globalThis, 'ResizeObserver', {
+    value: NoopResizeObserver,
+    configurable: true,
+    writable: true,
+  });
+}
+
+// Components read their strings through i18next. Start it in English before
+// any test renders, so `t()` returns real text rather than keys. Tests that
+// exercise another language call `setLanguage` themselves.
+await initI18n({ browserLanguages: ['en'] });

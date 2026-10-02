@@ -2,6 +2,8 @@
 
 Source files:
 - `packages/server/src/routes/admin.ts` -- User management, storage management endpoints
+- `packages/server/src/routes/adminUpdates.ts` -- Instance version and update-status endpoint
+- `packages/server/src/utils/releaseCheck.ts` -- Lazy, cached, fail-soft latest-release lookup
 - `packages/server/src/routes/instance.ts` -- Public instance info endpoint
 - `packages/server/src/routes/settings.ts` -- Instance settings and streaming limits endpoints
 - `packages/server/src/utils/auth.ts` -- `requireAdmin` middleware
@@ -14,6 +16,8 @@ Source files:
 - `packages/web/src/components/modals/instanceSettingsPanels/StoragePanel.tsx` -- Storage management UI
 - `packages/web/src/components/modals/instanceSettingsPanels/StreamingPanel.tsx` -- Streaming config UI
 - `packages/web/src/components/modals/instanceSettingsPanels/UsersPanel.tsx` -- User management UI
+- `packages/web/src/components/modals/instanceSettingsPanels/UpdatesPanel.tsx` -- Instance version and update guidance UI
+- `packages/web/src/components/modals/instanceSettingsPanels/TelemetryPanel.tsx` -- The daily hello: opt-in switch, state, masked id, live payload preview
 - `packages/server/src/routes/invites.ts` -- Admin invite-link CRUD endpoints
 - `packages/server/src/utils/inviteService.ts` -- Token generation, derived status, atomic redemption transaction
 - `packages/shared/src/types.ts` -- Shared type interfaces
@@ -50,6 +54,7 @@ Settings are split into two API surfaces:
 | General/Admin | `GET /api/settings/instance` (admin) | `PATCH /api/settings/instance` (admin) |
 | Streaming | `GET /api/settings/streaming` (auth) | `PATCH /api/settings/streaming` (admin) |
 | Public info | `GET /api/instance/info` (public) | N/A (derived from settings) |
+| Update status | `GET /api/admin/instance/update-status` (admin) | N/A (read-only by design, see below) |
 
 ### General Settings Schema (InstanceAdminSettings)
 
@@ -65,6 +70,12 @@ Settings are split into two API surfaces:
 | federationRelayEnabled | boolean | federationRelayEnabled | boolean | Default: 1 (enabled) |
 | federationRelayTtlDays | number | federationRelayTtlDays | integer 1-365 | Default: 30 days |
 | autoAcceptPeering | boolean | autoAcceptPeering | boolean | Default: true. When false, `peer/accept` rejects unsolicited requests (403 PEERING_REQUIRES_APPROVAL); only requests where a local `pending` record already exists are accepted |
+| directoryEnabled | boolean | directoryEnabled | boolean; `true` needs `discoveryEnabled` on (400 `directory_requires_discovery`) | Default: false. Allows spaces here to be listed in the space directory. Cleared in the same write whenever discovery is switched off, on either PATCH route. See [directory.md](directory.md) |
+| directoryBrowseEnabled | boolean | directoryBrowseEnabled | boolean (400 `field_not_boolean`) | Default: true. Allows people here to see spaces from other instances in Explore. The incoming axis, independent of `directoryEnabled`: nothing clears it and it is not part of the discovery invariant. Gates `GET /api/directory` and `directoryAvailable` on the public instance info. Changing it never marks the directory dirty. See [directory.md](directory.md) |
+| supportCardEnabled | boolean | supportCardEnabled | boolean (400 `field_not_boolean`) | Default: true. Whether the web client's Backspace page shows the Support card. Also reported on the public instance info. Hides only that card; see the General panel below |
+| directoryLastPingAt | number \| null | directoryLastPingAt | read-only, ignored on PATCH | Epoch ms of the last directory ping the hub accepted |
+| directoryLastError | DirectoryPingError \| null | directoryLastError | read-only, ignored on PATCH | `{ at, status, reason? }` of the last failed ping, null after a success; feeds the panel's status line |
+| directoryListedSpaceCount | number | (counted from `spaces`) | read-only, ignored on PATCH | Spaces here that are public or request to join with `directory_listed = 1`, counted whatever `directoryEnabled` says. Same predicate as the directory document (`countListedSpaces` in `directory/document.ts`). Drives the panel's listing note and its "N spaces listed" line |
 
 ### Streaming Settings Schema (InstanceStreamingLimits)
 
@@ -78,6 +89,7 @@ Settings are split into two API surfaces:
 | maxResolution | number | maxResolution | Must be in STANDARD_RESOLUTIONS | 1080 |
 | maxFramerate | number | maxFramerate | Must be in STANDARD_FRAMERATES | 60 |
 | discoveryEnabled | boolean | discoveryEnabled | boolean | true |
+| directoryEnabled | boolean | directoryEnabled | read-only on this route (set through `PATCH /api/settings/instance`); carried here so a non-admin's space settings can read it | false |
 | bitrateMatrixOverrides | Record<string,number>\|null | bitrateMatrixOverrides | Keys: `{res}_{fps}`, values: 1-1000000 | null |
 | allowCustomBitrate | boolean | allowCustomBitrate | boolean | true |
 
@@ -99,7 +111,7 @@ HIGH_END_FRAMERATE_THRESHOLD  = 75
 2160  20000 24000 28000 32000 38000 45000
 ```
 
-See [voice.md](voice.md) for how clients enforce these limits at the WebRTC encoding boundary.
+See [voice.md](voice.md) for how clients enforce these limits at the WebRTC encoding boundary. A screen share obeys the limits of the instance that issued the LiveKit token: in a federated space the client reads this document from the space's instance, not from the user's home, and applies it at use time without changing the user's saved settings (voice.md, "Whose limits apply").
 
 ---
 
@@ -166,12 +178,16 @@ No authentication. Returns:
 ```typescript
 {
   name: string;        // instanceSettings.instanceName ?? 'Backspace'
-  version: string;     // Hardcoded '1.0.0' in instance.ts
+  version: string;     // config.version, read from packages/server/package.json
   registrationOpen: boolean;  // DB setting overrides env if non-null
   federatedRegistrationOpen: boolean;  // NOT NULL DEFAULT 1; gates federated-account creation
   sourceCodeUrl: string;      // AGPL § 13; config.sourceCodeUrl (env BACKSPACE_SOURCE_URL)
   commit: string | null;      // AGPL § 13; config.commit (env BACKSPACE_COMMIT, build-injected)
   instanceId: string;         // Persistent per-instance epoch (incarnation UUID); getInstanceId()
+  directoryConfigured: boolean;  // config.directory.endpoint !== '' alone; every surface that promises the directory gates on it
+  directoryAvailable: boolean;  // directoryConfigured AND instanceSettings.directoryBrowseEnabled; the Explore page gates its Outer Space section on it
+  directoryEnabled: boolean;  // instanceSettings.directoryEnabled; the admin's listing opt-in, independent of the above
+  supportCardEnabled: boolean;  // instanceSettings.supportCardEnabled; the web client's Backspace page shows the Support card
 }
 ```
 
@@ -190,7 +206,9 @@ GET  /api/settings/instance    — admin only → InstanceAdminSettings
 PATCH /api/settings/instance   — admin only → InstanceAdminSettings
 ```
 
-See field table above for validation rules. Cross-field: `discoveryEnabled` changes here are also synced to `streamingLimits` in the frontend store (`settingsStore.ts:updateInstanceSettings`).
+See field table above for validation rules. Cross-field: `discoveryEnabled` and `directoryEnabled` changes here are also synced to `streamingLimits` in the frontend store (`settingsStore.ts:updateInstanceSettings`), from the server's answer rather than the request, since turning discovery off clears the directory server-side.
+
+**Discovery off implies directory off.** `applyDiscoveryAndDirectory` in `routes/settings.ts` runs on both PATCH routes against the resulting state: `directoryEnabled: true` with discovery off is `400 directory_requires_discovery`, and a write that leaves discovery off clears `directoryEnabled` in the same write. A change to `directoryEnabled`, `discoveryEnabled`, `instanceName` or `federatedRegistrationOpen` calls `markDirectoryDirty()` so the directory pinger tells the hub; see [directory.md](directory.md) §3.
 
 ### Streaming Settings
 
@@ -258,6 +276,138 @@ Storage functions (`getStorageStats`, `getOrphanedFiles`, `cleanupStorage`, `cle
 5. Stats refreshed after live cleanup
 
 **Media cleanup validation:** `maxAgeDays` must be a positive integer >= 1. Returns 400 otherwise.
+
+### Instance Updates
+
+Admin-only, read-only.
+
+```
+GET /api/admin/instance/update-status[?refresh=true] → InstanceUpdateStatus
+```
+
+```typescript
+interface InstanceUpdateStatus {
+  current: { version: string; commit: string | null };
+  latest: { version: string; url: string; publishedAt: string } | null;
+  state: 'up-to-date' | 'update-available' | 'unknown';
+  checkedAt: number | null;
+  checkEnabled: boolean;
+  reason: 'disabled' | 'unreachable' | 'rate-limited' | 'unparseable' | null;
+  channel: 'prebuilt' | 'source' | 'unknown';
+}
+```
+
+**There is no background poller on the server.** The GitHub lookup runs only
+when a signed-in admin's client asks for the update status: once when their home
+WebSocket reports an admin session, on a six-hourly refresh while that session
+lives, and on an explicit "Check again". An instance nobody administers never
+contacts github.com, and the request still carries nothing that identifies the
+instance. The trigger moved off the Updates panel when the update dot was added,
+because a dot that only appears after you open the panel tells you nothing.
+
+The six-hour success cache bounds a healthy instance to roughly four outbound
+requests a day. Failures are cached for a tenth of that, so an instance with
+blocked or rate-limited egress can attempt around forty a day; the fix, if it
+ever matters, is a longer failure TTL rather than a narrower trigger.
+
+`releaseCheck.ts` details:
+
+- The URL is the compile-time constant
+  `https://api.github.com/repos/TheZwiss/backspace/releases/latest`. It is never
+  derived from user input, so the SSRF policy in [embeds.md](embeds.md) does not
+  apply.
+- `User-Agent: Backspace`. GitHub requires one. The running version is
+  deliberately omitted so the request carries nothing identifying the instance
+  beyond the IP any outbound request would expose, and so GitHub's logs do not
+  become a version census of every deployment.
+- 5s timeout, `redirect: 'error'`, 512 KB response cap.
+- Successes cached 6h; failures cached for a tenth of that, so a transient
+  outage clears without hammering a rate-limited endpoint.
+- Concurrent requests are coalesced into one outbound call.
+- Every failure is soft: `state: 'unknown'` plus a `reason`. An operator with no
+  outbound internet still gets a panel that reports what they are running.
+- Drafts and prereleases are skipped. An `html_url` that is not on github.com is
+  replaced with a constructed one rather than rendered as a link.
+- `state` is `unknown` rather than a guess whenever either version fails to
+  parse as `major.minor.patch`. Running *ahead* of the latest release reports
+  `up-to-date`, so a maintainer on an unreleased build is not told to downgrade.
+
+**`BACKSPACE_UPDATE_CHECK=false`** disables the lookup outright. The endpoint
+then returns `checkEnabled: false, reason: 'disabled'` without opening a socket,
+and `?refresh=true` cannot override it.
+
+**`BACKSPACE_INSTALL_CHANNEL`** (`prebuilt` | `source`) is written to `.env` by
+`install.sh` after its pull-or-build decision resolves, so a fallback-to-build is
+recorded truthfully. Absent on older installs, which report `unknown`; the panel
+then shows both sets of manual commands rather than guessing. `./update.sh` reads
+the same value.
+
+#### Why there is no endpoint that performs the update
+
+Applying a container update from inside the container requires mounting
+`/var/run/docker.sock`, which grants the container root on the host. Backspace
+parses user-uploaded media, scrapes URLs for embeds, and accepts federation
+payloads from remote instances, so any remote-code-execution bug in it would
+become host root the moment that socket exists. Trading that for a button is not
+a trade worth making. The panel hands the operator an exact, copyable command
+instead, and `./update.sh` (see [deployment.md](deployment.md)) is where the
+effort went.
+
+---
+
+### Telemetry
+
+Admin-only. The opt-in daily usage report, shown in Instance settings as the
+section "Say hi to Jannis".
+
+```
+GET /api/admin/telemetry          → TelemetryStatus
+PUT /api/admin/telemetry          { enabled: boolean } → TelemetryStatus
+GET /api/admin/telemetry/preview  → TelemetryPayload
+```
+
+```typescript
+interface TelemetryStatus {
+  enabled: boolean | null;   // null = this instance was never asked
+  id: string | null;         // the random telemetry id, kept through off; null until the first enable
+  lastDay: string | null;    // last UTC day successfully reported
+  lastError: { day: string; status: number } | null;
+  askDue: boolean;           // whether an admin should be asked now, see telemetry.md §7
+}
+```
+
+**It is off until an admin turns it on**, and nothing is sent or fetched before
+that. The panel shows the toggle, the last reported day, the last error if there
+is one, the id masked, and the live preview: the exact document a ping would
+carry, built by the same function the reporter uses, so the panel can never show
+something the reporter would not send. While reporting is off the preview's
+`instance` is the literal string `preview` rather than a freshly minted id, and
+opening it writes nothing.
+
+`routes/adminTelemetry.ts` is the only HTTP writer of the five
+`instance_settings` telemetry columns, and every write goes through
+`telemetry/state.ts`, which the reporter and `install.sh` also use.
+`PATCH /api/settings/instance` does not touch them, so the id lifecycle has
+exactly one owner. The first enable mints a UUID that is kept for
+the life of the install. Neither branch writes `telemetry_last_day`: that column
+belongs to the reporter, and stamping it here cost the instance a day's ping
+every time the switch was flipped twice. Disabling keeps the id and the last
+reported day and clears the pending error, so a later re-enable reports as the
+same instance and does not repeat a day it already sent. Disabling also stamps
+`telemetry_declined_version` with the running version, which is what keeps the
+ask quiet for the rest of that minor release. Saving "on" while it is already on
+changes nothing at all.
+
+An admin signing in while `askDue` is true sees the modal. Dismissing it
+without answering snoozes it for 7 days in that browser, after which it returns,
+as often as it takes; any answer by any admin settles the ask for everyone,
+because the setting belongs to the instance. A yes ends it for good. A no keeps
+it away until the next minor release, when it is asked once more.
+
+Full reference, including every field, the rounding rule, what is never sent and
+the 90-day retention at the receiver: [telemetry.md](telemetry.md).
+
+---
 
 ### User Management
 
@@ -423,7 +573,9 @@ Zustand store managing two data objects:
 | isAdmin | boolean | Set externally via `setIsAdmin()` | -- |
 | gifEnabled | boolean | `fetchGifEnabled()` | -- |
 
-**Default fallback:** If streaming limits fail to fetch, the store falls back to `DEFAULT_LIMITS`:
+**A failed fetch leaves `streamingLimits` null.** `fetchStreamingLimits()` logs and keeps the field unknown rather than substituting `DEFAULT_LIMITS`. The document carries `discoveryEnabled` and `directoryEnabled`, and those defaults assert a pair (`discoveryEnabled: true`, `directoryEnabled: false`) that would be shown to the user as fact: the Explore page's `InstanceDiscoveryHint` would tell an admin on a listed instance that their spaces are not listed, next to a button that writes the setting, and `StreamingPanel` could save invented limits over the instance's real configuration. Every reader handles null without inventing a value; what each one does with an unknown document is described where that surface is, in [directory.md](directory.md) §10 for the Explore hint and the space settings switch, and under StreamingPanel below for the rest.
+
+`DEFAULT_LIMITS` still exists, as the read-time fallback inside `getStreamingLimits()`:
 ```typescript
 {
   maxBitrateKbps: 20000,
@@ -434,26 +586,107 @@ Zustand store managing two data objects:
   maxResolution: 1080,
   maxFramerate: 60,
   discoveryEnabled: true,
+  directoryEnabled: false,
   bitrateMatrixOverrides: null,
   allowCustomBitrate: true,
 }
 ```
 
-**Cross-field sync:** When `updateInstanceSettings()` changes `discoveryEnabled`, it also patches `streamingLimits.discoveryEnabled` to keep the streaming panel's DiscoveryPanel warning banner in sync.
+**Cross-field sync:** After every `updateInstanceSettings()` the store mirrors `discoveryEnabled` and `directoryEnabled` from the server's answer into `streamingLimits`, which is where the space settings `DiscoveryPanel` reads both flags for a home space (the warning banner and the directory switch's disabled reason; a remote space asks its own instance instead, see [directory.md](directory.md) §10). The answer is used rather than the request because switching discovery off clears the directory server-side.
 
-**Exported helper:** `getStreamingLimits()` returns current limits or defaults -- used by voice/streaming code outside React.
+**Exported helper:** `getStreamingLimits()` returns current limits or defaults -- used by voice/streaming code outside React. It is the one place a default may stand in: a screen share has to pick a bitrate whatever the server said. Anything that states a fact to the user, or offers to change one, reads `streamingLimits` and treats null as unknown.
+
+**Who fetches it:** the WS ready handler for every session (`useWebSocket.ts`), and `StreamingPanel` for itself when it opens. `InstancePanel` and `MobileInstancePanel` no longer pre-fetch it: the panel is the only reader of this document inside the instance-settings tree, and a parent's fetch cannot report its outcome to the panel that needs it.
 
 ### Admin UI Panels
 
 All panels live under `packages/web/src/components/modals/instanceSettingsPanels/`. Each operates as a controlled form with a local `draft` state, detecting changes against the store's server-synced values. Unsaved changes show a sticky glass-bubble save/reset bar at the bottom.
 
+#### UpdatesPanel
+
+Shows the running version, commit, and install channel; whether a newer release
+exists, with its date and a link to the notes; and the exact command to run.
+Ignores nothing and hides nothing: when the lookup could not be made it says so
+and still reports what is running, distinguishing "turned off", "rate-limited",
+and "could not reach GitHub", because those call for different responses.
+
+The command block is `select-all`-friendly with a copy button. A disclosure,
+"I do not have update.sh", expands to `git pull` plus the raw compose commands
+for the relevant channel. That disclosure is necessary because `update.sh` ships
+from 1.0.5 onward, so an operator on 1.0.4 does not have it yet.
+
+Registered as the `updates` sub-tab in `InstancePanel.tsx`, and as
+`settings-instance-updates` in `MobileShell.tsx` / `MobileInstancePanel.tsx`.
+
+**It always reads the home instance.** `api.admin.updateStatus()` goes through
+the origin-relative client, so a client with remote instances connected still
+reports only the instance that served it — the same rule the telemetry panel
+follows. An operator running two instances gets no signal here that the second
+one is behind; they see it when they sign in to that instance.
+
+**The dot.** When a release is available, an amber dot appears on the settings
+gear, on the Instance nav item, on the Updates sub-tab, and through the mobile
+chain (bottom-nav "You" tab, the You-screen gear, the Instance row, the Updates
+row). It is derived by `useInstanceUpdateBadge()` from the status the store
+holds, and is cleared for that version when the admin opens this panel. An admin
+is also toasted once per version, with an action that opens this panel. Both
+acknowledgements live in `localStorage` per user id
+(`packages/web/src/utils/updateAck.ts`), so they are per browser: a release
+re-arms both, and clearing site data brings them back.
+
+#### TelemetryPanel
+
+The permanent home of the opt-in daily report described in
+[telemetry.md](telemetry.md). It is the only place the setting can be changed
+outside the ask, and it always reads the home instance: there is no local
+copy of the state, so what the panel shows is what the server would send.
+
+Contents, top to bottom:
+
+- The switch, bound to `settingsStore.setTelemetryEnabled(next)`, which returns
+  the server's state and is the only thing the panel commits. There is no draft
+  and no save bar: a failed write leaves the switch where the server has it and
+  reports the reason through a toast.
+- The state line: `Never asked` while `enabled` is `null`, otherwise `Off` or
+  `On`.
+- The last reported day, formatted in the reader's language, or "no hello sent
+  yet". A bare `YYYY-MM-DD` day is built at local midnight before formatting, so
+  a reader west of UTC is not shown the day before.
+- The last failure, when `lastError` is set: its day and HTTP status, plus the
+  note that the next attempt is tomorrow. Absent when there is none.
+- The telemetry id, masked to its first block (`3f6c9e2a…`). The full id is what
+  ties an instance to its rows in the public archive, so the panel confirms
+  which one is in use without putting the whole value on screen. Hidden while
+  the setting is off: the server keeps the id for a later re-enable, but an id
+  on screen next to "Off" would read as if something were still being sent.
+- The live payload, rendered by the shared `PayloadPreview` (`defaultOpen`
+  here, folded away in the ask) straight from `GET /api/admin/telemetry/preview`
+  with a Refresh button. It is refetched after every successful toggle, since
+  the first switch-on mints the id the payload carries.
+- A link to `docs/systems/telemetry.md` on GitHub.
+
+Strings live in the `telemetry` namespace under `panel.*`. Registered as the
+`telemetry` sub-tab in `InstancePanel.tsx` (labelled "Say hi"), and as
+`settings-instance-telemetry` in `MobileShell.tsx` / `MobileInstancePanel.tsx`.
+
 #### GeneralPanel
 
-Manages: instance name, discovery toggle, GIF API key, federation relay toggle/TTL.
+Manages: instance name, the space-discovery ladder, the global browsing switch, GIF API key.
 
 - Instance name input: max 32 chars, enforced client-side via `slice(0, 32)`
+- Space discovery ladder: one radio group ("Space discovery", "How far spaces on this instance can be found.") replacing what used to be a discovery toggle and a directory toggle. Three mutually exclusive rungs, each a superset of the one above, and each writing both stored flags at once:
+
+  | Rung | Label | `discoveryEnabled` | `directoryEnabled` |
+  |------|-------|--------------------|--------------------|
+  | `invite` | Invite only | false | false |
+  | `local` | Local space discovery | true | false |
+  | `global` | Allow global listing | true | true |
+
+  The selected rung is derived from the draft by `levelOf()`, never stored as a third piece of state, and picking a rung applies that row through `LEVEL_FLAGS`. The pair the server refuses (`directory_requires_discovery`) has no rung, so the old "switching discovery off clears the directory in the draft" special case is gone; the server-side invariant is unchanged and still guards the API.
+- Under the `global` rung only, indented beneath it and rendered as a sibling of the radiogroup (which may own only radios): (1) while `federatedRegistrationOpen` is off, the amber note that listed spaces will show as closed to new accounts, with an "Open federated accounts" button that calls `updateInstanceSettings({ federatedRegistrationOpen: true })` immediately, outside the draft, disabled while in flight and reporting failure through the panel's `saveError` line. The flag is never flipped automatically by picking the rung: opening sign-ups to strangers stays an explicit click. The note appears as soon as the rung is picked in the draft, before any save. (2) a status line of the same shape as the telemetry panel's, fed by `directoryLastPingAt` and `directoryLastError` ("Never reported" / "Last reported <date>", then "Last attempt failed (<reason>)" with the hub's reason for a `fetch` status, a sentence of its own for `origin`, `network` and `timeout`, or the bare HTTP status). (3) the one-sentence disclosure of what listing makes public. Before (1), while `directoryListedSpaceCount` is 0 and the instance has an endpoint, a second amber note says the rung lists nothing by itself and each space has to switch on its own listing, with a "Show me where" button into a space's Discovery tab ("Save and show me where" while the panel has unsaved changes, which saves first); once a space is listed the note gives way to an "N spaces listed" line in the status box. Which space the button opens and when it is offered: [directory.md](directory.md) §10. The status line reads the store's `instanceSettings`, not the draft, and the panel calls `fetchInstanceSettings()` every 10 seconds while mounted (`INSTANCE_SETTINGS_REFRESH_MS`) so it follows the pinger, whatever rung is selected; the draft holds only the five editable fields and a refresh reseeds it only while it has no unsaved edit. Strings under `admin:general.discovery.*` and `admin:general.directory.*`. See [directory.md](directory.md) §10.
+- Global browsing switch, directly under the ladder in the same section, separated by a rule and outside the radiogroup: "Show global spaces in Explore" with "People here see spaces from other instances in Outer Space. Their browsers load those spaces' icons and banners from the instances that own them." It writes `directoryBrowseEnabled`, the incoming axis, and is a draft field saved by the same save bar as the rungs, not an immediate write. On an instance with no `DIRECTORY_ENDPOINT` the switch renders **off** and disabled, with "This instance is not configured to reach a directory, so there is nothing to show." beneath it: off is the effective state whatever the column says, and the column is deliberately not written to match, so browsing resumes at the admin's last choice if an endpoint is ever configured. The panel reads `directoryConfigured` from `GET /api/instance/info`, once. The same fact also takes the global rung out of the ladder, since listing needs the endpoint too; both are described once in [directory.md](directory.md) §10. Strings under `admin:general.browse.*` and `admin:general.discovery.unconfigured`.
 - GIF key: password input, separate dirty tracking (`gifKeyDirty`). Only sent on save if modified. "Clear key" button sets empty string.
-- Federation relay toggle and TTL input: drive `federationRelayEnabled` and `federationRelayTtlDays` instance settings.
+- Support card switch, its own row below the GIF key: "Show the Support card" with "Shows a card on the Backspace page that links to the project's Ko-fi page. Turning it off hides only that card." It writes `supportCardEnabled` and is a draft field saved by the same save bar as the rest of the panel. It hides the Support card and nothing else: every other card and link on the Backspace page stays. Strings under `admin:general.supportCard.*`.
 
 The registration toggles (`registrationOpen` / `federatedRegistrationOpen`) and the invite-link manager live in [RegistrationPanel](#registrationpanel).
 
@@ -521,7 +754,9 @@ See [api.md → Admin: Invite Management](api.md#admin-invite-management-routesi
 
 #### FederationPanel
 
-Manages: federation peers list, pending approval requests (inbound + outbound), manual peering initiation, secret rotation, peer reset.
+Manages: the relay settings (`federationRelayEnabled`, `autoAcceptPeering`, `federationRelayTtlDays`, `defaultAutoRotateIntervalDays`), federation peers list, pending approval requests (inbound + outbound), manual peering initiation, secret rotation, peer reset.
+
+- Relay group (`federation:admin.relay.*`): two toggles, relay enabled and auto-accept peering, and two number inputs clamped to 1-365 days, the relay TTL and the default auto-rotation interval. All four are draft fields saved together through `updateInstanceSettings`.
 
 - **Pending Approvals section:** Visible only when `pendingApprovalCount > 0` (from ready payload — the count sums inbound + outbound rows). Positioned above the peer list. Both directions render as rows in the same unified queue, branched on `direction`:
   - **Inbound rows** — "{instanceName} ({origin}) — wants to peer with us." Approve / Deny buttons.
@@ -552,6 +787,8 @@ Manages: storage overview, file type breakdown, upload limit, orphan cleanup, me
 #### StreamingPanel
 
 Manages: bitrate range (min/max/step), custom bitrate toggle, resolution/framerate allowlists, bitrate matrix.
+
+- **Its own load:** the panel calls `fetchStreamingLimits()` on mount and reads the outcome from the store afterwards (the action swallows its error, so "the document arrived" is the signal). Until it does, the panel shows the loading line; a load that leaves the document null shows the panel's rose failure block, the same treatment its save errors use, with a Retry that stays in place and is disabled while the request is in flight.
 
 - **Bandwidth section:** Range sliders + number inputs for min/max bitrate. Step size via preset pills (100, 250, 500, 1000, 2500, 5000 kbps) + custom number input.
 - **Custom Bitrate toggle:** Controls whether users can set their own bitrate vs using matrix defaults
@@ -605,3 +842,5 @@ Manages: user list with search/filter/sort/pagination, admin promotion/demotion,
 - **Federation relay:** [federation.md](federation.md) -- Relay toggle/TTL mechanics, peer management, outbox delivery
 - **Voice/streaming:** [voice.md](voice.md) -- Client-side enforcement of streaming limits
 - **Permissions:** [permissions.md](permissions.md) -- Admin flag is separate from RBAC; `isAdmin` is a user-level column, not a permission bit
+- **Telemetry:** [telemetry.md](telemetry.md) -- The opt-in daily usage report: payload, opt-in state model, reporter, receiver, retention
+- **Space directory:** [directory.md](directory.md) -- The opt-in public directory: the admin toggle and status line, the per-space switch, the pinger, the hub

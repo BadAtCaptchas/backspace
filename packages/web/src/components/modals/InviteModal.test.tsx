@@ -15,7 +15,10 @@ vi.mock('../../audio/AudioManager', () => ({
 
 // Mock the API client so we can assert spaceInvite calls.
 const mockSpaceInvite = vi.fn();
-vi.mock('../../api/client', () => ({
+vi.mock('../../api/client', async (importOriginal) => ({
+  // Keep the real exports (HttpError is what describeError inspects) and
+  // replace only the api surface this test asserts on.
+  ...(await importOriginal<typeof import('../../api/client')>()),
   api: {
     dm: {
       spaceInvite: (...args: unknown[]) => mockSpaceInvite(...args),
@@ -24,6 +27,7 @@ vi.mock('../../api/client', () => ({
 }));
 
 import { InviteModal } from './InviteModal';
+import { HttpError } from '../../api/client';
 import { useUIStore } from '../../stores/uiStore';
 import { useSpaceStore } from '../../stores/spaceStore';
 import { useSocialStore } from '../../stores/socialStore';
@@ -272,7 +276,7 @@ describe('InviteModal', () => {
     // f1 succeeds, f2 fails with `not_a_friend`.
     mockSpaceInvite.mockImplementation(({ target }: any) => {
       if (target.userId === 'f1') return Promise.resolve({});
-      return Promise.reject(new Error('not_a_friend'));
+      return Promise.reject(new HttpError(400, 'Not a friend', { error: 'Not a friend', code: 'not_a_friend', statusCode: 400 }, 'not_a_friend'));
     });
 
     setUpStore({
@@ -373,7 +377,7 @@ describe('InviteModal', () => {
         expect.stringContaining('/join/abc123'),
       );
     });
-    expect(await screen.findByText('Copied!')).toBeInTheDocument();
+    expect(await screen.findByText('Copied')).toBeInTheDocument();
   });
 
   it('Copy button is disabled while the invite code is loading', () => {

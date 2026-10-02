@@ -3,6 +3,10 @@
 Source files:
 - `packages/desktop/src/main.ts` — Main process: window management, tray, IPC handlers, auto-update, deep links, app lifecycle
 - `packages/desktop/src/preload.ts` — Context bridge: exposes `window.backspace` API to renderer
+- `packages/desktop/src/updateCapability.ts` — Signature probe: can this build install its own updates
+- `packages/desktop/src/updateStatus.ts` — Update status union, store, and the shared prompt predicate
+- `packages/desktop/src/updateDismissal.ts` — Per-version dismissal persisted to userData
+- `packages/desktop/src/updaterCache.ts` — Reclaims the updater download cache on manual-mode builds
 - `packages/desktop/src/activityDetector.ts` — Process polling, game dictionary loading/sync, activity change detection
 - `packages/desktop/src/keybindManager.ts` — Global keybinds via uIOhook, native keycode mapping, press/release tracking
 - `packages/web/src/stores/keybindStore.ts` — Client-side keybind persistence (Zustand + localStorage)
@@ -10,7 +14,10 @@ Source files:
 - `packages/web/src/platform/electron.d.ts` — TypeScript declarations for `window.backspace`
 - `packages/web/src/platform/platform.ts` — `isElectron()` / `isElectronMac()` / `getElectronAPI()` helpers
 - `packages/desktop/electron-builder.yml` — Build config, protocol registration, afterPack hook
-- `packages/desktop/scripts/afterPack.js` — Cross-platform native module cleanup (critical for builds)
+- `packages/desktop/scripts/afterPack.js` — Cross-platform native module cleanup (critical for builds), then macOS signing
+- `packages/desktop/scripts/macSign.js` — Ad-hoc macOS code signing fallback (critical: without it the app will not launch)
+- `io.github.TheZwiss.backspace.yml` — Flatpak manifest (offline x86_64/aarch64 source build)
+- `flatpak/` — Flatpak launcher, desktop entry, AppStream metadata, and build instructions
 - `packages/desktop/resources/games.json` — Bundled game dictionary seed (versioned)
 
 ---
@@ -22,7 +29,7 @@ The desktop app wraps the Backspace web client in Electron with:
 - **Preload bridge** (`preload.ts`): Exposes `window.backspace` API via `contextBridge` with full sandbox isolation (`contextIsolation: true`, `nodeIntegration: false`, `sandbox: true`)
 - **Renderer**: The standard web client, detecting Electron via `typeof window.backspace !== 'undefined'`
 
-The desktop package compiles to CommonJS (`module: "commonjs"`) targeting ES2022. Electron version: 40+.
+The desktop package compiles to CommonJS (`module: "commonjs"`) targeting ES2022. Electron version: 43.4+ to honor `restrictOwnAudio` in the custom screen-share handler (see [voice.md](voice.md#system-audio-loopback-shareaudio)).
 
 ---
 
@@ -75,6 +82,15 @@ Close does **not** quit the app. The `close` event is intercepted; the window is
 3. No URL: loads `resources/instance-picker.html` (local HTML file)
 
 Instance URL management functions: `loadInstanceUrl()`, `saveInstanceUrl()`, `clearInstanceUrl()` — all operate on `{userData}/instance-url.json`.
+
+### Interface Scale
+
+The Appearance settings' interface-scale control is shared with the web client
+(50–250%, saved locally). It uses root CSS zoom; the native title bar is not
+scaled. `--titlebar-inset` is the single 33 px reservation (32 px drag region
+plus 1 px divider), divided by interface scale. `App`, `SpaceSidebar` and
+`ImagePreview` share it so fixed overlays and normal layout continue matching
+the native controls at every scale. See `design-system.md` → Interface scale.
 
 ### Focus Tracking
 
@@ -137,6 +153,13 @@ The OS is the source of truth for `openAtLogin` on all platforms. Disk is used o
 - **macOS:** OS-authoritative for `openAtLogin`. Disk-cached for `startMinimized` (no introspection available).
 - **Linux:** OS-authoritative for `openAtLogin`. Disk-cached for `startMinimized` (we deliberately do not parse `Exec=` lines from `.desktop` files; out-of-band edits are rare and parsing shell-quoted strings is fragile).
 
+Flatpak is the exception: Electron cannot register a host login item across the
+sandbox boundary, so both auto-launch IPC handlers return disabled settings and
+the renderer hides the controls. This is decided by the dedicated
+`isSandboxed()` predicate and `is-sandboxed` IPC query, not by
+`UpdateCapability`; sandbox restrictions and update ownership are independent
+capabilities even though `FLATPAK_ID` currently affects both.
+
 ### Platform-Specific Implementation (`applyLoginItemSettings()`)
 
 | Platform | Method | Key parameters | Rationale |
@@ -185,9 +208,9 @@ Pure logic lives in `packages/desktop/src/autoLaunch.ts` with vitest coverage in
 | macOS | `resources/tray-iconTemplate.png` (+ `@2x`) | Template image: solid black + alpha at 22×22 / 44×44; OS recolours for light/dark/active |
 | Windows | `resources/tray-icon.ico` | Multi-size `.ico` (16/20/24/32/40/48); Windows + Electron auto-pick best size for current DPI |
 | Linux | `resources/tray-icon.png` | Single 22×22 colored PNG (AppIndicator / StatusNotifier convention); no runtime resize |
-| Fallback | Programmatic 16×16 BGRA buffer | Blurple circle (#5865f2); should not trigger now that templates ship populated |
+| Fallback | Programmatic 16×16 BGRA buffer | Lavender circle (#7c6cf6); should not trigger now that templates ship populated |
 
-All four assets are produced by `scripts/gen-icons.mjs` from `assets/brand/{mark.svg, mark-mono-dark.svg}` — see the [icon system spec](../superpowers/specs/2026-04-27-icon-system-design.md) for the full output matrix and `scripts/gen-icons.README.md` for regeneration workflow.
+All four assets are produced by `scripts/gen-icons.mjs` from `assets/brand/{mark-tray.svg, mark-small.svg}`, see `scripts/gen-icons.README.md` for the full output matrix and regeneration workflow. The template tray icons render from `assets/brand/mark-tray.svg`; the colour tray files render from `mark-small.svg`. Details are in `scripts/gen-icons.README.md`.
 
 ### Context Menu
 
@@ -233,32 +256,129 @@ Registered via `app.setAsDefaultProtocolClient('backspace')` and in `electron-bu
 
 ## Auto-Update
 
-Powered by `electron-updater`. Loaded via `require()` (not import) for graceful degradation when not available.
+Powered by `electron-updater`. Loaded via `require()` (not import) for graceful
+degradation when not available.
+
+Source files:
+- `updateCapability.ts` — measures whether this build can install its own updates
+- `updateStatus.ts` — the `UpdateStatus` union, the `UpdateStatusStore`, and the
+  shared "should we interrupt the user" predicate
+- `updateDismissal.ts` — per-version dismissal persisted to userData
+- `updaterCache.ts` — reclaims the download cache on builds that cannot install
+- `packages/web/src/stores/updateStore.ts` — the renderer mirror
+- `packages/web/src/components/ui/UpdateToast.tsx` — the prompt
+
+### Update capability, and why it is measured rather than assumed
+
+```
+type UpdateCapability = 'auto' | 'manual';
+```
+
+`getUpdateCapability()` (memoised, `updateCapability.ts`) decides in this order:
+
+1. `!app.isPackaged` → `manual`. A dev build has no feed and must never offer to install.
+2. Not darwin → `auto`. NSIS and AppImage apply unsigned updates without complaint.
+3. darwin → run `codesign -d -r- <bundle>` and classify the designated requirement:
+   - a bare `cdhash H"…"` → `adhoc` → `manual`
+   - anything mentioning `anchor` or `certificate` → `identified` → `auto`
+   - unreadable → `unknown` → `manual`
+4. Any failure → `manual`.
+
+Every uncertain path resolves to `manual` deliberately. A download link always
+works, so guessing "manual" wrongly costs one extra click, while guessing "auto"
+wrongly produces a button that silently does nothing.
+
+**Nothing here hardcodes "macOS cannot update".** It measures the property that
+actually decides the outcome, so the day CI signs with a Developer ID this
+returns `auto` with no code change. See [desktop-security.md](desktop-security.md)
+for why the ad-hoc signature makes it impossible today.
 
 ### Configuration (`initAutoUpdater()`)
 
 ```
-autoDownload: true
-autoInstallOnAppQuit: true
+autoDownload         = capability === 'auto'
+autoInstallOnAppQuit = capability === 'auto'
 Publish: GitHub (TheZwiss/backspace)
 ```
 
-**Signing status (as of v1.0.0):** all builds are unsigned. Consequences:
-- **macOS:** Squirrel.Mac refuses to apply unsigned updates — auto-update is
-  effectively disabled on macOS until a Developer ID certificate + notarization
-  are added to the CI build. Users update manually from the releases page.
-  First launch requires right-click → Open (Gatekeeper).
-- **Windows:** NSIS auto-update works unsigned; SmartScreen warns on first
-  install only.
-- **Linux:** AppImage auto-update works unsigned.
+In `manual` mode nothing is downloaded, so no proxy server is created, Squirrel
+is never invoked, and the spurious install error never fires. `purgeUpdaterCache`
+also runs once at startup to reclaim archives stranded by earlier versions
+(measured at 228 MB on a real macOS install, because the archive is stored
+twice). The directory to delete is read from the packaged `app-update.yml`'s
+`updaterCacheDirName` rather than reconstructed, and must pass
+`isSafeUpdaterCacheDirName` (no separators, no traversal, mandatory `-updater`
+suffix) before anything is removed.
 
-CI publishes via `.github/workflows/release.yml` (tag `v*` on the public repo):
-native runners for mac (arm64+x64), win (x64+arm64), linux (x64, arm64), each
-job uploading its installers, `.blockmap`s, and platform `latest*.yml` manifest
-to a single draft release. The draft must be published manually — drafts are
-invisible to electron-updater.
+### The `update-downloaded` trap
 
-### Check Schedule
+`MacUpdater.doDownloadUpdate()` fires `dispatchUpdateDownloaded()` **inside the
+`server.listen` callback**, the moment its local proxy server is up, and *before*
+Squirrel has been asked to do anything:
+
+```js
+this.server.listen(0, "127.0.0.1", () => {
+    this.nativeUpdater.setFeedURL({ ... });
+    this.dispatchUpdateDownloaded(event);      // fires here
+    if (this.autoInstallOnAppQuit) {
+        this.nativeUpdater.checkForUpdates();   // Squirrel fails later
+    }
+});
+```
+
+So on macOS `update-downloaded` means "the archive is on disk", **not** "the
+update can be installed". Treating it as the latter is what produced a Restart
+button that did nothing. `MacUpdater.quitAndInstall()` then takes a branch that
+registers a listener for an event that never fires and returns, with no error and
+no exception.
+
+### Status model
+
+One value, replaced wholesale by every event, so a stale `ready` can never
+outrank a fresh `failed`:
+
+```typescript
+type UpdateStatus =
+  | { phase: 'idle' }
+  | { phase: 'checking' }
+  | { phase: 'available'; version: string }
+  | { phase: 'downloading'; version: string; percent: number; bytesPerSecond: number }
+  | { phase: 'ready'; version: string }
+  | { phase: 'failed'; version: string | null; message: string }
+  | { phase: 'up-to-date'; checkedAt: number };
+
+interface UpdateSnapshot {
+  capability: UpdateCapability;
+  dismissedVersion: string | null;
+  status: UpdateStatus;
+}
+```
+
+`capability` and `dismissedVersion` are ambient facts about the install; `status`
+is the event-driven part. They travel together so a dismissed update stays
+*visible* in Settings while being *silent* in the toast. Suppressing it in main
+would make it unreachable, turning "Later" into "never".
+
+`shouldPromptForUpdate(snapshot)` is the single definition of "interrupt the
+user". Both the toast and the native notification call it, so they cannot
+disagree about whether the user already said later. It returns false for
+`checking`, `downloading` and `up-to-date` (progress, not news), for a dismissed
+version, and for a `failed` that never learned a version.
+
+### Dismissal
+
+Persisted to `{userData}/update-state.json` as `{ dismissedVersion }`.
+
+It lives in the **main process, not localStorage**, because an available update
+is a property of the installed app, not of whichever instance the user happens to
+be connected to. Per-origin storage would re-nag anyone who switches instances
+and would lose the dismissal when site data is cleared.
+
+Exactly one version is remembered, compared by equality. Dismissing 1.0.4
+silences 1.0.4 and nothing else, so 1.0.5 surfaces normally. A corrupt or
+truncated file yields "nothing dismissed" rather than throwing at startup.
+
+### Check schedule
 
 | Trigger | Delay |
 |---------|-------|
@@ -266,31 +386,251 @@ invisible to electron-updater.
 | Periodic check | Every 4 hours |
 | Manual check | `check-for-updates` IPC from renderer |
 
-### Event Flow (main -> renderer)
+### Event flow (main -> renderer)
 
 | Event | IPC Channel | Payload | Condition |
 |-------|------------|---------|-----------|
-| Update found | `update-available` | `{ version }` | Always |
-| Download complete | `update-downloaded` | `{ version }` | Always |
-| Error | `update-error` | `{ message, releaseUrl }` | Only if `updateConfirmed` is true (download failed after update was confirmed) |
+| Snapshot changed | `update-status-changed` | `UpdateSnapshot` | Every status or dismissal change |
+| Update found | `update-available` | `{ version }` | Always (legacy) |
+| Download complete | `update-downloaded` | `{ version }` | Always (legacy) |
+| Error | `update-error` | `{ message, releaseUrl }` | Only if `updateConfirmed` (legacy) |
 
-Check-phase errors (network, auth, 404) are silently ignored — nothing actionable for the user.
+The three legacy per-event channels are **kept even though the current client no
+longer reads them**. The desktop app and the instance it connects to version
+independently: a newer app can be pointed at an older instance still serving a
+client that calls `onUpdateDownloaded`, and removing them would throw inside that
+client's `useEffect` and take the renderer down. The reverse case is handled on
+the web side, where `updateStore.ts` feature-detects `getUpdateStatus` and falls
+back to reconstructing a snapshot from the legacy channels.
+
+`download-progress` is wired and drives the `downloading` phase. Pushes are
+throttled to whole-percent changes, so at most 101 IPC messages per download.
+
+Check-phase errors are recorded as `{ phase: 'failed', version: null }`, which
+keeps them out of the toast while leaving them visible in Settings. Interrupting
+someone because a background poll hit a flaky network is noise.
 
 ### Install
 
-`install-update` IPC triggers `autoUpdater.quitAndInstall()`.
+`install-update` IPC:
 
-### Recovery Integration
+- `manual` → opens the releases page because there is no in-place install.
+- `external` → does nothing because the package manager owns the entire update
+  lifecycle and no in-app action is presented for this capability.
+- otherwise → `autoUpdater.quitAndInstall()`, then a **4-second watchdog**. If the
+  app is still alive and still `ready` after it, the status flips to `failed`.
+  A successful install takes the app down before the timer fires. This is defence
+  in depth against the silent no-op recurring on a platform we did not anticipate.
 
-All `autoUpdater` events update the `RecoveryStateStore` (drives tray + macOS menu UI dynamically). Existing renderer IPC channels (`update-available`, `update-downloaded`, `update-error`) are preserved unchanged.
+### Notification
 
-On `update-downloaded`, a native OS notification fires **only when `mainWindow?.isFocused()` is false** — symmetric suppression across normal and recovery modes (the in-app banner / Restart button is visible to a focused user; the notification covers minimized/tray/background-desktop cases). Notification click calls `autoUpdater.quitAndInstall()` directly (force-kill fix path — see Recovery Mode section).
+Fires on `update-available` in manual mode and `update-downloaded` in auto mode,
+suppressed when the window is focused (the in-app toast covers that) and when
+`shouldPromptForUpdate` says no.
 
-Win32 only: `app.setAppUserModelId('com.backspace.desktop')` is set early in startup so notifications attribute to "Backspace" instead of "Electron" in Windows Action Center.
+| Capability | Title | Body | Click |
+|---|---|---|---|
+| `auto` | Backspace update ready | Click to restart and install version X. | `quitAndInstall()` |
+| `manual` | Backspace X is available | Click to open the download page. | `shell.openExternal(RELEASES_URL)` |
+| `external` | — | No in-app notification; the package manager notifies the user. | — |
 
-`extractErrorCode(err)` in `recovery.ts` extracts the `code` field from `electron-updater` errors when present (string only); used to populate `RecoveryState.lastUpdateError.code`.
+Win32 only: `app.setAppUserModelId('com.backspace.desktop')` is set early in
+startup so notifications attribute to "Backspace" in Windows Action Center.
 
----
+### Recovery integration
+
+All `autoUpdater` events update the `RecoveryStateStore`. `UpdateState` gained
+**`available-manual`**: an update exists but this build cannot install it. The
+recovery surface then offers a versioned "Download Backspace X" button
+(`open-releases` action) instead of "Restart to Install Update", and the tray and
+macOS app menus do the same via `updateActionItem`. Without this the recovery
+screen, which is the escape hatch for a user whose app will not start, would
+present the one button guaranteed not to help them.
+
+`extractErrorCode(err)` in `recovery.ts` extracts the `code` field from
+`electron-updater` errors when present (string only); used to populate
+`RecoveryState.lastUpdateError.code`.
+
+### Desktop tab in the browser
+
+The Desktop tab is no longer Electron-only. In a browser it renders
+`DesktopDownloadPanel` instead of the settings panel: a line on what the desktop
+app adds, one primary download for the platform the visitor is on, every other
+build of the same release below it, and a link to the releases listing last.
+
+The links are built from the instance version reported by `GET
+/api/instance/info`, so a visitor is offered the desktop build that matches the
+server they are signed in to. A version that is not a plain `major.minor.patch`
+points every link at the releases listing instead, because there is no tag to
+download from. The server reads its version verbatim from
+`packages/server/package.json`, so a development checkout reports a plain triple
+like any other instance and gets real asset links; the case that actually
+reaches the fallback is the panel having no version yet, while the instance info
+request is in flight or after it failed.
+
+The hazard the fallback does not cover is the window between a version bump
+landing and its tag being published. The links then name assets that do not
+exist and GitHub answers 404. The "All releases" link at the bottom of the panel
+is the recovery, and it is present whatever the version says.
+
+Platform detection reads the user agent client hints first and the user agent
+string second (`packages/web/src/platform/desktopDownload.ts`). A client hint
+platform the module does not recognise, `Unknown` included, decides nothing and
+leaves the answer to the user agent string. Every build is architecture
+specific, so when the browser will not report one the panel falls back to the
+platform default (x64 on Windows and Linux, Apple Silicon on macOS) and says
+so; the tile's picker offers the other one.
+
+Windows is the one platform where the user agent string is not consulted for
+the architecture: every browser on Windows on ARM freezes it at `Win64; x64`,
+so the token proves nothing there. Only a client hint counts, and anything
+else is x64 marked as a guess. The x64 default is load-bearing rather than
+merely likely. The x64 installer runs under emulation on Windows on ARM, while
+the arm64 installer on an x64 machine has no package to extract, so a wrong
+guess has to land on x64.
+
+The secondary list leads with the rest of the detected platform's own builds
+(the other installer on Windows; the other-architecture disk image on macOS;
+the matching deb, then the other architecture's AppImage and deb, on Linux),
+then runs windows, linux, mac over what is left, each platform with the
+detected architecture first. A visitor on an unsupported platform gets no
+primary offer and the plain windows, linux, mac order. That order is the one
+used everywhere a visitor sees a download list: this tab, the README table,
+and the Downloads table in every release's notes.
+
+The same wiring is mirrored in the mobile settings hub
+(`packages/web/src/components/layout/MobileSettingsScreen.tsx`), which is where
+a phone reaches settings: the desktop settings modal is never mounted on a
+mobile viewport. See `docs/systems/mobile-ui.md`.
+
+### Release publishing
+
+Flatpak is represented by the standard update-capability abstraction: when the
+runtime exposes `FLATPAK_ID`, `getUpdateCapability()` returns `external`.
+Updater initialization, checks, prompts, install actions, recovery controls,
+and update settings all consume that capability. Flatpak owns application
+updates because `/app` is immutable; the manifest also removes `app-update.yml`.
+The manifest checks out a pinned source commit, installs dependencies from a
+generated offline pnpm store, compiles TypeScript, and has electron-builder
+produce an unpacked Linux application inside the SDK. It then installs that
+output on the Electron BaseApp and uses `zypak-wrapper` for Chromium sandbox
+integration.
+
+The published manifest remains pinned to a released commit. Pull-request CI
+generates `flatpak/node-sources.ci.json` from the checked-out `pnpm-lock.yaml`
+on each architecture, then uses `flatpak/prepare-ci-manifest.mjs` to generate
+an ignored manifest that swaps both the pinned application source for `type:
+dir` and the committed offline source list for that generated one, so both
+x86_64 and aarch64 jobs compile the actual checkout against its own
+dependencies. The committed `flatpak/node-sources.json` stays paired with the
+pinned release commit and is regenerated only by
+`flatpak-release-metadata.yml`, so ordinary pull requests must not regenerate
+it from their working-tree lockfile, and a contributor changing dependencies
+needs no Flatpak installation on any platform.
+
+**Flatpak release metadata.** Publishing a GitHub release starts
+`.github/workflows/flatpak-release-metadata.yml` (`release: released`, which
+fires for a full release and for a prerelease promoted to one, never for a
+prerelease). A tag outside `vX.Y.Z`, a prerelease, or a release that has
+already landed makes the run a successful no-op that logs why. A release has
+landed when main's manifest pins the Backspace source to the tag's commit
+(read with `flatpak/manifest-pin.mjs`), which only its merged metadata pull
+request does. An AppStream entry for the version on main does not count as
+landed: see step 2. Otherwise, checked out at the tag, it:
+
+1. Reads the release notes and takes the paragraph under the
+   `# Backspace X.Y.Z` title as the AppStream release description, which is
+   the "What's New" text in GNOME Software, KDE Discover and Flathub
+   (`flatpak/release-summary.mjs`: wrapped lines are joined, links and images
+   become their text, emphasis and code markers are dropped, backslash escapes
+   become the literal character). Notes that do not open with that title
+   followed by a prose paragraph (a heading, table, list, quote, code block or
+   HTML in its place, or nothing) fail the job with the reason, so a
+   placeholder never ships. Fix the notes on the release page and dispatch a
+   new run.
+2. Runs `flatpak/update-release.mjs`, which updates the source pin, the
+   screenshot tag and the AppStream entry. The script reads the metainfo as it
+   is at the tag. To write the entry by hand instead of taking the notes'
+   paragraph, commit it to main before cutting the tag: the script then keeps
+   it and never replaces it, while the pin, the screenshot tag and
+   `node-sources.json` still move and the pull request still opens. The notes
+   still need their summary paragraph, because step 1 runs either way. An entry
+   written by hand on the metadata pull request's branch is not kept: a re-run
+   while that pull request is open force-pushes a fresh branch from the tag
+   over it.
+3. Regenerates `node-sources.json`, lints the manifest and AppStream file,
+   uploads those exact files, and builds their published manifest natively on
+   x86_64 and aarch64. The metadata pull request also runs `flatpak.yml`, but
+   that builds the working tree; this is the only build of the manifest as it
+   will be published.
+4. Only after both builds pass, pushes `automation/flatpak-<tag>` and opens (or
+   reuses) the metadata pull request as the release bot GitHub App. The app's
+   token, unlike `GITHUB_TOKEN`, starts CI on the pull request. The job updates
+   the branch when main has moved past the tag, because the ruleset requires
+   it to be up to date, and turns on squash auto-merge, so the pull request
+   merges itself once `Build & test` passes.
+
+To re-run a release, dispatch the workflow with its tag (`workflow_dispatch`,
+input `tag`); a malformed tag fails the dispatch. A re-run replaces the open
+pull request's branch, as described in step 2. A tag cut before this workflow
+existed cannot be re-run, and a release that has already landed opens nothing.
+Use a fresh dispatch rather than "Re-run failed jobs" on
+the pull request job after the first day: the builds hand their files to that
+job as an artifact kept for one day, so a re-run after that fails to find it.
+
+When the pull request job goes red at the update-branch step, click "Update
+branch" on the pull request. Auto-merge is already on and finishes once CI
+passes on the updated branch.
+
+The app and its two secrets are described in
+[security-scanning.md](security-scanning.md#done).
+
+`create-release` writes the `# Backspace X.Y.Z` heading at the top of the
+draft, above the Downloads table. The one human step for Flatpak is to write
+the summary paragraph directly under that heading before publishing. Flathub
+shows that paragraph, so write it as the store-facing summary of the release.
+
+CI publishes via `.github/workflows/release.yml` (tag `v*` on the public repo).
+A `create-release` job runs first and creates the draft for the tag, then four
+native build jobs fan out (mac arm64+x64, win x64+arm64, linux x64, linux
+arm64), each uploading its installers, `.blockmap`s, and platform `latest*.yml`
+manifest into that one draft. The draft must be published manually, because
+drafts are invisible to electron-updater. Publishing it also starts the Flatpak
+metadata workflow above.
+
+A release carries 16 assets, named
+`Backspace-<version>-<os>-<arch>.<ext>` (`artifactName` in
+`electron-builder.yml`, `${os}` being `win`, `mac` or `linux`):
+
+| Asset | Reader |
+|-------|--------|
+| `-win-x64.exe`, `-win-arm64.exe` (+ `.blockmap`) | Windows users; electron-updater picks by `process.arch` |
+| `-linux-x86_64.AppImage`, `-linux-arm64.AppImage` | Linux users; AppImage auto-update, one feed file per architecture |
+| `-linux-amd64.deb`, `-linux-arm64.deb` | Linux users |
+| `-mac-arm64.dmg`, `-mac-x64.dmg` (+ `.blockmap`) | Mac users; the blockmaps are unused while mac updates are `manual` |
+| `latest.yml`, `latest-linux.yml`, `latest-linux-arm64.yml`, `latest-mac.yml` | electron-updater; a `manual` mac still reads `latest-mac.yml` to raise its notice |
+
+The architecture spelling follows electron-builder's per-format convention
+(`x86_64` for an AppImage, `amd64` for a deb, `x64` elsewhere). There is no
+combined Windows installer (`nsis.buildUniversalInstaller: false`) and no mac
+zip: the zip only serves Squirrel.Mac auto-update, which ad-hoc signed builds
+cannot use.
+
+GitHub sorts the asset list by name and offers no other order, which puts
+Linux first and Windows last. So `create-release` writes a Downloads table
+into the draft body, in Windows, Linux, macOS order with plain labels, from
+the names electron-builder will produce; the "What's new" notes are written
+by hand above it before publishing. The web client's Desktop tab
+(`packages/web/src/platform/desktopDownload.ts`) and the README table spell
+the same names out and have to move with `artifactName`.
+
+The `create-release` job exists because electron-builder creates the release
+itself when it cannot find one for the tag, and four jobs doing that lookup
+concurrently can all miss. On v1.0.3 two of them created a draft and the assets
+split across the pair, which needed manual consolidation before the release
+could be published. Creating the draft once, ahead of the matrix, leaves the
+build jobs with nothing to create.
+
 
 ## Recovery Mode
 
@@ -309,7 +649,9 @@ Source files:
 interface RecoveryState {
   mode: 'normal' | 'recovery';
   reason: { code: 'load-failed' | 'render-gone' | 'unresponsive' | 'renderer-stalled'; detail: string } | null;
-  updateState: 'idle' | 'checking' | 'downloading' | 'downloaded' | 'error';
+  // 'available-manual': an update exists but this build cannot install it in
+  // place, so the surface offers a download rather than a dead Restart button.
+  updateState: 'idle' | 'checking' | 'downloading' | 'available-manual' | 'downloaded' | 'error';
   updateVersion: string | null;
   lastUpdateError: { message: string; code: string | null; at: number } | null;
   lastCheckResult: 'up-to-date' | 'failed' | null;  // transient, 5s decay
@@ -346,9 +688,14 @@ Page reads initial state via `getRecoveryState()` IPC and subscribes to `recover
 |--------|---------|---------|
 | Reload | always | always |
 | Restart to Install Update | `updateState === 'downloaded'` | always when visible |
-| Check for Updates | always | not in `'checking'` / `'downloading'` / `'downloaded'` |
+| Check for Updates | always | not in `'checking'` / `'downloading'` / `'downloaded'` / `'available-manual'` |
 | Change Instance | always | always |
-| Open Releases Page | `updateState === 'error'` | always when visible |
+| Open Releases Page | `updateState === 'error'` or `'available-manual'` | always when visible |
+
+In `'available-manual'` the Open Releases button relabels to "Download Backspace
+X". Restart to Install is never shown in that state, because the build cannot
+install in place.
+
 | Quit Backspace | always | always |
 
 **Change Instance from recovery is non-destructive.** The saved URL is not cleared when navigating to the picker; see the Instance Picker section above for the full behavior (pre-filled input, Cancel button, header copy update).
@@ -412,6 +759,20 @@ Executed before each release. See `docs/superpowers/specs/2026-05-03-electron-re
 - `silent: false` (plays system sound)
 - Click handler: defaults to show + focus the main window; an optional `onClick` parameter overrides this (used by the update-ready notification to call `autoUpdater.quitAndInstall()` directly)
 
+Chat notifications carry optional `{ channelId, spaceId, userId }` context through
+`showNotification(title, body, options?)`. Clicking restores a minimized window,
+shows it, and sends `notification-click` back to the originating renderer only
+while its home origin still matches. `onNotificationClick` returns an unsubscribe
+function; the web client feature-detects it for compatibility with older shells.
+`NotificationController` validates the signed-in home user and current channel
+membership before navigating to `/channels/<spaceId or @me>/<channelId>`.
+The space comes from `channelToSpaceMap`, including remote spaces; existing
+channel-origin routing selects the API instance. Browser notifications use the
+same navigation handler and close on click. Mobile navigation also brings the
+chat screen to the top when the URL already points at that chat.
+
+Do Not Disturb and the badge: see sounds.md ("Do Not Disturb").
+
 Badge count: `set-badge-count` IPC calls `app.setBadgeCount()` (macOS dock badge, Windows taskbar overlay).
 
 **Win32 attribution:** `app.setAppUserModelId('com.backspace.desktop')` set early in startup so notifications attribute to "Backspace" in Windows Action Center.
@@ -435,16 +796,50 @@ Hidden menu bar (frameless window), but an Edit menu is still registered so keyb
 
 ## Screen Share Integration
 
-The main process intercepts `getDisplayMedia()` via `session.defaultSession.setDisplayMediaRequestHandler()`.
+The main process intercepts `getDisplayMedia()` via `session.defaultSession.setDisplayMediaRequestHandler()`. Two IPC flows answer it; the renderer's `ScreenShareSetup` (see `voice.md`, "Start flow") decides which by feature-detecting the preload API.
 
-### Flow
+### Preselected flow (current web client)
 
-1. Handler invoked by Chromium when renderer calls `navigator.mediaDevices.getDisplayMedia()`
-2. Main process enumerates sources via `desktopCapturer.getSources({ types: ['screen', 'window'], thumbnailSize: { width: 320, height: 180 }, fetchWindowIcons: true })`
-3. Sources serialized (id, name, thumbnail data URL, app icon data URL, isScreen flag) and sent to renderer via `screen-share-sources` IPC
-4. Renderer shows custom picker UI, user selects a source
-5. Renderer sends `screen-share-selected` IPC with `sourceId` (or `null` to cancel) and `shareAudio` flag
-6. Main process calls `callback({ video: selectedSource, audio: 'loopback' })` (audio only if `shareAudio` is true)
+1. Setup screen opens → renderer calls `getScreenSources()` (`ipcMain.handle('get-screen-sources')`) → main enumerates via `desktopCapturer.getSources({ types: ['screen', 'window'], thumbnailSize: { width: 320, height: 180 }, fetchWindowIcons: true })`, caches the result in `lastScreenSources`, returns the serialized list (id, name, thumbnail data URL, app icon data URL, isScreen flag). Enumeration is gated — see "Who may enumerate" below
+2. User clicks a tile → renderer sends `screen-share-preselect` with `sourceId` + `shareAudio` → main stores `pendingScreenSelection` (30 s TTL)
+3. Renderer calls `getDisplayMedia()` → handler takes the pending selection (one-shot), resolves the id against the cache (re-enumerating if missing) and calls `callback({ video: source, audio: 'loopback' })` (audio only when `shareAudio`). No prompt round-trip.
+4. The stream is previewed in the setup screen and published on "Start stream".
+5. Turning System Audio on during a share that has no audio runs steps 2 and 3 again for the same `sourceId` with `shareAudio = true`; the renderer keeps only the new capture's loopback audio track and stops its video (`syncScreenShareAudio`, voice.md "Changing the toggle mid-stream"). The handler re-enumerates to resolve the id, since the caches were dropped after the first request. No main-process or preload change was needed for this.
+
+### Who may enumerate
+
+`get-screen-sources` hands the renderer a thumbnail of every open window, and the renderer runs the instance's web client — remote code. Before the setup screen existed, that pixel data only ever arrived as the *result* of a `getDisplayMedia()` call, which Chromium gates behind transient activation; an IPC handler has no such gate, so the decision is spelled out in `screenSharePolicy.ts` (`screenEnumerationDecision`) and applied in `main.ts`:
+
+| Condition | Answer |
+|-----------|--------|
+| Sender is not `mainWindow.webContents` | `[]` |
+| The app window is not focused | the last serialized list (no fresh capture) |
+| Less than `SCREEN_SOURCES_CACHE_MS` (1 s) since the last enumeration | the last serialized list |
+| Otherwise | a fresh `desktopCapturer` scan, cached with its timestamp |
+
+The setup screen enumerates once per open, so no legitimate flow meets the cache window. Both caches (`lastScreenSources`, the NativeImage list used to resolve a preselected id, and `lastServedScreenSources`, the serialized one) are dropped in the display-media handler's `finally`, so thumbnails are not pinned for the life of the process. `get-screen-share-picker-mode` carries the same sender guard and answers `'app'` to anything else.
+
+None of this substitutes for trusting the instance you connect to; it bounds what a hostile or compromised web client can collect silently. See `desktop-security.md`.
+
+### System-picker flow (Wayland)
+
+`get-screen-share-picker-mode` returns `'system'` on Linux when `XDG_SESSION_TYPE=wayland` (or `WAYLAND_DISPLAY` is set and the session is not X11), `'app'` everywhere else (`screenSharePickerMode()` in `screenSharePolicy.ts`, unit-tested there alongside the preselection TTL and the enumeration gate). This reads the session type, which is a guess: under XWayland the capture stack behaves like X11 while the session still reports `wayland`. A wrong guess costs one extra click — the click falls through to the prompted flow, which both sides already support. Under Wayland, `desktopCapturer.getSources()` itself opens the compositor's screencast portal and returns only what the user chose there, so:
+
+1. The renderer never enumerates up front (that would prompt on every open); it shows a "Choose" card and sends `screen-share-audio-preference` with the loopback choice
+2. The card's click calls `getDisplayMedia()` → handler enumerates → portal dialog → one source back
+3. Handler sees `'system'` mode and exactly one source and calls `callback({ video: source, audio: 'loopback'? })` directly, no `screen-share-sources` round trip
+4. Zero sources means the portal was cancelled → request denied → renderer shows "No screen was chosen"
+
+There is no persistent grant: the portal asks per share by design, and one screen or window per share is inherent. The AppImage packaging is unrelated.
+
+### Prompted flow (older web clients, or nothing preselected)
+
+1. Handler invoked with no pending selection → main enumerates sources and sends them via `screen-share-sources` IPC
+2. Renderer shows the grid, user selects a source
+3. Renderer sends `screen-share-selected` with `sourceId` (or `null` to cancel) and `shareAudio`
+4. Main calls `callback({ video: selectedSource, audio: 'loopback' })`
+
+The prompted flow stays because the desktop app loads whatever web client its instance serves: an older instance still calls `getDisplayMedia()` first, and a newer instance on an older desktop build lacks `getScreenSources` and falls back to this path (`preselectScreenSource` / `getScreenSources` are optional in `electron.d.ts` for that reason).
 
 No sources (0 results) typically means Screen Recording permission not granted on macOS.
 
@@ -483,13 +878,16 @@ All handlers registered in `main.ts:registerIpcHandlers()`.
 
 | Channel | Direction | Payload | Action |
 |---------|-----------|---------|--------|
-| `show-notification` | R->M | `{ title, body }` | Show native notification |
+| `show-notification` | R->M | `{ title, body, options?: { channelId?, spaceId?, userId? } }` | Show native notification with optional chat target |
+| `notification-click` | M->R | `{ channelId?, spaceId?, userId? }` | Open the notification's chat in the originating session |
 | `set-badge-count` | R->M | `number` | Set dock/taskbar badge |
 | `minimize-window` | R->M | — | Minimize window |
 | `maximize-window` | R->M | — | Toggle maximize/unmaximize |
 | `close-window` | R->M | — | Close (hides to tray) |
-| `install-update` | R->M | — | `autoUpdater.quitAndInstall()` |
+| `install-update` | R->M | — | `quitAndInstall()` on auto-capable builds, otherwise opens the releases page. 4s watchdog flips the status to `failed` if the app is still running |
 | `check-for-updates` | R->M | — | `autoUpdater.checkForUpdates()` |
+| `dismiss-update` | R->M | `{ version }` | Persists the dismissal and re-pushes the snapshot |
+| `open-release-page` | R->M | — | `shell.openExternal(RELEASES_URL)` |
 | `screen-share-selected` | R->M | `sourceId, shareAudio?` | Safety net (actual handler is `ipcMain.once` in display media flow) |
 | `keybinds-sync` | R->M | `KeybindConfig[]` | `keybindManager.updateKeybinds()` |
 | `set-connected-origins` | R->M | `string[]` | Update `knownInstanceOrigins` set (used by in-instance `/join/` interception) |
@@ -509,6 +907,8 @@ All handlers registered in `main.ts:registerIpcHandlers()`.
 | `get-current-activity` | R->M | `Activity \| null` | Current detected game activity |
 | `check-accessibility` | R->M | `boolean` | macOS accessibility permission check |
 | `get-recovery-state` | R->M | `RecoveryState` | Recovery page reads initial state on mount |
+| `get-update-status` | R->M | `UpdateSnapshot` | Renderer reads the current snapshot on mount |
+| `is-sandboxed` | R->M | `boolean` | Detect package sandbox restrictions independently of update capability |
 
 ### Main -> Renderer Events
 
@@ -526,6 +926,7 @@ All handlers registered in `main.ts:registerIpcHandlers()`.
 | `keybind-hook-error` | `{ message }` | uIOhook start failure |
 | `open-internal-route` | `string` (path) | In-instance `/join/` interception: renderer navigates to `path` instead of opening externally |
 | `recovery-state-changed` | `RecoveryState` | Store subscriber, mode-gated to `mode === 'recovery'` |
+| `update-status-changed` | `UpdateSnapshot` | Every status or dismissal change |
 
 ---
 
@@ -573,6 +974,15 @@ Detection: `typeof window.backspace !== 'undefined'` (see `platform.ts:isElectro
 | `getRecoveryState()` | invoke | R->M | Returns `Promise<RecoveryState>` |
 | `onRecoveryStateChanged(cb)` | listen | M->R | Returns cleanup function; recovery.html subscribes |
 | `recoveryAction(action)` | fire | R->M | Single channel for all recovery button clicks |
+| `getUpdateStatus()` | invoke | R->M | Returns `Promise<UpdateSnapshot>`. Optional: absent on pre-1.0.5 apps |
+| `onUpdateStatusChanged(cb)` | listen | M->R | Returns cleanup function. Optional |
+| `dismissUpdate(version)` | fire | R->M | Optional |
+| `openReleasePage()` | fire | R->M | Optional |
+
+The four update-snapshot methods are declared **optional** in
+`electron.d.ts`. A client served by a newer instance can be running inside an
+older desktop app that does not expose them, so every call site feature-detects.
+`updateStore.ts` falls back to the legacy per-event channels when they are absent.
 
 Direction legend: **fire** = `ipcRenderer.send` (no response), **invoke** = `ipcRenderer.invoke` (returns Promise), **listen** = `ipcRenderer.on` (event subscription).
 
@@ -682,7 +1092,67 @@ interface Activity {
 
 ### Overview
 
-Captures global keyboard and mouse events via `uiohook-napi` (OS-level input hook) and matches them against user-configured keybinds. Works even when the Backspace window is not focused.
+Windows, macOS and Linux X11 capture global keyboard and mouse events via
+`uiohook-napi`. Linux Wayland sessions (including an XWayland app window inside
+Wayland) instead use the desktop's `org.freedesktop.portal.GlobalShortcuts`
+interface. An X11 hook cannot observe input to other native Wayland clients.
+
+### Wayland portal
+
+`globalShortcutsPortal.ts` uses a dedicated session-bus connection, registers the
+desktop-file identity `io.github.TheZwiss.backspace` through the host Registry
+when outside Flatpak, and creates a GlobalShortcuts session. Older portals
+without the optional Registry remain supported. Flatpak supplies its own identity;
+no additional bus permissions or unrestricted input-device access are requested.
+
+The desktop is the sole source of truth for Wayland assignments. The application
+registers a stable catalogue of all six voice actions, without preferred triggers
+or dependence on browser/X11 keybind storage. After successful registration, every startup creates a session and
+calls BindShortcuts so the desktop can restore its saved assignments. Registration
+is not gated on ListShortcuts: some backends return an empty list before binding
+the new session. First launch stays idle until Settings → Keybinds requests registration.
+Successful registration is remembered in `userData/global-shortcuts.json`; only
+the registration flag is stored, never shortcut assignments. Existing installs
+without this flag need to open Keybinds once to save it.
+After cancellation or failure, the explicit retry button can register a new session.
+
+On Wayland the settings panel has no local recorder, edit or delete controls.
+It directs users to the system's Backspace shortcut settings and shows a read-only
+list of actual assignments. Closing a session unregisters its runtime listeners;
+it does **not** delete the desktop's persistent shortcut configuration. Change or
+remove those assignments in the desktop settings instead.
+
+Bindings require system consent and a portal backend implementing GlobalShortcuts.
+`Activated` and `Deactivated` both reach the renderer so push-to-talk works while
+unfocused. Electron's press-only `globalShortcut` callback is insufficient here.
+Only signals from the resolved portal owner and current session are accepted.
+Repeated activations are suppressed; stop, revoked bindings, session closure,
+portal restart and transport errors release held actions. Portal failure exposes
+a manual retry in settings (no prompt loop). Local bindings are disabled on
+Wayland even when the portal is unavailable, so a removed system assignment cannot
+unexpectedly continue to work through a stale local binding.
+
+One portal session lasts for the app run; local edits, empty configuration and
+renderer unmount do not recreate it. BindShortcuts is called at most once per
+session. Request responses are subscribed before method calls to handle early
+replies; method and consent waits are bounded and cancelled on shutdown.
+
+Optional preload methods `getKeybindPortalStatus`, `onKeybindPortalStatus` and
+`retryKeybindPortal` report idle/pending/ready/unavailable plus actual assignments.
+ShortcutsChanged triggers a full ListShortcuts refresh instead of treating the
+possibly partial signal as the whole configuration. Window focus and reading
+status also refresh the list, covering changes made in system settings. Removed
+or reassigned held actions are released. PTT mode follows the system's active PTT
+assignment, not local storage; unchanged status refreshes do not re-mute a held PTT.
+Portal events bypass the legacy 100 ms duplicate filter. The browser/non-Wayland
+fallback releases its own held actions on window blur and cleanup.
+
+The MIT-licensed `dbus-next` dependency provides D-Bus message transport without a
+helper executable. Its optional obsolete `usocket` native addon is excluded (no
+file-descriptor transfer is needed), and `xml2js` is overridden to a patched
+version. The normal filesystem session socket works through Node's built-in net
+transport; legacy abstract sockets requiring the optional addon report the portal
+as unavailable. Regenerate Flatpak's offline sources after lockfile changes.
 
 ### Native Keycode to DOM Code Mapping
 
@@ -870,7 +1340,7 @@ Toggle actions only fire on `pressed: true`. Push-to-talk fires on both press (u
 ```yaml
 appId: com.backspace.desktop
 productName: Backspace
-artifactName: "${productName}-${version}-${arch}.${ext}"
+artifactName: "${productName}-${version}-${os}-${arch}.${ext}"
 output: dist-electron
 ```
 
@@ -878,8 +1348,8 @@ output: dist-electron
 
 | Platform | Formats |
 |----------|---------|
-| macOS | dmg, zip |
-| Windows | nsis (allows custom install dir) |
+| macOS | dmg (no zip: Squirrel.Mac auto-update needs a Developer ID first) |
+| Windows | nsis, one installer per architecture (allows custom install dir) |
 | Linux | AppImage, deb |
 
 ### Build Commands
@@ -894,7 +1364,9 @@ output: dist-electron
 
 **Dependency:** `uiohook-napi` (native N-API addon for global input hooks)
 
-**Rebuild:** `electron-rebuild -f -w uiohook-napi` runs on `postinstall` to compile for the build machine's Electron ABI.
+**Rebuild:** `electron-rebuild -f -w uiohook-napi` runs on `postinstall` to compile for the build machine's Electron ABI. `uiohook-napi` is the only native module this rebuild touches, and it is the only one in the desktop dependency tree. `better-sqlite3` belongs to `packages/server` and never enters the packaged app, so an Electron ABI mismatch cannot reach it.
+
+`@electron/rebuild` 4 is ESM-only and declares `engines.node: >=22.12.0`, which the repository's own floor now matches (`engines.node: >=22.12.0`, CI legs on 22 and 24). While one `ci.yml` leg still ran Node 20 the CLI was measured on 20.19.5 and completed the rebuild anyway: it uses `parseArgs`, `styleText` and `import.meta.dirname`, all of which exist in 20.19. The `postinstall` also ends in `|| node -e "console.warn(...)"`, so a future failure degrades to a warning rather than breaking `pnpm install`. That fallback is what makes the engines mismatch tolerable, not the measurement: if the rebuild ever does stop running on Node 20, `pnpm dev` breaks locally while release builds keep working, because packaging uses `prebuilds/` and `npmRebuild: false`.
 
 **ASAR unpacking:** All `.node` files are unpacked from the ASAR archive (`asarUnpack: "**/*.node"`). Native modules cannot load from inside ASAR.
 
@@ -923,15 +1395,45 @@ output: dist-electron
 
 **WARNING:** Removing or disabling this hook will cause Windows and Linux builds to crash on launch. This is documented in project memory as a critical constraint.
 
+3. **Ad-hoc sign (macOS only):** Delegates to `scripts/macSign.js`. Must run last — signing seals the bundle, so it has to follow every file mutation, including the deletions above.
+
+### macOS Ad-hoc Signing (CRITICAL)
+
+**File:** `scripts/macSign.js`
+
+**Problem:** electron-builder only signs when it can resolve a signing identity. With no Developer ID available, `MacPackager.sign()` bails out before signing at all (`findIdentity()` → `null` → `reportError()` → `return false`), leaving the bundle with only the linker-generated ad-hoc signatures baked into the prebuilt Electron binaries. Packaging then invalidates those: it renames the executable, rewrites `Info.plist`, injects `app.asar`, and deletes files from `Contents/Resources`.
+
+The result is not merely unsigned, it is **invalid** — `codesign --verify` reports `code has no resources but signature indicates they must be present`, and there is no `Contents/_CodeSignature` at all. macOS reports an invalid signature as *"Backspace.app is damaged and can't be opened. You should move it to the Trash."* That is a dead end: unlike the unnotarized-app warning, it offers no "Open Anyway" path. Every macOS user of v1.0.0 hit this (issue #38).
+
+**Solution:** Re-seal the bundle with an ad-hoc signature in `afterPack`:
+
+1. Sign every Mach-O under `Contents/Resources` (`.node`, `.dylib`). `codesign --deep` only reaches the standard nested-code locations, so native modules unpacked to `app.asar.unpacked` are otherwise sealed as plain resources and never signed.
+2. `codesign --force --deep --sign -` the bundle. `--deep` is discouraged for distribution signing because it applies one entitlement set to every nested binary; ad-hoc signatures carry no entitlements, so that does not apply here.
+3. `codesign --verify --deep --strict` immediately, so a bad bundle fails the build **before** electron-builder packages and publishes it. `.github/workflows/release.yml` re-checks the final bundle as a backstop.
+
+**Why `afterPack` and not `afterSign`:** electron-builder skips the `afterSign` hook entirely when no signing occurred (`didSign === false`), which is precisely this build's situation.
+
+**No-op conditions:** skips when `CSC_LINK` or `CSC_NAME` is set, so a real Developer ID identity takes over cleanly, and warns (rather than failing) on non-macOS hosts, which cannot run `codesign`.
+
+**WARNING:** Removing this hook makes macOS builds refuse to launch entirely.
+
 ### Icon Generation
 
-All desktop and web brand assets are generated by `scripts/gen-icons.mjs` from sources in `assets/brand/`. Run via `pnpm gen-icons` after artwork changes; commit the diff. The generator uses `sharp` (resize / SVG → PNG / squircle composite), `png-to-ico` (multi-size `.ico`), and `png2icons` (`.icns`). Output is byte-stable for a given lockfile.
+All desktop and web brand assets are generated by `scripts/gen-icons.mjs` from sources in `assets/brand/`. Run via `pnpm gen-icons` after artwork changes; commit the diff. The generator uses `sharp` (SVG → PNG via librsvg), `png-to-ico` (multi-size `.ico`), and `png2icons` (`.icns`). Output is byte-stable for a given lockfile.
+
+The split is by surface, not file type: UI surfaces (favicons, tray icons, the in-app sidebar tile) stay a flat two-colour mark; the app-icon family (every output where the OS shows this app as one launchable icon: dock, taskbar, Start menu, Alt-Tab, PWA install, iOS home screen, the maskable Android icon) is a dimensional squircle badge on a `#2a2740`-to-`#12101d` plum gradient, with drop shadow, inner shadow and a soft-light stroke overlay, and a white-to-`#7c6cf6` gradient glyph.
 
 **Sources:**
-- `app-icon.svg` — flat-vector B-badge. Drives app-icon outputs <128 px (favicons, small `.ico` reps, small Linux launcher reps) where pixel-grid alignment beats 3D detail.
-- `app-icon-x1.png` (149) / `app-icon-x2.png` (294) / `app-icon-x3.png` (440) / `app-icon-1024.png` (1024) — 3D-rendered B-badge at four native resolutions. Drives app-icon outputs ≥128 px (PWA, dock, launcher, homescreen, in-app sidebar logo). The generator picks the smallest source whose dimension is ≥ the target output size, so every output is a downscale (no upscale anywhere). After resize, a 22 %-radius rounded-square mask clips the corners to transparent — matches Apple's macOS template ratio and the existing `app-icon.svg` geometry, so launchers/docks/homescreens that render the icon as-is produce the rounded silhouette they expect.
-- `mark.svg` — bare gradient B. Drives the PWA maskable inner (60 % scale on `#1d1d1b`) and the Win/Linux tray icons.
-- `mark-mono-dark.svg` — solid-black B. Drives the macOS menu-bar template tray icon (alpha + black; OS recolours).
+- `app-icon.svg`: the dimensional squircle badge (plum gradient, filters, stroke overlay) plus the gradient glyph, at a 256 viewBox. Every app-icon output above 32 px renders straight from this vector, at target size, with no raster intermediate or post-render masking.
+- `app-icon-small.svg`: the same dimensional badge geometry with a bolder, simplified mark. Drives app-icon outputs at 16 and 32 px, where the standard mark's inset strokes and shadow read as noise.
+- `mark-icon.svg`: the bare gradient glyph alone, transparent, no badge. Drives the PWA maskable icon's inner mark (composited over a full-bleed plum-gradient canvas, mark at 60% of canvas height) and the social preview.
+- `mark-small.svg`: a bolder small-size variant of the flat glyph. Drives the web favicons (16/32, transparent, glyph fills the box) and the colour tray icons (Windows `.ico`, Linux PNG).
+- `mark-mono-light.svg`: the flat white glyph, for rendering on a lavender ground. Drives `packages/web/public/icons/logo-mark.svg` (byte copy), which paints the sidebar's lavender home tile.
+- `mark-tray.svg`: template artwork tuned for 22px. Drives the macOS menu-bar template tray icon (alpha + black; OS recolours). `mark-mono-dark.svg` has no pipeline output today.
+
+`mark.svg` (the flat-lavender standalone glyph, for dark UI-surface grounds) is not read by this script.
+
+`apple-touch-icon.png` composites the app icon full-bleed over an opaque copy of its own plum gradient (`#2a2740` to `#12101d`, matching `app-icon.svg`'s squircle) so no pixel is transparent. iOS otherwise paints transparent corners black.
 
 The `dev` script copies the committed `build/icon.icns` into Electron's bundled `Resources/electron.icns` so the macOS dev dock shows the Backspace mark instead of the default Electron logo. This dev-only patch is independent of how `.icns` is generated.
 
@@ -975,6 +1477,7 @@ Earlier builds wrote to `<appData>/@backspace/desktop/`. On first launch after t
 | `instance-url.json` | `{ url: string }` | Saved instance URL |
 | `window-state.json` | `WindowState` | Window position, size, maximize state |
 | `auto-launch.json` | `AutoLaunchSettings` | Open at login + start minimized prefs |
+| `update-state.json` | `{ dismissedVersion }` | The update version the user waved away. Belongs to the app, not to an instance |
 | `games-cache.json` | `VersionedDictionary` | Cached remote game dictionary |
 | `games-cache-etag.txt` | ETag string | For conditional HTTP requests |
 
@@ -991,10 +1494,14 @@ Earlier builds wrote to `<appData>/@backspace/desktop/`. On first launch after t
 5. Create main window (with state restoration)
    - After the BrowserWindow is constructed, `setMainWindow(mainWindow)` and `attachRecoveryHandlers(mainWindow)` are called. The `closed` event handler calls `setMainWindow(null)`.
 6. Create tray icon
-7. Initialize auto-updater (10s delayed first check)
+7. Resolve the update capability, then initialize the auto-updater (10s delayed
+   first check). An `external` capability, including Flatpak, records that state
+   without loading `electron-updater`.
 8. Wire recovery store subscriber (rebuilds tray + macOS menu on every state change; pushes `recovery-state-changed` to renderer when in recovery mode)
 9. `setOnQuitRequested(requestQuit)` so recovery's Quit button uses the same `isQuitting + app.quit()` pattern as the tray
-10. Start activity detection (immediate first poll, 15s interval, background remote sync)
+10. Start activity detection (immediate first poll, 15s interval, background
+    remote sync). Flatpak uses the same platform-dependent behavior as global
+    keybinds instead of applying a contradictory package-wide disable.
 11. Linux/AppImage path-refresh: re-apply autostart entry if `$APPIMAGE` path changed (conditional; no-op on Windows/macOS)
 12. Check for deep link in launch args
 

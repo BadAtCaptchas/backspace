@@ -1,8 +1,12 @@
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyReply } from 'fastify';
+import type Database from 'better-sqlite3';
 import { eq } from 'drizzle-orm';
-import { getDb, schema } from '../db/index.js';
+import { getDb, getRawDb, schema } from '../db/index.js';
 import { authenticate, requireAdmin } from '../utils/auth.js';
 import { config } from '../config.js';
+import { sendError } from '../utils/httpErrors.js';
+import { markDirectoryDirty, readDirectoryState } from '../directory/state.js';
+import { countListedSpaces } from '../directory/document.js';
 import type { InstanceStreamingLimits, InstanceAdminSettings } from '@backspace/shared';
 import { STANDARD_RESOLUTIONS, STANDARD_FRAMERATES, BITRATE_MATRIX_KBPS } from '@backspace/shared/src/constants.js';
 
@@ -23,6 +27,12 @@ function rowToLimits(row: typeof schema.instanceSettings.$inferSelect): Instance
     maxResolution: row.maxResolution,
     maxFramerate: row.maxFramerate,
     discoveryEnabled: row.discoveryEnabled === 1,
+    directoryEnabled: row.directoryEnabled === 1,
+    // From configuration, not from the row: whether this instance has a hub
+    // to reach at all. Every surface that offers to list a space needs it,
+    // and a space's own instance is the only one that can answer it, which
+    // is why it travels on the document a peer's client already fetches.
+    directoryConfigured: config.directory.endpoint !== '',
     bitrateMatrixOverrides: (() => {
       const raw = row.bitrateMatrixOverrides as string | null;
       if (!raw) return null;
@@ -36,13 +46,87 @@ function rowToLimits(row: typeof schema.instanceSettings.$inferSelect): Instance
   };
 }
 
+type SettingsRow = typeof schema.instanceSettings.$inferSelect;
+type SettingsUpdate = Record<string, number | string | boolean | null>;
+
+function rowToAdminSettings(row: SettingsRow, sqlite: Database.Database): InstanceAdminSettings {
+  const gifKey = row.gifApiKey as string | null;
+  const maxUploadBytes = row.maxUploadSizeBytes ?? config.maxUploadSize;
+  const directory = readDirectoryState(sqlite);
+  return {
+    instanceName: row.instanceName ?? 'Backspace',
+    registrationOpen: row.registrationOpen !== null ? row.registrationOpen === 1 : config.registrationOpen,
+    federatedRegistrationOpen: row.federatedRegistrationOpen === 1,
+    discoveryEnabled: row.discoveryEnabled === 1,
+    gifApiKey: gifKey ? `****${gifKey.slice(-4)}` : undefined,
+    gifEnabled: !!gifKey,
+    maxUploadSizeMb: Math.round(maxUploadBytes / (1024 * 1024)),
+    federationRelayEnabled: row.federationRelayEnabled === 1,
+    federationRelayTtlDays: row.federationRelayTtlDays,
+    defaultAutoRotateIntervalDays: row.defaultAutoRotateIntervalDays,
+    autoAcceptPeering: row.autoAcceptPeering === 1,
+    directoryEnabled: directory.enabled,
+    directoryBrowseEnabled: row.directoryBrowseEnabled === 1,
+    directoryLastPingAt: directory.lastPingAt,
+    directoryLastError: directory.lastError,
+    directoryListedSpaceCount: countListedSpaces(sqlite),
+    supportCardEnabled: row.supportCardEnabled,
+  };
+}
+
+/**
+ * The one place the "discovery off implies directory off" invariant lives
+ * (spec section 4). Runs after the caller has translated `discoveryEnabled`
+ * into `updateData`, so the resulting discovery state is known. Returns false
+ * after sending the error reply.
+ */
+function applyDiscoveryAndDirectory(
+  body: { directoryEnabled?: unknown },
+  updateData: SettingsUpdate,
+  currentRow: SettingsRow,
+  reply: FastifyReply,
+): boolean {
+  const discoveryOn = (updateData.discoveryEnabled ?? currentRow.discoveryEnabled) === 1;
+
+  if (body.directoryEnabled !== undefined) {
+    if (typeof body.directoryEnabled !== 'boolean') {
+      sendError(reply, 400, 'field_not_boolean', { field: 'directoryEnabled' });
+      return false;
+    }
+    if (body.directoryEnabled && !discoveryOn) {
+      sendError(reply, 400, 'directory_requires_discovery');
+      return false;
+    }
+    updateData.directoryEnabled = body.directoryEnabled ? 1 : 0;
+  }
+
+  if (!discoveryOn) {
+    updateData.directoryEnabled = 0;
+  }
+  return true;
+}
+
+/**
+ * Fields of instance_settings that feed the served directory document
+ * (spec section 4). A write that changes any of them owes a ping; the name
+ * is compared through the same fallback the document applies.
+ */
+function directoryDocumentChanged(updateData: SettingsUpdate, currentRow: SettingsRow): boolean {
+  const flags = ['directoryEnabled', 'discoveryEnabled', 'federatedRegistrationOpen'] as const;
+  for (const key of flags) {
+    if (updateData[key] !== undefined && updateData[key] !== currentRow[key]) return true;
+  }
+  return updateData.instanceName !== undefined
+    && updateData.instanceName !== (currentRow.instanceName ?? 'Backspace');
+}
+
 export async function settingsRoutes(app: FastifyInstance): Promise<void> {
   // GET /api/settings/streaming — any authenticated user can read instance limits
   app.get('/api/settings/streaming', { preHandler: authenticate }, async (_request, reply) => {
     const db = getDb();
     const row = db.select().from(schema.instanceSettings).where(eq(schema.instanceSettings.id, 1)).get();
     if (!row) {
-      return reply.code(500).send({ error: 'Instance settings not initialized', statusCode: 500 });
+      return sendError(reply, 500, 'instance_settings_missing');
     }
     return reply.code(200).send(rowToLimits(row));
   });
@@ -52,38 +136,41 @@ export async function settingsRoutes(app: FastifyInstance): Promise<void> {
     const db = getDb();
 
     const body = request.body;
-    const updateData: Record<string, number | string | null> = { updatedAt: Date.now() };
+    const updateData: SettingsUpdate = { updatedAt: Date.now() };
 
     if (body.maxBitrateKbps !== undefined) {
       if (typeof body.maxBitrateKbps !== 'number' || body.maxBitrateKbps < 500 || body.maxBitrateKbps > 1000000) {
-        return reply.code(400).send({ error: 'maxBitrateKbps must be between 500 and 1000000', statusCode: 400 });
+        return sendError(reply, 400, 'streaming_max_bitrate_out_of_range', { min: 500, max: 1000000 });
       }
       updateData.maxBitrateKbps = body.maxBitrateKbps;
     }
 
     if (body.minBitrateKbps !== undefined) {
       if (typeof body.minBitrateKbps !== 'number' || body.minBitrateKbps < 100 || body.minBitrateKbps > 1000000) {
-        return reply.code(400).send({ error: 'minBitrateKbps must be between 100 and 1000000', statusCode: 400 });
+        return sendError(reply, 400, 'streaming_min_bitrate_out_of_range', { min: 100, max: 1000000 });
       }
       updateData.minBitrateKbps = body.minBitrateKbps;
     }
 
     if (body.bitrateStepKbps !== undefined) {
       if (typeof body.bitrateStepKbps !== 'number' || body.bitrateStepKbps < 50 || body.bitrateStepKbps > 5000) {
-        return reply.code(400).send({ error: 'bitrateStepKbps must be between 50 and 5000', statusCode: 400 });
+        return sendError(reply, 400, 'streaming_bitrate_step_out_of_range', { min: 50, max: 5000 });
       }
       updateData.bitrateStepKbps = body.bitrateStepKbps;
     }
 
     if (body.allowedResolutions !== undefined) {
       if (!Array.isArray(body.allowedResolutions) || body.allowedResolutions.length === 0) {
-        return reply.code(400).send({ error: 'allowedResolutions must be a non-empty array', statusCode: 400 });
+        return sendError(reply, 400, 'streaming_resolutions_required');
       }
       const invalid = body.allowedResolutions.filter((r) =>
         r !== 'native' && !(STANDARD_RESOLUTIONS as readonly number[]).includes(r as number)
       );
       if (invalid.length > 0) {
-        return reply.code(400).send({ error: `Invalid resolutions: ${invalid.join(', ')}. Allowed: ${[...STANDARD_RESOLUTIONS, 'native'].join(', ')}`, statusCode: 400 });
+        return sendError(reply, 400, 'streaming_resolutions_invalid', {
+          invalid: invalid.join(', '),
+          allowed: [...STANDARD_RESOLUTIONS, 'native'].join(', '),
+        });
       }
       // Serialize: numbers sorted ascending, 'native' always last
       const nums = body.allowedResolutions.filter((r): r is number => r !== 'native').sort((a, b) => a - b);
@@ -93,25 +180,28 @@ export async function settingsRoutes(app: FastifyInstance): Promise<void> {
 
     if (body.allowedFramerates !== undefined) {
       if (!Array.isArray(body.allowedFramerates) || body.allowedFramerates.length === 0) {
-        return reply.code(400).send({ error: 'allowedFramerates must be a non-empty array', statusCode: 400 });
+        return sendError(reply, 400, 'streaming_framerates_required');
       }
       const invalid = body.allowedFramerates.filter((f) => !(STANDARD_FRAMERATES as readonly number[]).includes(f));
       if (invalid.length > 0) {
-        return reply.code(400).send({ error: `Invalid framerates: ${invalid.join(', ')}. Allowed: ${STANDARD_FRAMERATES.join(', ')}`, statusCode: 400 });
+        return sendError(reply, 400, 'streaming_framerates_invalid', {
+          invalid: invalid.join(', '),
+          allowed: STANDARD_FRAMERATES.join(', '),
+        });
       }
       updateData.allowedFramerates = body.allowedFramerates.sort((a, b) => a - b).join(',');
     }
 
     if (body.maxResolution !== undefined) {
       if (!(STANDARD_RESOLUTIONS as readonly number[]).includes(body.maxResolution)) {
-        return reply.code(400).send({ error: `maxResolution must be one of: ${STANDARD_RESOLUTIONS.join(', ')}`, statusCode: 400 });
+        return sendError(reply, 400, 'streaming_max_resolution_invalid', { allowed: STANDARD_RESOLUTIONS.join(', ') });
       }
       updateData.maxResolution = body.maxResolution;
     }
 
     if (body.maxFramerate !== undefined) {
       if (!(STANDARD_FRAMERATES as readonly number[]).includes(body.maxFramerate)) {
-        return reply.code(400).send({ error: `maxFramerate must be one of: ${STANDARD_FRAMERATES.join(', ')}`, statusCode: 400 });
+        return sendError(reply, 400, 'streaming_max_framerate_invalid', { allowed: STANDARD_FRAMERATES.join(', ') });
       }
       updateData.maxFramerate = body.maxFramerate;
     }
@@ -128,7 +218,7 @@ export async function settingsRoutes(app: FastifyInstance): Promise<void> {
       if (body.bitrateMatrixOverrides === null) {
         updateData.bitrateMatrixOverrides = null;
       } else if (typeof body.bitrateMatrixOverrides !== 'object' || Array.isArray(body.bitrateMatrixOverrides)) {
-        return reply.code(400).send({ error: 'bitrateMatrixOverrides must be an object or null', statusCode: 400 });
+        return sendError(reply, 400, 'streaming_bitrate_matrix_invalid');
       } else {
         // Validate each key and value
         const validKeys = new Set<string>();
@@ -139,10 +229,10 @@ export async function settingsRoutes(app: FastifyInstance): Promise<void> {
         }
         for (const [key, value] of Object.entries(body.bitrateMatrixOverrides)) {
           if (!validKeys.has(key)) {
-            return reply.code(400).send({ error: `Invalid matrix key: "${key}". Keys must be {resolution}_{framerate}, e.g. "1080_60"`, statusCode: 400 });
+            return sendError(reply, 400, 'streaming_bitrate_matrix_key_invalid', { key });
           }
           if (typeof value !== 'number' || value <= 0 || value > 1000000) {
-            return reply.code(400).send({ error: `Invalid value for "${key}": must be a positive number up to 1000000 kbps`, statusCode: 400 });
+            return sendError(reply, 400, 'streaming_bitrate_matrix_value_invalid', { key, max: 1000000 });
           }
         }
         updateData.bitrateMatrixOverrides = JSON.stringify(body.bitrateMatrixOverrides);
@@ -152,20 +242,30 @@ export async function settingsRoutes(app: FastifyInstance): Promise<void> {
     // Cross-field validation: min < max
     const currentRow = db.select().from(schema.instanceSettings).where(eq(schema.instanceSettings.id, 1)).get();
     if (!currentRow) {
-      return reply.code(500).send({ error: 'Instance settings not initialized', statusCode: 500 });
+      return sendError(reply, 500, 'instance_settings_missing');
     }
 
     const effectiveMin = (updateData.minBitrateKbps as number | undefined) ?? currentRow.minBitrateKbps;
     const effectiveMax = (updateData.maxBitrateKbps as number | undefined) ?? currentRow.maxBitrateKbps;
     if (effectiveMin >= effectiveMax) {
-      return reply.code(400).send({ error: 'minBitrateKbps must be less than maxBitrateKbps', statusCode: 400 });
+      return sendError(reply, 400, 'streaming_min_bitrate_not_below_max');
+    }
+
+    // This route carries discoveryEnabled but not directoryEnabled: only the
+    // clearing half of the invariant applies here.
+    if (!applyDiscoveryAndDirectory({}, updateData, currentRow, reply)) {
+      return reply;
     }
 
     db.update(schema.instanceSettings).set(updateData).where(eq(schema.instanceSettings.id, 1)).run();
 
+    if (directoryDocumentChanged(updateData, currentRow)) {
+      markDirectoryDirty(getRawDb());
+    }
+
     const updatedRow = db.select().from(schema.instanceSettings).where(eq(schema.instanceSettings.id, 1)).get();
     if (!updatedRow) {
-      return reply.code(500).send({ error: 'Failed to read updated settings', statusCode: 500 });
+      return sendError(reply, 500, 'instance_settings_reload_failed');
     }
 
     return reply.code(200).send(rowToLimits(updatedRow));
@@ -177,26 +277,10 @@ export async function settingsRoutes(app: FastifyInstance): Promise<void> {
 
     const row = db.select().from(schema.instanceSettings).where(eq(schema.instanceSettings.id, 1)).get();
     if (!row) {
-      return reply.code(500).send({ error: 'Instance settings not initialized', statusCode: 500 });
+      return sendError(reply, 500, 'instance_settings_missing');
     }
 
-    const gifKey = row.gifApiKey as string | null;
-    const maxUploadBytes = row.maxUploadSizeBytes ?? config.maxUploadSize;
-    const response: InstanceAdminSettings = {
-      instanceName: row.instanceName ?? 'Backspace',
-      registrationOpen: row.registrationOpen !== null ? row.registrationOpen === 1 : config.registrationOpen,
-      federatedRegistrationOpen: row.federatedRegistrationOpen === 1,
-      discoveryEnabled: row.discoveryEnabled === 1,
-      gifApiKey: gifKey ? `****${gifKey.slice(-4)}` : undefined,
-      gifEnabled: !!gifKey,
-      maxUploadSizeMb: Math.round(maxUploadBytes / (1024 * 1024)),
-      federationRelayEnabled: row.federationRelayEnabled === 1,
-      federationRelayTtlDays: row.federationRelayTtlDays,
-      defaultAutoRotateIntervalDays: row.defaultAutoRotateIntervalDays,
-      autoAcceptPeering: row.autoAcceptPeering === 1,
-    };
-
-    return reply.code(200).send(response);
+    return reply.code(200).send(rowToAdminSettings(row, getRawDb()));
   });
 
   // PATCH /api/settings/instance — admin only, updates instance admin settings
@@ -204,11 +288,11 @@ export async function settingsRoutes(app: FastifyInstance): Promise<void> {
     const db = getDb();
 
     const body = request.body;
-    const updateData: Record<string, number | string | null> = { updatedAt: Date.now() };
+    const updateData: SettingsUpdate = { updatedAt: Date.now() };
 
     if (body.instanceName !== undefined) {
       if (typeof body.instanceName !== 'string' || body.instanceName.trim().length === 0 || body.instanceName.trim().length > 32) {
-        return reply.code(400).send({ error: 'Instance name must be 1-32 characters', statusCode: 400 });
+        return sendError(reply, 400, 'instance_name_length', { min: 1, max: 32 });
       }
       updateData.instanceName = body.instanceName.trim();
     }
@@ -219,13 +303,33 @@ export async function settingsRoutes(app: FastifyInstance): Promise<void> {
 
     if (body.federatedRegistrationOpen !== undefined) {
       if (typeof body.federatedRegistrationOpen !== 'boolean') {
-        return reply.code(400).send({ error: 'federatedRegistrationOpen must be boolean', statusCode: 400 });
+        return sendError(reply, 400, 'field_not_boolean', { field: 'federatedRegistrationOpen' });
       }
       updateData.federatedRegistrationOpen = body.federatedRegistrationOpen ? 1 : 0;
     }
 
     if (body.discoveryEnabled !== undefined) {
       updateData.discoveryEnabled = body.discoveryEnabled ? 1 : 0;
+    }
+
+    // The incoming directory axis. Deliberately not routed through
+    // applyDiscoveryAndDirectory or directoryDocumentChanged: what this
+    // instance shows its own people is nowhere in the document it serves, so
+    // a change here owes the hub nothing and must never cost a ping.
+    if (body.directoryBrowseEnabled !== undefined) {
+      if (typeof body.directoryBrowseEnabled !== 'boolean') {
+        return sendError(reply, 400, 'field_not_boolean', { field: 'directoryBrowseEnabled' });
+      }
+      updateData.directoryBrowseEnabled = body.directoryBrowseEnabled ? 1 : 0;
+    }
+
+    // Only the web client reads it, to hide the Support card. Nowhere in the
+    // directory document, so it never owes a ping either.
+    if (body.supportCardEnabled !== undefined) {
+      if (typeof body.supportCardEnabled !== 'boolean') {
+        return sendError(reply, 400, 'field_not_boolean', { field: 'supportCardEnabled' });
+      }
+      updateData.supportCardEnabled = body.supportCardEnabled;
     }
 
     if (body.gifApiKey !== undefined) {
@@ -243,7 +347,7 @@ export async function settingsRoutes(app: FastifyInstance): Promise<void> {
       const mb = Number(body.maxUploadSizeMb);
       const MAX_MB = Math.floor(Number.MAX_SAFE_INTEGER / (1024 * 1024));
       if (!Number.isFinite(mb) || !Number.isInteger(mb) || mb < 1 || mb > MAX_MB) {
-        return reply.code(400).send({ error: `maxUploadSizeMb must be a positive integer (1 - ${MAX_MB})`, statusCode: 400 });
+        return sendError(reply, 400, 'upload_limit_out_of_range', { min: 1, max: MAX_MB });
       }
       updateData.maxUploadSizeBytes = mb * 1024 * 1024;
     }
@@ -255,7 +359,7 @@ export async function settingsRoutes(app: FastifyInstance): Promise<void> {
     if (body.federationRelayTtlDays !== undefined) {
       const ttl = Number(body.federationRelayTtlDays);
       if (isNaN(ttl) || !Number.isInteger(ttl) || ttl < 1 || ttl > 365) {
-        return reply.code(400).send({ error: 'federationRelayTtlDays must be an integer between 1 and 365', statusCode: 400 });
+        return sendError(reply, 400, 'relay_ttl_out_of_range', { min: 1, max: 365 });
       }
       updateData.federationRelayTtlDays = ttl;
     }
@@ -263,7 +367,7 @@ export async function settingsRoutes(app: FastifyInstance): Promise<void> {
     if (body.defaultAutoRotateIntervalDays !== undefined) {
       const interval = Number(body.defaultAutoRotateIntervalDays);
       if (isNaN(interval) || !Number.isInteger(interval) || interval < 1 || interval > 365) {
-        return reply.code(400).send({ error: 'defaultAutoRotateIntervalDays must be an integer between 1 and 365', statusCode: 400 });
+        return sendError(reply, 400, 'rotation_interval_out_of_range', { min: 1, max: 365 });
       }
       updateData.defaultAutoRotateIntervalDays = interval;
     }
@@ -272,29 +376,29 @@ export async function settingsRoutes(app: FastifyInstance): Promise<void> {
       updateData.autoAcceptPeering = body.autoAcceptPeering ? 1 : 0;
     }
 
+    const currentRow = db.select().from(schema.instanceSettings).where(eq(schema.instanceSettings.id, 1)).get();
+    if (!currentRow) {
+      return sendError(reply, 500, 'instance_settings_missing');
+    }
+
+    // directoryLastPingAt and directoryLastError are read-only on the wire:
+    // the pinger owns them, so the body's copies are never read. The same
+    // holds for directoryListedSpaceCount, which is counted from `spaces`.
+    if (!applyDiscoveryAndDirectory(body, updateData, currentRow, reply)) {
+      return reply;
+    }
+
     db.update(schema.instanceSettings).set(updateData).where(eq(schema.instanceSettings.id, 1)).run();
+
+    if (directoryDocumentChanged(updateData, currentRow)) {
+      markDirectoryDirty(getRawDb());
+    }
 
     const updatedRow = db.select().from(schema.instanceSettings).where(eq(schema.instanceSettings.id, 1)).get();
     if (!updatedRow) {
-      return reply.code(500).send({ error: 'Failed to read updated settings', statusCode: 500 });
+      return sendError(reply, 500, 'instance_settings_reload_failed');
     }
 
-    const updatedGifKey = updatedRow.gifApiKey as string | null;
-    const updatedMaxUploadBytes = updatedRow.maxUploadSizeBytes ?? config.maxUploadSize;
-    const response: InstanceAdminSettings = {
-      instanceName: updatedRow.instanceName ?? 'Backspace',
-      registrationOpen: updatedRow.registrationOpen !== null ? updatedRow.registrationOpen === 1 : config.registrationOpen,
-      federatedRegistrationOpen: updatedRow.federatedRegistrationOpen === 1,
-      discoveryEnabled: updatedRow.discoveryEnabled === 1,
-      gifApiKey: updatedGifKey ? `****${updatedGifKey.slice(-4)}` : undefined,
-      gifEnabled: !!updatedGifKey,
-      maxUploadSizeMb: Math.round(updatedMaxUploadBytes / (1024 * 1024)),
-      federationRelayEnabled: updatedRow.federationRelayEnabled === 1,
-      federationRelayTtlDays: updatedRow.federationRelayTtlDays,
-      defaultAutoRotateIntervalDays: updatedRow.defaultAutoRotateIntervalDays,
-      autoAcceptPeering: updatedRow.autoAcceptPeering === 1,
-    };
-
-    return reply.code(200).send(response);
+    return reply.code(200).send(rowToAdminSettings(updatedRow, getRawDb()));
   });
 }

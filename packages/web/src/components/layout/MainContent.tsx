@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
+import { useTranslation } from 'react-i18next';
 import { useLocation } from 'react-router-dom';
 import { useSpaceStore } from '../../stores/spaceStore';
 import { useChatStore } from '../../stores/chatStore';
@@ -11,13 +12,14 @@ import { VoiceControlBar } from '../voice/VoiceControlBar';
 import { VoiceChatPanel } from '../voice/VoiceChatPanel';
 import { FriendsPage } from '../chat/FriendsPage';
 import { ExplorePage } from '../chat/ExplorePage';
+import { ProjectHubPage } from '../projectHub/ProjectHubPage';
 import { Avatar } from '../ui/Avatar';
 import { AvatarStack } from '../ui/AvatarStack';
 import { useVoiceStore } from '../../stores/voiceStore';
 import { wsSend } from '../../hooks/useWebSocket';
 import { MemberListToggleButton } from './MemberListToggleButton';
 import { TransferIndicator } from './TransferIndicator';
-import { isSelf, parseFederatedUsername, isFederationGlobeApplicable } from '../../utils/identity';
+import { isSelf, isFederationGlobeApplicable, userDisplayName } from '../../utils/identity';
 import { formatDmHeaderName, formatDmInputLabel, isDeletedPartnerDm } from '../../utils/dmFormatters';
 import { DmDeletedNotice } from '../chat/DmDeletedNotice';
 import { useCanonicalUserView } from '../../utils/userViewLookup';
@@ -26,9 +28,35 @@ import { Tooltip } from '../ui/Tooltip';
 import { joinVoiceChannel } from '../../utils/voice';
 import { SearchPopover } from '../chat/SearchPopover';
 import { isDmChannel, getChannelOrigin } from '../../stores/spaceStore';
+import { usePointerReveal, VOICE_CHROME_ATTR } from '../../hooks/usePointerReveal';
+
+/**
+ * Voice channel header, in both of its shapes.
+ *
+ * Docked it is a real row that reserves its own height. In fullscreen it
+ * becomes a band floating over the video, so it must not reserve height and
+ * must not swallow clicks: the band is `pointer-events-none` and only the
+ * action buttons inside it opt back in. Visibility is driven by `revealed`
+ * rather than `group-hover`, because the group fills the viewport in
+ * fullscreen and would hold hover forever. `focus-within` keeps it reachable
+ * by keyboard, and pointers that cannot hover keep it up permanently.
+ */
+function voiceHeaderClassName(fullscreen: boolean, revealed: boolean): string {
+  const base = 'h-12 px-5 flex items-center justify-between bg-surface-base transition-opacity duration-300';
+  if (!fullscreen) {
+    return `${base} border-b border-border-hard flex-shrink-0`;
+  }
+  const overlay =
+    'pointer-events-none absolute inset-x-0 top-0 z-30 border-b border-white/5 bg-gradient-to-b from-black/90 via-black/70 to-transparent';
+  const visibility = revealed
+    ? 'opacity-100'
+    : 'opacity-0 focus-within:opacity-100 [@media(hover:none)]:opacity-100 [@media(any-pointer:coarse)]:opacity-100';
+  return `${base} ${overlay} ${visibility}`;
+}
 
 export function MainContent() {
   // 1. ALL HOOKS AT THE TOP
+  const { t } = useTranslation(['spaces', 'common']);
   const channels = useSpaceStore((s) => s.channels);
   const currentChannelId = useChatStore((s) => s.currentChannelId);
   const currentSpaceId = useSpaceStore((s) => s.currentSpaceId);
@@ -42,6 +70,7 @@ export function MainContent() {
   const showDms = useUIStore((s) => s.showDms);
   const location = useLocation();
   const isExplorePage = location.pathname === '/explore';
+  const isProjectHubPage = location.pathname === '/backspace';
   const activeDmCall = useVoiceStore((s) => s.activeDmCall);
   const outgoingCall = useVoiceStore((s) => s.outgoingCall);
   const dmChannels = useSpaceStore((s) => s.dmChannels);
@@ -49,9 +78,15 @@ export function MainContent() {
   const openModal = useUIStore((s) => s.openModal);
 
   const voiceContainerRef = useRef<HTMLDivElement>(null);
+  // Fullscreen chrome is revealed by pointer movement and hidden once the
+  // pointer goes still. It cannot be `group-hover`: fullscreen makes this
+  // container the whole viewport, so hover is true wherever the pointer is
+  // and the chrome would never leave. See usePointerReveal.
+  const chromeRevealed = usePointerReveal(voiceContainerRef, voiceFullscreen);
   const searchButtonRef = useRef<HTMLButtonElement>(null);
   const [searchOpen, setSearchOpen] = useState(false);
   const [jumpToMessageId, setJumpToMessageId] = useState<string | null>(null);
+  const clearJumpRequest = useCallback(() => setJumpToMessageId(null), []);
 
   // Resolve the DM header's "first other" member through the canonical view
   // cache. The hook must be called unconditionally at the component top, so we
@@ -150,10 +185,15 @@ export function MainContent() {
   const channel = channels.find(c => c.id === currentChannelId);
   const isVoiceChannel = channel?.type === 'voice';
 
-  if (showDms || isExplorePage || !currentSpaceId) {
+  if (showDms || isExplorePage || isProjectHubPage || !currentSpaceId) {
     if (!currentChannelId) {
-      if (isExplorePage) return <ExplorePage />;
-      return <FriendsPage />;
+      return isExplorePage ? (
+        <ExplorePage />
+      ) : isProjectHubPage ? (
+        <ProjectHubPage />
+      ) : (
+        <FriendsPage />
+      );
     }
 
     const dmChannel = dmChannels.find(dm => dm.id === currentChannelId);
@@ -162,13 +202,12 @@ export function MainContent() {
     // Use the canonicalized view of the 1-on-1 partner (resolved above the
     // conditional so the hook is called unconditionally).
     const firstOther = _rawFirstOther ? _canonicalFirstOther : (otherMembers[0] ?? null);
-    const { baseName: firstBaseName } = parseFederatedUsername(firstOther?.username ?? '');
     // Group DMs route through `formatDmHeaderName` (honors `dm.name`, falls
     // back to joined member names); 1-on-1 DMs keep the canonical-view path
     // so replicated aliases still surface the home-instance display name.
     const dmName = isGroupDm && dmChannel
       ? formatDmHeaderName(dmChannel, authUser)
-      : (firstOther?.displayName ?? (firstBaseName || 'Direct Message'));
+      : ((firstOther && userDisplayName(firstOther)) || t('spaces:main.dm.fallbackName'));
     // Message-input placeholder — groups use `formatDmInputLabel` which
     // collapses unnamed groups to "the group" so the textarea doesn't render
     // "Message #Alice, Bob, Charlie, Dave". 1-on-1 reuses the canonical
@@ -176,9 +215,9 @@ export function MainContent() {
     // resolves the raw partner; on replicated aliases the canonical view
     // can disagree).
     const dmInputPlaceholder = isGroupDm && dmChannel
-      ? `Message ${formatDmInputLabel(dmChannel, authUser)}`
+      ? t('spaces:main.dm.composerPlaceholder', { target: formatDmInputLabel(dmChannel, authUser) })
       : dmChannel
-        ? `Message @${dmName}`
+        ? t('spaces:main.dm.composerPlaceholder', { target: `@${dmName}` })
         : undefined;
     const dmPartnerDeleted = dmChannel ? isDeletedPartnerDm(dmChannel, authUser) : false;
 
@@ -203,39 +242,44 @@ export function MainContent() {
       return (
         <div
           ref={voiceContainerRef}
-          className={`flex-1 flex flex-col bg-surface-base min-w-0 group/voice relative ${voiceFullscreen ? 'h-screen' : ''}`}
+          className={`flex-1 flex flex-col bg-surface-base min-w-0 group/voice relative overflow-hidden ${voiceFullscreen ? 'h-screen' : ''}`}
         >
-          <div className={`h-14 px-5 flex items-center justify-between border-b border-border-hard flex-shrink-0 bg-surface-base transition-opacity duration-300 ${voiceFullscreen ? 'opacity-0 hover:opacity-100' : ''}`}>
+          <div
+            data-testid="voice-header-overlay"
+            className={voiceHeaderClassName(voiceFullscreen, chromeRevealed)}
+            {...(voiceFullscreen ? { [VOICE_CHROME_ATTR]: '' } : {})}
+          >
             <div className="flex items-center gap-[10px]">
               <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor" className="text-txt-tertiary">
                 <path d="M6.62 10.79c1.44 2.83 3.76 5.14 6.59 6.59l2.2-2.2c.27-.27.67-.36 1.02-.24 1.12.37 2.33.57 3.57.57.55 0 1 .45 1 1V20c0 .55-.45 1-1 1-9.39 0-17-7.61-17-17 0-.55.45-1 1-1h3.5c.55 0 1 .45 1 1 0 1.25.2 2.45.57 3.57.11.35.03.74-.25 1.02l-2.2 2.2z" />
               </svg>
               <span className="font-bold text-[15px] tracking-[-0.02em] text-txt-primary">{dmName}</span>
               {connectionError ? (
-                <span className="text-xs text-txt-danger font-medium ml-2">Connection Failed</span>
+                <span className="text-xs text-txt-danger font-medium ml-2">{t('spaces:main.voice.connectionFailed')}</span>
               ) : isLiveKitConnected ? (
                 <>
-                  <span className="text-xs text-status-online font-medium ml-2">Connected</span>
-                  <span className="text-xs text-txt-tertiary ml-1">{participants.length} in call</span>
+                  <span className="text-xs text-status-online font-medium ml-2">{t('spaces:main.voice.connected')}</span>
+                  <span className="text-xs text-txt-tertiary ml-1">{t('spaces:main.voice.inCall', { count: participants.length })}</span>
                 </>
               ) : (
-                <span className="text-xs text-status-idle font-medium ml-2">Connecting...</span>
+                <span className="text-xs text-status-idle font-medium ml-2">{t('spaces:main.voice.connecting')}</span>
               )}
             </div>
-            <div className="flex items-center gap-1 flex-shrink-0">
+            <div className={`flex items-center gap-1 flex-shrink-0 ${voiceFullscreen ? 'pointer-events-auto mr-24' : ''}`}>
               <TransferIndicator />
               <MemberListToggleButton />
             </div>
           </div>
 
-          <div className="flex-1 flex overflow-hidden pb-20">
-            <VoiceGrid participants={participants} />
+          <div className="flex-1 flex overflow-hidden min-h-0">
+            <div className={`flex-1 min-w-0 flex relative ${voiceFullscreen ? '' : 'pb-20'}`}>
+              <VoiceGrid participants={participants} />
+              <VoiceControlBar revealed={chromeRevealed} />
+            </div>
             {voiceChatOpen && !voiceFullscreen && (
               <VoiceChatPanel channelId={currentChannelId} channelName={`@${dmName}`} />
             )}
           </div>
-
-          <VoiceControlBar />
         </div>
       );
     }
@@ -248,23 +292,23 @@ export function MainContent() {
               <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" className="text-status-online animate-pulse">
                 <path d="M6.62 10.79c1.44 2.83 3.76 5.14 6.59 6.59l2.2-2.2c.27-.27.67-.36 1.02-.24 1.12.37 2.33.57 3.57.57.55 0 1 .45 1 1V20c0 .55-.45 1-1 1-9.39 0-17-7.61-17-17 0-.55.45-1 1-1h3.5c.55 0 1 .45 1 1 0 1.25.2 2.45.57 3.57.11.35.03.74-.25 1.02l-2.2 2.2z" />
               </svg>
-              <span className="text-status-online text-sm font-medium">Calling {dmName}...</span>
+              <span className="text-status-online text-sm font-medium">{t('spaces:main.dm.calling', { name: dmName })}</span>
             </div>
             <button
               onClick={handleCancelCall}
               className="px-3 py-1 bg-accent-rose hover:bg-accent-rose/80 text-white text-xs font-medium rounded transition-colors"
             >
-              Cancel
+              {t('common:actions.cancel')}
             </button>
           </div>
         )}
-        <div className="h-14 px-5 flex items-center justify-between border-b border-border-hard flex-shrink-0 z-10 bg-surface-chat">
+        <div className="h-12 px-5 flex items-center justify-between border-b border-border-hard flex-shrink-0 z-10 bg-surface-chat">
           <div className="flex items-center gap-[10px] min-w-0">
             {isGroupDm ? (
               <div
                 onClick={() => openModal('groupDmSettings', { dmChannelId: currentChannelId, initialTab: 'overview' })}
                 className="flex-shrink-0 cursor-pointer"
-                aria-label="Open group settings"
+                aria-label={t('spaces:main.dm.openGroupSettings')}
               >
                 <AvatarStack members={otherMembers} size={32} border="chat" iconUrl={dmChannel?.icon} />
               </div>
@@ -306,14 +350,14 @@ export function MainContent() {
                 onClick={() => openModal('groupDmSettings', { dmChannelId: currentChannelId, initialTab: 'members' })}
                 className="text-xs text-txt-tertiary flex-shrink-0 cursor-pointer"
               >
-                ({dmChannel?.members.length} members)
+                {t('spaces:main.dm.memberCount', { count: dmChannel?.members.length ?? 0 })}
               </span>
             )}
             {isGroupDm && (
               <button
                 onClick={() => openModal('groupDmSettings', { dmChannelId: currentChannelId, initialTab: 'overview' })}
                 className="w-7 h-7 flex items-center justify-center text-txt-tertiary hover:text-txt-primary transition-colors rounded-[6px] hover:bg-interactive-hover flex-shrink-0"
-                title="Group Settings"
+                title={t('spaces:main.dm.groupSettings')}
               >
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
                   <path d="M19.14,12.94c0.04-0.3,0.06-0.61,0.06-0.94c0-0.32-0.02-0.64-0.07-0.94l2.03-1.58c0.18-0.14,0.23-0.41,0.12-0.61 l-1.92-3.32c-0.12-0.22-0.37-0.29-0.59-0.22l-2.39,0.96c-0.5-0.38-1.03-0.7-1.62-0.94L14.4,2.81c-0.04-0.24-0.24-0.41-0.48-0.41 h-3.84c-0.24,0-0.43,0.17-0.47,0.41L9.25,5.35C8.66,5.59,8.12,5.92,7.63,6.29L5.24,5.33c-0.22-0.08-0.47,0-0.59,0.22L2.74,8.87 C2.62,9.08,2.66,9.34,2.86,9.48l2.03,1.58C4.84,11.36,4.8,11.69,4.8,12s0.02,0.64,0.07,0.94l-2.03,1.58 c-0.18,0.14-0.23,0.41-0.12,0.61l1.92,3.32c0.12,0.22,0.37,0.29,0.59,0.22l2.39-0.96c0.5,0.38,1.03,0.7,1.62,0.94l0.36,2.54 c0.05,0.24,0.24,0.41,0.48,0.41h3.84c0.24,0,0.44-0.17,0.47-0.41l0.36-2.54c0.59-0.24,1.13-0.56,1.62-0.94l2.39,0.96 c0.22,0.08,0.47,0,0.59-0.22l1.92-3.32c0.12-0.22,0.07-0.47-0.12-0.61L19.14,12.94z M12,15.6c-1.98,0-3.6-1.62-3.6-3.6 s1.62-3.6,3.6-3.6s3.6,1.62,3.6,3.6S13.98,15.6,12,15.6z" />
@@ -326,7 +370,7 @@ export function MainContent() {
               onClick={handleStartVoiceCall}
               disabled={!!outgoingCall || !!activeDmCall}
               className="w-8 h-8 flex items-center justify-center text-txt-tertiary hover:text-txt-primary transition-colors rounded-[6px] hover:bg-interactive-hover disabled:opacity-50 disabled:cursor-not-allowed"
-              title="Start Voice Call"
+              title={t('spaces:main.dm.startVoiceCall')}
             >
               <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
                 <path d="M6.62 10.79c1.44 2.83 3.76 5.14 6.59 6.59l2.2-2.2c.27-.27.67-.36 1.02-.24 1.12.37 2.33.57 3.57.57.55 0 1 .45 1 1V20c0 .55-.45 1-1 1-9.39 0-17-7.61-17-17 0-.55.45-1 1-1h3.5c.55 0 1 .45 1 1 0 1.25.2 2.45.57 3.57.11.35.03.74-.25 1.02l-2.2 2.2z" />
@@ -336,7 +380,7 @@ export function MainContent() {
               onClick={handleStartVoiceCall}
               disabled={!!outgoingCall || !!activeDmCall}
               className="w-8 h-8 flex items-center justify-center text-txt-tertiary hover:text-txt-primary transition-colors rounded-[6px] hover:bg-interactive-hover disabled:opacity-50 disabled:cursor-not-allowed"
-              title="Start Video Call"
+              title={t('spaces:main.dm.startVideoCall')}
             >
               <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
                 <path d="M21 6.5l-4 4V7c0-.55-.45-1-1-1H9.82L21 17.18V6.5zM3.27 2L2 3.27 4.73 6H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.21 0 .39-.08.54-.18L19.73 21 21 19.73 3.27 2z" />
@@ -345,7 +389,7 @@ export function MainContent() {
             <button
               onClick={() => openModal('addDmMember', { dmChannelId: currentChannelId })}
               className="w-8 h-8 flex items-center justify-center text-txt-tertiary hover:text-txt-primary transition-colors rounded-[6px] hover:bg-interactive-hover"
-              title="Add Friends to DM"
+              title={t('spaces:main.dm.addFriends')}
             >
               <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
                 <path d="M14 8.00598C14 10.211 12.206 12.006 10 12.006C7.795 12.006 6 10.211 6 8.00598C6 5.80098 7.794 4.00598 10 4.00598C12.206 4.00598 14 5.80098 14 8.00598ZM2 19.006C2 15.473 5.29 13.006 10 13.006C14.711 13.006 18 15.473 18 19.006V20.006H2V19.006ZM20 20.006H22V19.006C22 16.451 20.178 14.471 17.532 13.471C19.461 14.601 20 16.561 20 19.006V20.006Z" />
@@ -355,7 +399,7 @@ export function MainContent() {
               ref={searchButtonRef}
               onClick={() => setSearchOpen(!searchOpen)}
               className={`w-8 h-8 flex items-center justify-center transition-colors rounded-[6px] ${searchOpen ? 'text-txt-primary bg-interactive-active' : 'text-txt-tertiary hover:text-txt-primary hover:bg-interactive-hover'}`}
-              title="Search"
+              title={t('common:actions.search')}
             >
               <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
                 <path d="M21.707 20.293l-5.395-5.395A7.457 7.457 0 0018 10.5 7.5 7.5 0 1010.5 18c1.575 0 3.027-.486 4.228-1.31l5.476 5.476a.997.997 0 001.414 0l.089-.089a1 1 0 000-1.414l.001-.37zM10.5 16a5.5 5.5 0 110-11 5.5 5.5 0 010 11z" />
@@ -366,7 +410,7 @@ export function MainContent() {
             <MemberListToggleButton />
           </div>
         </div>
-        <MessageList channelId={currentChannelId} jumpToMessageId={jumpToMessageId} onJumpComplete={() => setJumpToMessageId(null)} />
+        <MessageList channelId={currentChannelId} jumpToMessageId={jumpToMessageId} onJumpHandled={clearJumpRequest} />
         {dmPartnerDeleted
           ? <DmDeletedNotice />
           : <MessageInput channelId={currentChannelId} channelName={`@${dmName}`} placeholder={dmInputPlaceholder} />}
@@ -385,15 +429,15 @@ export function MainContent() {
   if (!currentChannelId || !channel) {
     return (
       <div className="flex-1 flex flex-col bg-surface-chat relative">
-        <div className="h-14 px-5 flex items-center justify-between border-b border-border-hard">
-          <span className="text-txt-tertiary">Select a channel</span>
+        <div className="h-12 px-5 flex items-center justify-between border-b border-border-hard">
+          <span className="text-txt-tertiary">{t('spaces:main.selectChannel')}</span>
           <div className="flex items-center gap-1 flex-shrink-0">
             <TransferIndicator />
             <MemberListToggleButton />
           </div>
         </div>
         <div className="flex-1 flex items-center justify-center text-txt-tertiary">
-          <p>Select a text or voice channel to get started</p>
+          <p>{t('spaces:main.selectChannelHint')}</p>
         </div>
       </div>
     );
@@ -405,7 +449,7 @@ export function MainContent() {
     if (!isInThisChannel) {
       return (
         <div className="flex-1 flex flex-col bg-surface-base">
-          <div className="h-14 px-5 flex items-center justify-between border-b border-border-hard flex-shrink-0 bg-surface-base">
+          <div className="h-12 px-5 flex items-center justify-between border-b border-border-hard flex-shrink-0 bg-surface-base">
             <div className="flex items-center gap-[10px]">
               <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor" className="text-txt-tertiary">
                 <path d="M11 5L6 9H2V15H6L11 19V5ZM15.54 8.46C16.48 9.4 17 10.67 17 12S16.48 14.6 15.54 15.54L14.12 14.12C14.69 13.55 15 12.79 15 12S14.69 10.45 14.12 9.88L15.54 8.46Z" />
@@ -418,16 +462,16 @@ export function MainContent() {
             </div>
           </div>
           <div className="flex-1 flex flex-col items-center justify-center gap-8 relative">
-            <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_center,rgba(124,108,246,0.12)_0%,transparent_70%)] animate-gradient-pulse pointer-events-none" />
+            <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_center,rgb(var(--accent-primary)/0.12)_0%,transparent_70%)] animate-gradient-pulse pointer-events-none" />
             <div className="text-center relative z-10">
               <h2 className="text-[28px] font-bold text-white mb-3">{channel.name}</h2>
-              <p className="text-txt-tertiary text-[15px]">No one is currently in this voice channel.</p>
+              <p className="text-txt-tertiary text-[15px]">{t('spaces:main.voice.empty')}</p>
             </div>
             <button
               onClick={() => joinVoiceChannel(currentChannelId, useVoiceStore.getState().connectFn ?? undefined)}
-              className="relative z-10 px-8 py-3 bg-accent-primary hover:bg-accent-primary-hover text-white font-semibold rounded-full transition-all text-[15px] shadow-[0_4px_20px_rgba(124,108,246,0.3)]"
+              className="relative z-10 px-8 py-3 bg-accent-primary hover:bg-accent-primary-hover text-white font-semibold rounded-full transition-all text-[15px] shadow-[0_4px_20px_rgb(var(--accent-primary)/0.3)]"
             >
-              Join Voice
+              {t('spaces:main.voice.join')}
             </button>
           </div>
         </div>
@@ -437,46 +481,51 @@ export function MainContent() {
     return (
       <div 
         ref={voiceContainerRef}
-        className={`flex-1 flex flex-col bg-surface-base min-w-0 group/voice relative ${voiceFullscreen ? 'h-screen' : ''}`}
+        className={`flex-1 flex flex-col bg-surface-base min-w-0 group/voice relative overflow-hidden ${voiceFullscreen ? 'h-screen' : ''}`}
       >
-        <div className={`h-14 px-5 flex items-center justify-between border-b border-border-hard flex-shrink-0 bg-surface-base transition-opacity duration-300 ${voiceFullscreen ? 'opacity-0 hover:opacity-100' : ''}`}>
+        <div
+          data-testid="voice-header-overlay"
+          className={voiceHeaderClassName(voiceFullscreen, chromeRevealed)}
+          {...(voiceFullscreen ? { [VOICE_CHROME_ATTR]: '' } : {})}
+        >
           <div className="flex items-center gap-[10px]">
             <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor" className="text-txt-tertiary">
               <path d="M11 5L6 9H2V15H6L11 19V5ZM15.54 8.46C16.48 9.4 17 10.67 17 12S16.48 14.6 15.54 15.54L14.12 14.12C14.69 13.55 15 12.79 15 12S14.69 10.45 14.12 9.88L15.54 8.46Z" />
             </svg>
             <span className="font-bold text-[15px] tracking-[-0.02em] text-txt-primary">{channel.name}</span>
             {connectionError ? (
-              <span className="text-xs text-txt-danger font-medium ml-2">Connection Failed</span>
+              <span className="text-xs text-txt-danger font-medium ml-2">{t('spaces:main.voice.connectionFailed')}</span>
             ) : isLiveKitConnected ? (
               <>
-                <span className="text-xs text-status-online font-medium ml-2">Connected</span>
-                <span className="text-xs text-txt-tertiary ml-1">{participants.length} connected</span>
+                <span className="text-xs text-status-online font-medium ml-2">{t('spaces:main.voice.connected')}</span>
+                <span className="text-xs text-txt-tertiary ml-1">{t('spaces:main.voice.participants', { count: participants.length })}</span>
               </>
             ) : (
-              <span className="text-xs text-status-idle font-medium ml-2">Connecting...</span>
+              <span className="text-xs text-status-idle font-medium ml-2">{t('spaces:main.voice.connecting')}</span>
             )}
           </div>
-          <div className="flex items-center gap-1 flex-shrink-0">
+          <div className={`flex items-center gap-1 flex-shrink-0 ${voiceFullscreen ? 'pointer-events-auto mr-24' : ''}`}>
             <TransferIndicator />
             <MemberListToggleButton />
           </div>
         </div>
 
-        <div className="flex-1 flex overflow-hidden pb-20">
-          <VoiceGrid participants={participants} />
+        <div className="flex-1 flex overflow-hidden min-h-0">
+          <div className={`flex-1 min-w-0 flex relative ${voiceFullscreen ? '' : 'pb-20'}`}>
+            <VoiceGrid participants={participants} />
+            <VoiceControlBar revealed={chromeRevealed} />
+          </div>
           {voiceChatOpen && !voiceFullscreen && (
             <VoiceChatPanel channelId={currentChannelId} channelName={channel.name} />
           )}
         </div>
-
-        <VoiceControlBar />
       </div>
     );
   }
 
   return (
     <div className="flex-1 flex flex-col bg-surface-chat min-w-0 relative">
-      <div className="h-14 px-5 flex items-center justify-between border-b border-border-hard flex-shrink-0 z-10 bg-surface-chat">
+      <div className="h-12 px-5 flex items-center justify-between border-b border-border-hard flex-shrink-0 z-10 bg-surface-chat">
         <div className="flex items-center gap-[10px] min-w-0">
           <span className="text-[20px] font-medium text-txt-tertiary flex-shrink-0 leading-none">#</span>
           <span className="font-bold text-[15px] tracking-[-0.02em] text-txt-primary truncate leading-tight">{channel.name}</span>
@@ -488,7 +537,7 @@ export function MainContent() {
           )}
         </div>
         <div className="flex items-center gap-1 flex-shrink-0">
-          <button className="w-8 h-8 flex items-center justify-center text-txt-tertiary hover:text-txt-primary transition-colors rounded-[6px] hover:bg-interactive-hover" title="Notification Settings">
+          <button className="w-8 h-8 flex items-center justify-center text-txt-tertiary hover:text-txt-primary transition-colors rounded-[6px] hover:bg-interactive-hover" title={t('spaces:main.notificationSettings')}>
             <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
               <path d="M12 22c1.1 0 2-.9 2-2h-4c0 1.1.89 2 2 2zm6-6v-5c0-3.07-1.64-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.63 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2z" />
             </svg>
@@ -497,7 +546,7 @@ export function MainContent() {
             ref={searchButtonRef}
             onClick={() => setSearchOpen(!searchOpen)}
             className={`w-8 h-8 flex items-center justify-center transition-colors rounded-[6px] ${searchOpen ? 'text-txt-primary bg-interactive-active' : 'text-txt-tertiary hover:text-txt-primary hover:bg-interactive-hover'}`}
-            title="Search"
+            title={t('common:actions.search')}
           >
             <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
               <path d="M21.707 20.293l-5.395-5.395A7.457 7.457 0 0018 10.5 7.5 7.5 0 1010.5 18c1.575 0 3.027-.486 4.228-1.31l5.476 5.476a.997.997 0 001.414 0l.089-.089a1 1 0 000-1.414l.001-.37zM10.5 16a5.5 5.5 0 110-11 5.5 5.5 0 010 11z" />
@@ -508,7 +557,7 @@ export function MainContent() {
           <MemberListToggleButton />
         </div>
       </div>
-      <MessageList channelId={currentChannelId} jumpToMessageId={jumpToMessageId} onJumpComplete={() => setJumpToMessageId(null)} />
+      <MessageList channelId={currentChannelId} jumpToMessageId={jumpToMessageId} onJumpHandled={clearJumpRequest} />
       <MessageInput channelId={currentChannelId} channelName={channel.name} />
       <SearchPopover
         open={searchOpen}

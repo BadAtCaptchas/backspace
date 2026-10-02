@@ -3,12 +3,17 @@ import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import { VitePWA } from 'vite-plugin-pwa';
 import path from 'path';
+import { devCspPreamble } from './src/build/devCsp';
+import { PRECACHE_MAX_FILE_BYTES } from './src/build/precache';
 
 export default defineConfig({
   plugins: [
+    devCspPreamble(),
     react(),
     VitePWA({
-      registerType: 'autoUpdate',
+      // 'prompt' keeps a new build waiting until SwAutoUpdate applies it, so an
+      // update never reloads the page out from under a live voice session.
+      registerType: 'prompt',
       includeAssets: ['icons/favicon-32.png', 'icons/favicon-16.png', 'icons/apple-touch-icon.png'],
       manifest: {
         name: 'Backspace',
@@ -27,10 +32,16 @@ export default defineConfig({
       workbox: {
         navigateFallback: '/index.html',
         navigateFallbackDenylist: [/^\/api/, /^\/ws/, /^\/uploads/],
-        skipWaiting: true,
+        // No skipWaiting: a new worker activates only on SwAutoUpdate's
+        // SKIP_WAITING message. The one exception is replacing a worker from
+        // before that flow, which public/sw-rollover.js handles.
+        // clientsClaim only matters on the first install, where there is no
+        // older worker to replace.
+        importScripts: ['sw-rollover.js'],
         clientsClaim: true,
         cleanupOutdatedCaches: true,
-        maximumFileSizeToCacheInBytes: 3 * 1024 * 1024,
+        // CI fails when a precached file nears this limit; see src/build/precache.ts.
+        maximumFileSizeToCacheInBytes: PRECACHE_MAX_FILE_BYTES,
       },
     }),
   ],
@@ -43,7 +54,7 @@ export default defineConfig({
   resolve: {
     extensions: ['.tsx', '.ts', '.jsx', '.js', '.mjs', '.mts', '.json'],
     alias: {
-      '@': path.resolve(__dirname, './src'),
+      '@': path.resolve(import.meta.dirname, './src'),
     },
   },
   server: {

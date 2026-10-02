@@ -8,8 +8,13 @@
 
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-3da639.svg)](LICENSE)
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178c6.svg)](https://www.typescriptlang.org/)
-[![Node.js](https://img.shields.io/badge/node-20_LTS-339933.svg)](https://nodejs.org/)
-[![Version](https://img.shields.io/badge/version-1.0.0-16a34a.svg)](#project-status)
+[![Node.js](https://img.shields.io/badge/node-24_LTS-339933.svg)](https://nodejs.org/)
+[![Release](https://img.shields.io/github/v/release/TheZwiss/backspace?color=16a34a&label=release)](https://github.com/TheZwiss/backspace/releases)
+[![CodeQL](https://github.com/TheZwiss/backspace/actions/workflows/codeql.yml/badge.svg)](https://github.com/TheZwiss/backspace/actions/workflows/codeql.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/TheZwiss/backspace/badge)](https://scorecard.dev/viewer/?uri=github.com/TheZwiss/backspace)
+[![Security policy](https://img.shields.io/badge/security-policy-blue.svg)](SECURITY.md)
+
+**English** · [Русский](README.ru.md)
 
 </div>
 
@@ -26,7 +31,8 @@ commercial license is available if the AGPL doesn't fit your use. See
 [License](#license) for the details.
 
 > **Project status** <a name="project-status"></a>
-> Backspace 1.0. Stable, self-hostable, and actively developed.
+> Backspace 1.x. Stable, self-hostable, and actively developed. The release
+> badge above tracks the current version.
 
 ## What makes Backspace different
 
@@ -37,7 +43,7 @@ Rarely all three, and rarely with the fine-grained media controls people expect.
 Backspace does all three at once:
 
 - **Voice and video with a real control surface.** This goes past a screen-share
-  button. Choose resolution, frame rate, codec (VP9 or hardware H.264), and
+  button. Choose resolution, frame rate, codec (VP9 or H.264), and
   bitrate; set independent 0-200% volume for every person and every screen-share;
   RNNoise noise suppression; a live connection inspector (bitrate, codec, ping,
   packet loss, jitter); and a per-tile badge showing each stream's measured
@@ -109,7 +115,7 @@ You own the server, the data, and the network it federates into.
 - Direct messages: 1-on-1 and group DMs (up to 10 people), with voice/video calls (ring, accept, reject)
 
 **Voice, video, and screen sharing** (via [LiveKit](https://livekit.io/)):
-- Screen sharing up to 4K/120fps: VP9 by default, an optional hardware-accelerated H.264 mode, and a VP8 simulcast fallback
+- Screen sharing up to 4K/120fps: VP9 by default, optional H.264 (hardware acceleration depends on the browser, GPU, and driver), and a dynacast-managed VP8 simulcast fallback
 - Per-stream quality controls: resolution, frame rate, codec, and bitrate, within admin-set bounds
 - Independent 0-200% volume for every participant and every screen-share
 - RNNoise noise suppression (on by default), plus echo-cancellation and auto-gain toggles and mic/speaker device selection
@@ -302,6 +308,15 @@ scheme/IP), and a **body-size limit** matching `MAX_UPLOAD_SIZE` (default 100 MB
 
 Replace `chat.example.com` and `8080` with your domain and `APP_PORT`.
 
+If your public port is not 443 (a home connection where the ISP blocks 80 and
+443, say), put the port in `DOMAIN` itself: `DOMAIN=chat.example.com:1443`. That
+is the host clients type, and every URL the instance advertises is built from
+it. Make your proxy listen on that port and pass the `Host` header through
+unchanged; the snippets below already do (`$http_host` in nginx, since `$host`
+drops the port). Only `proxy` mode supports this: the bundled Caddy needs 80
+and 443 for certificates, and a tunnel always serves on 443 at its edge.
+Federation with a port in `DOMAIN` is not supported yet.
+
 **nginx.** The `map` goes in `http { }` once; the `server` block per site:
 
 ```nginx
@@ -319,11 +334,11 @@ server {
     location / {
         proxy_pass http://127.0.0.1:8080;
         proxy_http_version 1.1;
-        proxy_set_header Host              $host;
+        proxy_set_header Host              $http_host;   # not $host: it drops the port
         proxy_set_header X-Real-IP         $remote_addr;
         proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-Host  $http_host;
         proxy_set_header Upgrade    $http_upgrade;        # WebSocket
         proxy_set_header Connection $connection_upgrade;  # WebSocket
         proxy_read_timeout 3600s;
@@ -334,7 +349,7 @@ server {
     # location /livekit/ {
     #     proxy_pass http://127.0.0.1:7880/;
     #     proxy_http_version 1.1;
-    #     proxy_set_header Host       $host;
+    #     proxy_set_header Host       $http_host;
     #     proxy_set_header Upgrade    $http_upgrade;
     #     proxy_set_header Connection $connection_upgrade;
     # }
@@ -445,30 +460,53 @@ tunnel:
 
 ### Updating a running instance
 
-Back up first. The app auto-snapshots the SQLite DB, and you can take one on
-demand with `./backup.sh` (see [`docs/systems/deployment.md`](docs/systems/deployment.md)).
-Then, from the install directory:
+From the install directory:
+
+```bash
+./update.sh          # update, with one confirmation prompt
+./update.sh --check  # see whether an update exists, changing nothing
+```
+
+`update.sh` takes a database snapshot, refreshes the checkout where that is
+possible, fetches the new image (pulling or rebuilding to match how you
+installed), and restarts only the `backspace` container. It then waits for the
+healthcheck **and verifies the running version actually changed**. If either
+fails, it puts back the image you were on and tells you what happened. A
+no-op update is detected and skips the restart entirely, so nobody gets
+dropped from a voice call for nothing.
+
+Signed-in admins can see the running version and whether an update exists under
+**Instance Settings, Updates**, which also shows the exact command for their
+install.
+
+If you do not have `update.sh` yet (it ships from 1.0.5), take a snapshot with
+`./backup.sh`, then:
 
 ```bash
 git pull                              # refresh compose files / install.sh / docs
 
 # Prebuilt-image installs (the default):
-docker compose pull && docker compose up -d
+docker compose pull backspace && docker compose up -d backspace
 
 # From-source installs (a fork, or BACKSPACE_BUILD=true):
-docker compose up -d --build
+docker compose up -d --build backspace
 ```
 
 Because `COMPOSE_FILE` lives in `.env`, these commands automatically use the
 right compose files in every mode, with no `-f` flags to remember. A redeploy
 briefly restarts the `backspace` container (clients reconnect automatically).
 
+> **Name the `backspace` service and do not pass `--remove-orphans`.** If you run
+> other containers in the same compose project, Compose will suggest that flag,
+> and following it deletes them.
+
 ## Development
 
-Requirements: **Node.js 20 or newer** and **pnpm 10**. The `.nvmrc` file keeps
-Node 20 as the default development and production baseline; CI additionally
-exercises Node 24, and newer majors generally work but are not part of the test
-matrix. The Docker image continues to build on Node 20 regardless of your host.
+Requirements: **Node.js 22.12 or newer** and **pnpm 10**. The `.nvmrc` file
+selects Node 24, which is the active LTS and the version the Docker image runs.
+CI runs the suite on both Node 22 and Node 24. Node 20 reached end of life in
+April 2026 and is no longer supported: the native SQLite driver needs Node 22.
+Newer majors generally work but are not part of the test matrix.
 
 ```bash
 pnpm install
@@ -476,7 +514,7 @@ cp .env.example .env          # set JWT_SECRET (openssl rand -hex 32)
 pnpm dev                       # API server on :3005, Vite dev server on :5173
 ```
 
-On Windows PowerShell, confirm Node 20 or newer and use the native copy command:
+On Windows PowerShell, confirm Node 22 or newer and use the native copy command:
 
 ```powershell
 node --version
@@ -532,6 +570,8 @@ The most important:
 | `BACKSPACE_IMAGE` / `BACKSPACE_IMAGE_TAG` | no | `ghcr.io/thezwiss/backspace` / `latest` | Prebuilt image to pull; pin a tag or point at your fork's registry |
 | `LIVEKIT_URL` / `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | no | none | Enable voice/video |
 | `COMPOSE_PROFILES`   | no       | none        | Set to `voice` to start the bundled LiveKit service |
+| `FEDERATION_ALLOW_PRIVATE_PEERS` | no | `false` | Set `true` only on a LAN-only deployment, so instances on private addresses can still peer when a user adds a handle. Admin-driven peering with a private peer works either way. |
+| `TELEMETRY`          | no       | none        | `on` or `off`: answer the opt-in usage hello at install time instead of in the app. See [Privacy](#privacy). |
 
 ## Voice & Video
 
@@ -573,12 +613,17 @@ Grab the installer for your platform from the
 
 | Platform | File | Notes |
 |----------|------|-------|
-| Windows | `Backspace-<version>.exe` | Universal installer (x64 + arm64). SmartScreen may warn on first run; choose "More info" → "Run anyway". Auto-updates. |
-| macOS | `Backspace-<version>-arm64.dmg` (Apple Silicon) / `Backspace-<version>-x64.dmg` (Intel) | Builds are currently **unsigned**: on first launch, right-click the app → **Open** → **Open**. Auto-update is not available on macOS yet, so check the releases page for new versions. |
-| Linux | `Backspace-<version>-x86_64.AppImage` / `-arm64.AppImage`, or `.deb` (`amd64` / `arm64`) | AppImage auto-updates; `.deb` installs update via new releases. |
+| Windows | `Backspace-<version>-win-x64.exe` / `-win-arm64.exe` | Pick x64 unless you know the machine is ARM; the x64 build also runs on Windows on ARM. SmartScreen may warn on first run; choose "More info" → "Run anyway". Auto-updates. |
+| Linux | `Backspace-<version>-linux-x86_64.AppImage` / `-linux-arm64.AppImage`, or `-linux-amd64.deb` / `-linux-arm64.deb` | AppImage auto-updates; `.deb` installs update via new releases. |
+| macOS | `Backspace-<version>-mac-arm64.dmg` (Apple Silicon) / `-mac-x64.dmg` (Intel) | Builds are ad-hoc signed but **not notarized**, so Gatekeeper blocks the first launch. Open it once, dismiss the warning, then go to **System Settings → Privacy & Security** and click **Open Anyway** next to the Backspace message. On macOS 14 and earlier, right-click the app → **Open** → **Open** works instead. Auto-update is not available on macOS yet, so check the releases page for new versions. |
+
+Every release also carries `.blockmap` and `latest*.yml` files. The auto-updater reads those; they are not downloads.
 
 On first launch the app asks for your instance URL. Enter the address of the
 Backspace server you use (e.g. `https://chat.example.com`).
+
+Linux users can also build and install the Flatpak manifest locally. See
+[`flatpak/README.md`](flatpak/README.md) for the commands and sandbox details.
 
 ### Building from source
 
@@ -619,13 +664,13 @@ packages/
 
 | Layer        | Technology |
 |--------------|------------|
-| Server       | Node.js 20+, Fastify 4, TypeScript (strict) |
+| Server       | Node.js 22+, Fastify 4, TypeScript (strict) |
 | Database     | SQLite (better-sqlite3) + Drizzle ORM |
 | Auth         | JWT + bcrypt |
-| Frontend     | React 18, Vite 6, Tailwind CSS 3, Zustand 5 |
+| Frontend     | React 18, Vite 8, Tailwind CSS 3, Zustand 5 |
 | Voice/Video  | LiveKit |
 | Media        | sharp (thumbnails), Cheerio (embeds) |
-| Desktop      | Electron 40 |
+| Desktop      | Electron 43 |
 | Deployment   | Docker Compose + Caddy (auto-HTTPS) |
 
 Every subsystem has a dedicated specification under
@@ -680,12 +725,53 @@ it, which is what lets Backspace be offered under both the AGPL and a commercial
 license. You also receive a perpetual license to reuse the specific code you
 wrote in your own other projects.
 
+## Privacy
+
+Backspace tracks nobody. There is no analytics, no crash reporting, and nothing
+phones home on its own. The one exception is opt-in: an admin can let their
+instance send me a once-a-day hello with rounded counts (people, messages, the
+version, whether voice and federation are on) and the country the request came
+from. No names, no message content, no addresses of any kind. It stays off until
+an admin says yes, in Instance settings or with `TELEMETRY=on` at install time,
+and can be turned off again at any time. Everything that comes back is published
+as open data on the [insights page](https://backspacechat.com/insights/).
+What is sent, how it is stored and for how long is documented in
+[`docs/systems/telemetry.md`](docs/systems/telemetry.md).
+
 ## Security
 
 If you discover a security vulnerability, please **do not** open a public issue.
 Report it privately via a GitHub security advisory on this repository. See
 [`SECURITY.md`](SECURITY.md). We'll work with you on a fix and coordinated
 disclosure.
+
+### Security and supply chain
+
+Every change is scanned automatically before and after it lands. Results are
+published to this repository's Security tab.
+
+| What | Tool | When |
+|------|------|------|
+| Static analysis of the TypeScript | CodeQL | every pull request, every push to `main`, weekly |
+| Known vulnerabilities in dependencies | OSV-Scanner | every pull request, every push to `main`, weekly |
+| Secrets, across the full git history | gitleaks | every pull request, every push to `main`, weekly |
+| Infrastructure and container config | Trivy | every pull request, every push to `main`, weekly |
+| Dependency licenses | Trivy | every pull request, every push to `main`, weekly |
+| The published container image | Trivy | on every image publish |
+| Repository security posture | OpenSSF Scorecard | every push to `main`, weekly |
+| A running instance | OWASP ZAP baseline | every push to `main`, weekly |
+| Dependency and base image updates | Dependabot | weekly |
+
+Supporting practice: every GitHub Action is pinned to a full commit SHA rather
+than a tag, every job runs on a hardened runner with egress auditing, and
+workflow permissions are granted per job instead of repository-wide. Published
+images carry a software bill of materials and build provenance.
+
+Findings are triaged rather than accumulated. Anything dismissed carries a
+written reason, recorded in
+[`docs/systems/security-scanning.md`](docs/systems/security-scanning.md), which
+also documents the scan policy, the known gaps, and the deployment-time settings
+a self-hoster should check.
 
 ## License
 
@@ -730,5 +816,5 @@ Built on the shoulders of [Fastify](https://fastify.dev/),
 [Drizzle ORM](https://orm.drizzle.team/), [React](https://react.dev/),
 [LiveKit](https://livekit.io/), [Tailwind CSS](https://tailwindcss.com/),
 [Electron](https://www.electronjs.org/), and the broader open-source ecosystem.
-The interface uses the [DM Sans](https://github.com/googlefonts/dm-fonts) font
-(SIL Open Font License 1.1).
+The interface uses [DM Sans](https://github.com/googlefonts/dm-fonts) and
+[Inter](https://github.com/rsms/inter) (SIL Open Font License 1.1).

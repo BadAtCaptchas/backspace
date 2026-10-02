@@ -1,4 +1,5 @@
 import React, { useState, useCallback, useEffect } from 'react';
+import { useTranslation } from 'react-i18next';
 import Cropper from 'react-easy-crop';
 import type { Area } from 'react-easy-crop';
 import { cropImage } from '../../utils/cropImage';
@@ -20,12 +21,14 @@ export function ImageCropModal({
   onClose,
   imageSrc,
   onCropComplete,
-  title = 'Crop Image',
+  title,
   aspectRatio = 1,
   cropShape = 'round',
   maxOutputDimension,
   outputType,
 }: ImageCropModalProps) {
+  const { t } = useTranslation(['uploads', 'common']);
+  const heading = title ?? t('uploads:crop.title');
   const [crop, setCrop] = useState({ x: 0, y: 0 });
   const [zoom, setZoom] = useState(1);
   const [croppedAreaPixels, setCroppedAreaPixels] = useState<Area | null>(null);
@@ -79,10 +82,11 @@ export function ImageCropModal({
       <div className="relative max-w-md w-full mx-4 bg-surface-elevated rounded-lg shadow-xl animate-slide-up">
         {/* Title bar */}
         <div className="flex items-center justify-between px-4 pt-4">
-          <h2 className="text-xl font-bold text-txt-primary">{title}</h2>
+          <h2 className="text-xl font-bold text-txt-primary">{heading}</h2>
           <button
             onClick={onClose}
             className="text-txt-tertiary hover:text-txt-primary transition-colors p-1"
+            aria-label={t('common:actions.close')}
           >
             <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
               <path d="M18.4 4L12 10.4L5.6 4L4 5.6L10.4 12L4 18.4L5.6 20L12 13.6L18.4 20L20 18.4L13.6 12L20 5.6L18.4 4Z" />
@@ -91,7 +95,11 @@ export function ImageCropModal({
         </div>
 
         {/* Crop area */}
-        <div className="relative h-[350px] mx-4 mt-3 rounded-lg overflow-hidden bg-surface-base">
+        {/* react-easy-crop mixes DOM rect/client coordinates with CSS pixels.
+            Keep only its interactive canvas at effective 100%; dialog controls
+            still use the selected interface scale. */}
+        <div className="relative h-[350px] mx-4 mt-3 rounded-lg overflow-hidden bg-surface-base"
+          style={{ zoom: 'calc(1 / var(--interface-scale, 1))' }}>
           <Cropper
             image={imageSrc}
             crop={crop}
@@ -117,7 +125,7 @@ export function ImageCropModal({
             step={0.05}
             value={zoom}
             onChange={(e) => setZoom(Number(e.target.value))}
-            className="flex-1 h-1.5 rounded-full appearance-none bg-surface-input accent-accent-primary cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3.5 [&::-webkit-slider-thumb]:h-3.5 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-accent-primary"
+            className="flex-1 min-w-0 h-1.5 rounded-full appearance-none bg-surface-input accent-accent-primary cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3.5 [&::-webkit-slider-thumb]:h-3.5 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-accent-primary"
           />
         </div>
 
@@ -128,7 +136,7 @@ export function ImageCropModal({
             onClick={onClose}
             className="flex-1 py-2.5 text-sm font-medium text-txt-secondary bg-interactive-hover hover:bg-interactive-selected rounded-lg transition-colors"
           >
-            Cancel
+            {t('common:actions.cancel')}
           </button>
           <button
             type="button"
@@ -136,7 +144,7 @@ export function ImageCropModal({
             disabled={isProcessing || !croppedAreaPixels}
             className="flex-1 py-2.5 bg-accent-primary hover:bg-accent-primary/80 text-white text-sm font-medium rounded-lg transition-colors disabled:opacity-50"
           >
-            {isProcessing ? 'Applying...' : 'Apply'}
+            {isProcessing ? t('uploads:crop.applying') : t('common:actions.apply')}
           </button>
         </div>
       </div>

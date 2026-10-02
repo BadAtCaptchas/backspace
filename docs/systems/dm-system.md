@@ -2,15 +2,18 @@
 
 Source files:
 - `packages/server/src/routes/dm.ts` -- REST endpoints for DM CRUD, group lifecycle, message send/edit/delete, federation event queueing, `broadcastDmMessage()` with soft-close reopen logic
-- `packages/server/src/routes/federation.ts` -- Inbound relay event processors: `processMemberAddEvent`, `processMemberRemoveEvent`, `processOwnershipTransferEvent`, `processCreateEvent`, `processUpdateEvent`, `processDeleteEvent`, reaction processors, identity resolution (`resolveLocalUser`, `resolveOrCreateReplicatedUser`, `findOrCreateDmChannel`)
-- `packages/server/src/utils/federationOutbox.ts` -- `queueOutboxEvent`, `appendMutationLog`, `queueDmRelay`, `getDmParticipants`, `getGroupDmTargetOrigins`, `computeFederatedId`, `buildRelayPayload`
+- `packages/server/src/routes/federation.ts` -- Inbound relay event processors: `processMemberAddEvent`, `processMemberRemoveEvent`, `processOwnershipTransferEvent`, `processCreateEvent`, `processUpdateEvent`, `processDeleteEvent`, reaction processors, identity resolution (`resolveLocalUser`, `resolveOrCreateReplicatedUser`)
+- `packages/server/src/utils/federationOutbox.ts` -- `queueOutboxEvent`, `appendMutationLog`, `queueDmRelay`, `getDmParticipants`, `getGroupDmTargetOrigins`, `buildRelayPayload`
+- `packages/server/src/utils/dmConversation.ts` -- conversation identity (ADR 0002): `homeIdentityOf`, `oneOnOneKey`, `mintGroupKey` (the only code that computes or mints a key), `findOrCreateOneOnOne` (the only code that looks up or inserts a 1-on-1 row), `reconcileDmChannelFederatedId`, `backfillOneOnOneKeys` (startup, from `initDatabase`)
+- `packages/server/src/utils/dmChannelWire.ts` -- `toDmChannelWire()` (the one `DmChannel` serializer), `toDmLastMessagePreview()`, `loadOpenDmChannels()` (the DM list shared by the ready payload and `GET /api/dm`), `loadDmChannelWire()` (one conversation, for every other emitter)
 - `packages/server/src/utils/storageJanitor.ts` -- `cleanupSoftDeletedDmChannels()` (24h grace period hard-delete)
 - `packages/server/src/utils/userDeletion.ts` -- `tombstoneUser()`: DM membership partition (1-on-1 kept / group dropped) + dead-DM purge on "zero live members" (see "DM Tombstone Semantics")
 - `packages/server/src/utils/permissions.ts` -- `isDeadOneOnOne()` read-only guard for Deleted-User 1-on-1 threads
 - `packages/server/src/db/migrate.ts` -- Self-healing migration for corrupted group DM ownership; `backfillOneOnOneDmMembership()` restores pre-fix Deleted-User 1-on-1 threads
 - `packages/web/src/components/chat/DmDeletedNotice.tsx` -- read-only composer notice; `packages/web/src/utils/dmFormatters.ts:isDeletedPartnerDm()` gates it
 - `packages/server/src/ws/handler.ts` -- `sendToDmMembers()` broadcasts (ConnectionManager method)
-- `packages/web/src/stores/spaceStore.ts` -- Zustand DM state: `addDmChannel`, `removeDmChannel`, `addDmMember`, `removeDmMember`, `updateDmOwner`, `closeDm`, `leaveDm`, `findExistingDmForUser`
+- `packages/web/src/stores/dmConversations.ts` -- the client DM merge module (ADR 0002 section 4): the only place a copy of a conversation enters the client (`upsertCopy`, `mergeOriginListing`); `dmChannels` is derived from it
+- `packages/web/src/stores/spaceStore.ts` -- Zustand DM state: `removeDmChannel`, `addDmMember`, `removeDmMember`, `updateDmOwner`, `closeDm`, `leaveDm`, `findExistingDmForUser`
 - `packages/web/src/hooks/useWebSocket.ts` -- Frontend WS event handlers for `dm_channel_created`, `dm_channel_closed`, `dm_member_added`, `dm_member_removed`, `dm_owner_updated`
 - `packages/web/src/components/modals/NewDmModal.tsx` -- 1-on-1 DM creation UI with user search and deduplication
 - `packages/web/src/components/modals/AddDmMemberModal.tsx` -- Group DM member add / 1-on-1 upgrade UI
@@ -41,24 +44,26 @@ Related specs: `docs/systems/federation.md` (wire protocol, outbox worker, peer 
 
 ## Federated ID Algorithm
 
+The conversation key (`dm_channels.federated_id`) is computed or minted only in `utils/dmConversation.ts` (ADR 0002, `docs/decisions/0002-dm-conversation-identity.md`):
+
 ```typescript
-// federationOutbox.ts:computeFederatedId()
+// 1-on-1: oneOnOneKey(a, b), over homeIdentityOf(u) = u.homeUserId || u.id.
+// Same result on any instance for the same pair; these bytes never change.
+const sorted = [homeIdentityOf(a), homeIdentityOf(b)].sort();
+const key = crypto.createHash('sha256').update(sorted.join(':')).digest('hex').slice(0, 32);
 
-// 1-on-1: deterministic SHA-256 hash of sorted home user IDs
-// Same result on any instance for the same user pair
-const sorted = [homeUserIdA, homeUserIdB].sort();
-const federatedId = crypto.createHash('sha256')
-  .update(sorted.join(':'))
-  .digest('hex')
-  .slice(0, 32);  // 32-char hex string
-
-// Group: random UUID assigned by the creating instance
-const federatedId = crypto.randomUUID();  // 36-char UUID with dashes
+// Group: mintGroupKey(), a random UUID minted once
+const key = crypto.randomUUID();  // 36-char UUID with dashes
 ```
+
+- **1-on-1:** every row stores its key from insertion, relay on or off, whether or not a member is homed elsewhere. The key is a label: what is relayed is decided by the member set (`relayTargetOrigins`), so a pair of this instance's users has a key and no relay targets.
+- **Group:** the key is minted, together with the owner home identity, on the instance where the group first gets a member homed elsewhere (group create or add member), and never recomputed. A group no other instance holds keeps `NULL`; on a current server `federatedId: null` means exactly that. Call start reads the key and never computes or mints one; a row without one is not announced to peers.
+- **What counts as a 1-on-1 row:** `owner_id IS NULL` and a key that is `NULL` or 1-on-1 shaped (32 hex, `mayBeOneOnOneRow`). An ownerless row with a UUID key is a group copy (up to 1.6.0 the `member_add` bootstrap could create one without an owner) and is never re-keyed, merged or returned as a 1-on-1.
+- **Startup backfill:** `initDatabase` runs `backfillOneOnOneKeys` right after `backfillOneOnOneDmMembership`, on every boot. Every 1-on-1 row (as above, exactly two members, not soft-deleted) whose key is `NULL` or differs from the key of its members goes through `reconcileDmChannelFederatedId`: re-keyed in place, or merged into the row that already holds the key. This keys rows made while relay was off or before every 1-on-1 was keyed at insert, and merges such a row with the copy the relay later created for the same pair. A merge keeps one member row per home identity (a merged 1-on-1 never gains a third member), a member who had the merged-away row open has the survivor open, and the merged-away row's `federation_mutation_log` and `federation_outbox` rows are re-pointed to the survivor, so a peer's catch-up sync still gets its messages. When the sweep is about to change anything, the database is first snapshotted like before a migration (`createSnapshot(..., 'pre-migration')`, unless this boot already took one or `BACKUP_DISABLED` is set); nothing is snapshotted when there is nothing to change. Groups are not backfilled. Idempotent; logs `[db] 1-on-1 DM key backfill: keyed N, merged M` only when it changed something.
 
 The format difference (32-char hex vs 36-char UUID with dashes) allows detecting channel type independently of `ownerId`. The self-healing migration uses this: `length(federated_id) = 36 AND federated_id LIKE '________-____-____-____-____________'` identifies group DMs.
 
-**Re-attach re-keys the 1-on-1 `federatedId` (reattach-dm-reconcile spec).** Because the 1-on-1 id derives from the two participants' `home_user_id`s, a participant's `home_user_id` change — the detached-account re-attach flow (`POST /api/users/@me/reattach`, see `federation.md`) — changes the `federatedId` of every 1-on-1 DM that participant is in. Left alone, pre-reattach history would stay under the old-identity channel while new messages compute the new id and split into a parallel channel (one conversation shown twice). Instead, existing channels are **reconciled** by `reconcileDmChannelFederatedId`: **re-keyed in place** when no channel yet holds the new id, or **merged + deleted** into the existing new-identity channel when one does (`idx_dm_federated` is UNIQUE, so a re-key onto an occupied id is impossible). This runs inline in the re-attach transaction for the re-attaching account and as an idempotent startup sweep (`reconcileDriftedDmFederatedIds`) that heals accounts re-attached before the fix shipped. Group DMs (random-UUID `federatedId`, member-independent) are never affected.
+**Re-attach re-keys the 1-on-1 `federatedId` (reattach-dm-reconcile spec).** Because the 1-on-1 id derives from the two participants' `home_user_id`s, a participant's `home_user_id` change — the detached-account re-attach flow (`POST /api/users/@me/reattach`, see `federation.md`) — changes the `federatedId` of every 1-on-1 DM that participant is in. Left alone, pre-reattach history would stay under the old-identity channel while new messages compute the new id and split into a parallel channel (one conversation shown twice). Instead, existing channels are **reconciled** by `reconcileDmChannelFederatedId`: **re-keyed in place** when no channel yet holds the new id, or **merged + deleted** into the existing new-identity channel when one does (`idx_dm_federated` is UNIQUE, so a re-key onto an occupied id is impossible). This runs inline in the re-attach transaction for the re-attaching account and in the startup backfill (`backfillOneOnOneKeys`, above), which heals accounts re-attached before the fix shipped. Group DMs (random-UUID `federatedId`, member-independent) are never affected.
 
 ---
 
@@ -66,26 +71,24 @@ The format difference (32-char hex vs 36-char UUID with dashes) allows detecting
 
 **Endpoint:** `POST /api/dm` -- `dm.ts:dmRoutes`
 
-**Request:** `{ userId: string }`
+**Request:** `{ userId: string }` or `{ homeUserId, homeInstance }`
 
-**Deduplication algorithm:**
-1. Query all `dm_members` rows where `userId = caller`
-2. For each membership, check if `targetUserId` is also a member of that channel
-3. If found, verify exactly 2 members in that channel (skip group DMs that happen to include the target)
-4. If the channel exists and is not soft-deleted: reopen if caller had `closed=1`, return existing channel
-5. If no match: create new channel atomically in a transaction
+**Find or create:** `findOrCreateOneOnOne(db, caller, target, { open: 'first' })` (`utils/dmConversation.ts`), the only code that looks up or inserts a 1-on-1 row. In one transaction:
+1. The row holding `oneOnOneKey(caller, target)` is the conversation. Its members are made the pair: a member row holding a pair member's home identity under another local id is re-pointed to that member, a missing pair member is added; a 1-on-1 never gets a third member. A row holding the key under someone else's membership has drifted and is first moved to its own key (`reconcileDmChannelFederatedId`).
+2. Else a 1-on-1 row (`owner_id IS NULL`, not soft-deleted) whose members are exactly the pair, which is keyed on the way out.
+3. Else a new row: `ownerId = NULL`, the key, the caller's membership open and the target's closed.
 
-**Creation transaction:**
-1. Insert `dm_channels` with `ownerId = NULL`, no `federatedId` (assigned lazily when federation relay first fires)
-2. Insert two `dm_members` rows (caller + target)
+Looking up by key first returns a relay-created row whose member rows differ instead of inserting the key a second time (which the unique index answered with a 500 before).
 
-**Post-creation:**
-- Send `dm_channel_created` to the target user via WebSocket
-- Return 201 with the `DmChannel` response to the caller
+**Caller side:** an existing conversation the caller had closed is reopened for them and a `dm_reopen` is relayed. `POST /api/dm` and `ensureOneOnOneDmChannel` (space invites) share this as `openOneOnOne`.
 
-**No federation event queued at creation time.** The `federatedId` for 1-on-1 DMs is computed on demand when the first message is relayed via `queueDmRelay()`. The receiving instance uses `findOrCreateDmChannel()` which computes the deterministic hash and creates the channel if needed.
+**Target side (#360):** nothing is sent to the target. A new conversation holds their membership closed, and an existing one they closed stays closed. It reaches their list with the next message sent in it, or the first call started in it: `reopenForClosedMembers` reopens closed members and sends them `dm_channel_created`, with the message as `lastMessage` (see "Automatic Reopen"), before the message or the ring. A local target and a target on another instance (who learns of the conversation from its first relayed message) therefore see it at the same moment. The opener keeps an empty conversation in their own list.
 
-**Client routing:** DM creation always goes to the home instance. For federated users, the client passes `{ homeUserId, homeInstance }` and the server resolves the target via `resolveOrCreateReplicatedUser()`. The `federatedId` is computed at creation time when either participant has `homeInstance` set. Post-creation, every DM operation (message send/edit/delete, close/leave, typing, reactions, read-state acks) routes through `getChannelOrigin(channelId)` → `getApiForOrigin(origin)`. If the pinned origin drops mid-session, client-side failover re-keys the DM to a connected sibling that mirrors the same `federatedId` — see `docs/systems/client-federation.md` "DM Origin Failover".
+**Response:** the `DmChannel` from `loadDmChannelWire`: 201 when the row was created, 200 when it existed.
+
+**No federation event queued at creation time.** The first message's `create` relay carries the participants, and the receiving instance computes the same key (`oneOnOneKey`) and finds or creates its copy with `findOrCreateOneOnOne(..., { open: 'both' })`: its copy is created with the message, open for both members.
+
+**Client routing:** DM creation always goes to the home instance. For federated users, the client passes `{ homeUserId, homeInstance }` and the server resolves the target via `resolveRemoteIdentityForClient()`. The key is stored at creation, as for every 1-on-1. Post-creation, every DM operation (message send/edit/delete, close/leave, typing, reactions, read-state acks) routes through `getChannelOrigin(channelId)` → `getApiForOrigin(origin)`. If the pinned origin drops mid-session, client-side failover re-keys the DM to a connected sibling that mirrors the same `federatedId` — see `docs/systems/client-federation.md` "DM Origin Failover".
 
 ---
 
@@ -124,7 +127,7 @@ interface GroupDmUserIdentity {
 
 **Post-creation federation setup:**
 - If federation relay is enabled and any member has a remote `homeInstance`:
-  - Generate random UUID `federatedId` via `computeFederatedId()`
+  - Mint the group key via `mintGroupKey()`
   - Update channel with `federatedId`, `ownerHomeUserId`, `ownerHomeInstance`
 
 **Broadcasting (local-only principle):**
@@ -156,12 +159,12 @@ interface GroupDmUserIdentity {
 
 ### Automatic Reopen
 
-**Trigger:** `dm.ts:broadcastDmMessage()`
+**Trigger:** `dm.ts:reopenForClosedMembers()`, run by `broadcastDmMessage()` for every new message and by call start (`handleDmCallStart`) before it rings.
 
-When a new message arrives in a DM channel, for each member with `closed = 1`:
+For each member with `closed = 1`:
 1. Flip `closed` back to `0`
-2. Send `dm_channel_created` with full channel payload (including the new message as `lastMessage`) so their sidebar picks it up
-3. Then send the `dm_message_created` event
+2. Send `dm_channel_created` with the full channel payload (`loadDmChannelWire`; for a message, the new message as `lastMessage`) so their sidebar picks it up
+3. Then send the `dm_message_created` event (message) or `dm_call_incoming` (call). A reopened member is also in the `ready` payload's `activeCalls` on reconnect, which is built from open memberships
 
 This ensures closed DMs resurface automatically when new activity occurs.
 
@@ -169,10 +172,10 @@ This ensures closed DMs resurface automatically when new activity occurs.
 
 Close and reopen are relayed to all peer instances that hold a copy of the DM:
 
-- **Close relay:** After setting `closed = 1` locally, `queueDmCloseRelay(channelId, userId, 'dm_close')` queues a `dm_close` outbox event. The receiving instance finds the channel by `federatedId`, resolves the acting user via `resolveLocalUser`, sets `closed = 1` on the local `dm_members` row, and broadcasts `dm_channel_closed`.
+- **Close relay:** After setting `closed = 1` locally, `queueDmCloseRelay(channelId, userId, 'dm_close')` queues a `dm_close` outbox event. The receiving instance finds the channel by `federatedId`, resolves the acting user by `homeUserId` + `homeInstance` via `resolveRelayActor`, sets `closed = 1` on the local `dm_members` row, and broadcasts `dm_channel_closed`.
 - **Reopen relay:** Explicit reopens (`POST /api/dm` when reopening a closed 1-on-1 DM) queue a `dm_reopen` event. The receiving instance sets `closed = 0` and broadcasts `dm_channel_created` with a full channel payload.
 - **Relayed-message reopen:** `processCreateEvent` (inbound message relay) also checks each recipient's `closed` flag and performs the same resurface sequence (`dm_channel_created` → `dm_message_created`) — mirroring `broadcastDmMessage`. This ensures messages relayed from a remote instance properly reopen closed DMs on the receiving instance.
-- Only fires for DMs with a `federatedId`. Legacy local-only DMs (no `federatedId`) are unaffected.
+- Only fires for DMs with a `federatedId`, to the origins of members homed elsewhere (`getGroupDmTargetOrigins`). A 1-on-1 between two users of this instance is keyed but has no targets; an unshared group has no key.
 
 ### Frontend
 
@@ -424,11 +427,11 @@ The scan is **scoped** to `userDmChannelIds` (not a global `dm_channels` sweep) 
 
 ### Read-only enforcement (`isDeadOneOnOne`)
 
-A Deleted-User 1-on-1 is a **read-only archive** — you can never message a tombstoned (and possibly dead-incarnation) partner, and for a 1-on-1 an edit/delete relay would broadcast to all active peers (`getGroupDmTargetOrigins` returns `undefined`), risking mis-direction to a new incarnation. The server is the enforcement boundary:
+A Deleted-User 1-on-1 is a **read-only archive** — you can never message a tombstoned (and possibly dead-incarnation) partner, and an edit/delete relay would still be addressed to the tombstoned partner's home instance, risking mis-direction to a new incarnation. The server is the enforcement boundary:
 
 - **Helper:** `permissions.ts:isDeadOneOnOne(dmChannelId, requesterId)` → `true` when the channel is 1-on-1 (`ownerId IS NULL`) **and** every member other than the requester has `isDeleted = 1` (returns `false` for groups and when there are no other members).
 - **Applied to all three message-mutation endpoints** in `dm.ts`: `POST /api/dm/:id/messages` (after the `isDmMember` gate), `PATCH /api/dm/messages/:id`, and `DELETE /api/dm/messages/:id`. Each rejects with **`403 { error: "This user's account was deleted", code: 'recipient_deleted', statusCode: 403 }`**.
-- **Applied to DM reactions on the WebSocket path** in `ws/events.ts`: `handleReactionAdd` and `handleReactionRemove` call `isDeadOneOnOne(dmMsg.dmChannelId, userId)` after the `isDmMember` gate and **silently drop** the frame (WS has no response channel). Without this, a survivor could add/remove reactions on historical messages and the reaction would relay to **all** active peers (a 1-on-1 has no group target-origins, so `queueOutboxEvent(..., undefined)` fans out) — the exact mis-directed relay the read-only invariant exists to prevent.
+- **Applied to DM reactions on the WebSocket path** in `ws/events.ts`: `handleReactionAdd` and `handleReactionRemove` call `isDeadOneOnOne(dmMsg.dmChannelId, userId)` after the `isDmMember` gate and **silently drop** the frame (WS has no response channel). Without this, a survivor could add/remove reactions on historical messages and the reaction would relay to the tombstoned partner's home instance — the exact mis-directed relay the read-only invariant exists to prevent.
 - **Client mirror (consistency, not the boundary):** `components/chat/Message.tsx` withdraws the add-reaction affordances (hover button, emoji picker, context-menu "Add Reaction") and no-ops existing-pill toggles when the message's DM is a dead 1-on-1 (`isDeletedPartnerDm(dm, currentUser)`). Existing reactions still **display** read-only; only add/remove is disabled.
 
 ### Live update on the heal path
@@ -461,6 +464,9 @@ Users tombstoned **before** this fix already had their 1-on-1 `dm_members` row d
 - Must have content or attachments (not both empty)
 - Content max length: 4000 chars (`MAX_MESSAGE_LENGTH`)
 - Attachment ownership verified (must be unlinked and owned by caller)
+- `replyToId`, when present, must name a message in this same DM channel (`isDmReplyTargetInChannel`) -- otherwise `400 Invalid reply target` and nothing is inserted. The WebSocket `dm_message_create` path applies the same rule and answers with an `error` event instead.
+
+**Reply hydration:** every DM read path resolves `replyTo` through `fetchDmReplyToMessages(dmChannelId, rows)` (`dm.ts`), which scopes the reply lookup to the channel being read -- `getDmMessageWithUser`, `GET /api/dm/:id/messages`, `GET /api/dm/:id/search` and `GET /api/dm/:id/messages/around`. A `replyToId` pointing outside the channel hydrates as `replyTo: null` rather than surfacing the other conversation's message, so rows predating the create-time check stay contained. Relay never introduces a cross-channel target either: an inbound federated DM message never adopts the wire's `replyToId` (the sender's local id). Its reply target comes from `message.replyTo`, a `FederationMessageRef` resolved by `resolveRelayedReplyTarget` (`federation/dmChannels.ts`) and kept only when it names a message in the channel the reply is stored in; otherwise the reply is stored with `replyToId: null`. See "Outbound: Relay Payload Structure" below.
 
 **Flow:**
 1. Insert message + link attachments in a single transaction
@@ -490,9 +496,9 @@ Users tombstoned **before** this fix already had their 1-on-1 `dm_members` row d
 3. Delete attachments, reactions, and message atomically in a transaction
 4. Clean up files from disk
 5. Broadcast `dm_message_deleted` to all members
-6. Federation: `appendMutationLog()` + `queueOutboxEvent()` with `eventType='delete'`
+6. Federation: `queueDmMessageDeleteRelay(id, dmChannelId)`
 
-**Note:** Delete federation events are queued without `targetOrigins` -- they broadcast to ALL active peers regardless of group membership. This differs from create/update which use `getGroupDmTargetOrigins()` for group DMs.
+**Note:** `queueDmMessageDeleteRelay(messageId, dmChannelId, target)` (`federationOutbox.ts`) is the single source of truth for the delete relay and is shared with the WebSocket delete path (`ws/events.ts`). Both callers build `target` with `dmMessageMutationTarget` before deleting the row (see "Relayed edits and deletes"). It appends the mutation log entry and enqueues the outbox event with `getGroupDmTargetOrigins(dmChannelId)`, so a delete reaches exactly the peers that host a participant -- the same targeting create/update use.
 
 ---
 
@@ -504,14 +510,21 @@ This section covers the DM-specific application-level relay logic. For the wire 
 
 **Function:** `federationOutbox.ts:getGroupDmTargetOrigins()`
 
+Participant-derived for every DM, 1-on-1 and group alike:
+
 ```
-Channel has ownerId?
-├── No (1-on-1)  → return undefined → broadcasts to ALL active peers
-└── Yes (group)  → query all members' homeInstances
-                  → normalize bare domains to full URLs
-                  → filter out our own origin
-                  → return unique peer origins
+query all members' homeInstances
+  → normalize bare domains to full URLs
+  → filter out our own origin
+  → return unique peer origins   (empty array when every member is local)
 ```
+
+The return type is `string[]`, never `undefined`. The distinction matters at the
+call site: `queueOutboxEvent` reads an **omitted** `targetPeerOrigins` as
+"broadcast to every peer", while `[]` is a target list that matches no peer. A
+DM whose participants are all local therefore relays nowhere. `queueOutboxEvent`
+enforces this structurally — it refuses to enqueue a `contextType: 'dm'` event
+that arrives with no target list at all, and logs the caller instead.
 
 **Function:** `federationOutbox.ts:queueDmRelay()`
 
@@ -529,14 +542,32 @@ Single source of truth for message relay payload construction:
   userId: localUser.id,
   homeUserId: user.homeUserId || user.id,
   homeInstance: user.homeInstance || getOurOrigin(),
+  type?: 'system',                               // only on system messages
   content: message.content,
-  replyToId: message.replyToId ?? null,
+  replyToId: message.replyToId ?? null,          // sender-local; receivers ignore it
+  replyTo?: { messageId, messageHomeInstance },  // only on replies; see below
+  mentions?: [{ id, homeUserId, homeInstance }], // only when the content mentions someone; see "Mentions in relayed messages"
   editedAt: message.editedAt ?? null,
   createdAt: message.createdAt,
 }
 ```
 
+**Naming a message across instances.** Each instance holds its own copy of a federated message under its own local id, so a relay event that points at another message names it with `FederationMessageRef { messageId, messageHomeInstance }`: the message's id on the instance that created it, and that instance's origin. `dmMessageFederationRef(row)` (`federationOutbox.ts`) builds it from a row: a row this instance created is `(row.id, getOurOrigin())`, a relayed copy is `(row.sourceMessageId, row.sourceInstance)`. The receiver turns it back into its own row with `resolveLocalDmMessage`. Replies (`message.replyTo`, filled by `dmReplyRefForRelay` in `queueDmRelay` and in the sync endpoint) and reactions (`reaction.messageId` + `reaction.messageHomeInstance`, filled by the WS reaction handlers and in the sync endpoint) both use it. `replyTo` is an optional field: an older sender omits it and its replies arrive without a quote, an older receiver ignores it.
+
 The full event includes `participants` (all channel members with their federated identities and profile snapshots) and optionally `federatedId` (for group DMs).
+
+### Mentions in relayed messages
+
+This is the one place the rule is written; other specs point here. Code: `utils/federationMentions.ts`.
+
+A mention is a `<@id>` token in the content, and the id is one the instance the content was written on issued: a DM's tokens are its pinned origin's ids, which name nobody on another instance. So a relayed `create` or `update` carries `message.mentions: FederationMentionRef[]`, and the receiver stores the content with its own ids in the tokens.
+
+- **Tokens.** `<@[A-Za-z0-9_-]+>` outside fenced and inline code, the same scan as the web `MarkdownRenderer`. A token inside code is text and is never listed or rewritten. DMs have no channel or role mentions.
+- **Sender** (`relayMentionsOf`, called by `buildRelayPayload`, which builds the message part of both the live relay and the sync endpoint's replay on the current content). Each distinct token id that names a live local user becomes `{ id, homeUserId, homeInstance }` with that row's `relayActorOfUser` identity: a native user is its own id and `getOurOrigin()`, a replicated or federated row its home pair. An id with no live row, or a row without a comparable identity, is left out. At most `MAX_RELAYED_MENTIONS` (100) entries. System messages and content without mentions carry no list: `relayMentionsOf` returns none for them, and the builder then omits the field.
+- **Receiver** (`rewriteRelayedMentions`, in `processCreateEvent` before the insert and in `processUpdateEvent` before the write, for events with and without `target`). The list is read defensively: a non-array is ignored, at most 100 entries are read, an entry needs a token-shaped `id` and non-empty string fields of at most 255 characters, and only the first entry for an id counts. Each listed id that appears as a token is resolved with `resolveRelayActor(homeUserId, homeInstance)`, matched on the pair and never on the bare id. A `found` row replaces the token's id. An identity with no live row here (`unknown`, `mismatch`, or a deleted user) leaves the token as written, and no row is created for a mention: every participant was already resolved or created for the event, the web resolves a DM token only among the DM's members, and creating stubs from a list would let any peer create rows by naming identities. System messages are stored as sent.
+- **Edits.** An edit carries its full new content and a list in its own sender's id space, which can be a different instance from the one that sent the create (a user writing through their account on another instance). The receiver rewrites from scratch and keeps no mention state.
+- **What follows.** Stored content names local rows, so the REST and WebSocket payloads, reply previews (built from the local row), search (`LIKE` over stored content) and the web notification filter (`content.includes('<@myId>')`) all see this instance's ids.
+- **Mixed versions.** An older sender sends no list and its content is stored as sent (foreign ids, rendered as an unknown user, as before). An older receiver ignores the list.
 
 ### Inbound: Message Create
 
@@ -547,17 +578,36 @@ The full event includes `participants` (all channel members with their federated
 **Participant resolution:**
 - ALL participants resolved via `resolveOrCreateReplicatedUser()` (auto-creates stubs for unknown remote users)
 - Profile data from relay event hydrated onto replicated user stubs via `hydrateReplicatedUserProfile()`
+- The author is the resolved participant that IS `event.message`'s `homeUserId` + `homeInstance` (`resolveRelayActor`), not the first participant sharing its `homeUserId`: a participant bound by username can resolve to a row of another identity. No such participant: reject `author_not_found`
 
 **Channel resolution (group vs 1-on-1):**
 
 | Has `federatedId`? | Path |
 |---------------------|------|
-| Yes (group DM) | Lookup by `federatedId`. If not found, reject (`channel_not_found`) -- channel must exist from prior `member_add` bootstrap |
-| No (1-on-1 DM) | Compute deterministic `federatedId` from the two participants' home user IDs, then `findOrCreateDmChannel()` |
+| Yes (group DM) | Lookup by `federatedId`. If not found, reject (`channel_not_found`) -- channel must exist from prior `member_add` bootstrap. Then the "Relayed message creates" check against the channel's members |
+| No (1-on-1 DM) | The "Relayed message creates" check against the first two participants, then `findOrCreateOneOnOne()` for the pair (key `oneOnOneKey`) |
 
-**`findOrCreateDmChannel()`:**
-- Lookup by `federatedId`: if found, ensure both users are members (re-add if removed)
-- If not found: create new channel with `ownerId = NULL` and the computed `federatedId`, add both users as members
+### Relayed message creates
+
+This is the one place the rule is written; other specs point here.
+
+A relayed `create` is written into a conversation only when the sending peer and the author both belong to it (`mayRelayInto`, `federation/dmChannels.ts`):
+
+1. The author (resolved from `event.message` among the participants, after `attributionRefusal`) must be one of the conversation's members: for a group, its `dm_members` rows on this instance; for a 1-on-1, one of the two participants whose home user ids its `federatedId` is computed from. The pair is the whole membership of a 1-on-1, so it is checked before `findOrCreateOneOnOne` creates or re-adds anything.
+2. The signing peer must be one of `relayTargetOrigins(<those members>)` (`federationOutbox.ts`), the origins this instance relays the conversation to, compared by domain as `attributionRefusal` compares instances (stored `homeInstance` values are bare domains). `getGroupDmTargetOrigins(channelId)` is the same function applied to a stored channel. Only those instances hold a copy of the conversation a message could have been written in. A 1-on-1 between two users of this instance has no relay targets here, so a create for it from another instance (where the two talk through their accounts there, and which does queue it) is refused.
+
+Nothing is written when either fails. The reason depends on the conversation (`nonMemberRefusal`, `federation/dmChannels.ts`):
+
+- **Group:** `unauthorized_source`, which the sender retries. This instance knows a group's membership only as its copy currently holds it, and that copy changes through relayed `member_add` events. A member added through a third instance can post before their add reaches this instance; the create is refused until the add lands, and the retry then writes it.
+- **1-on-1:** `invalid_target` (terminal). The pair never changes, so a retry cannot succeed. This includes a `federatedId` that names a 1-on-1 here, which senders never send for one.
+
+The check reads no new wire field, so events from older senders are judged the same way; every sender version retries `unauthorized_source`.
+
+**`findOrCreateOneOnOne(db, a, b, { open: 'both' })`** (see "1-on-1 DM Creation" for the lookup order):
+- The row holding the key, with its members made the pair (missing ones added open, a same-identity row under another local id re-pointed)
+- Else an unkeyed row whose members are exactly the pair, keyed
+- Else a new row with `ownerId = NULL`, the key, and both members open (the message is delivered with it)
+- The caller then late-binds a federated call that rang before this copy existed (`lateBindFederatedCall`)
 
 **Attachment handling:**
 - Attachment rows created immediately with `filename = sourceUrl` (remote URL)
@@ -565,22 +615,45 @@ The full event includes `participants` (all channel members with their federated
 - Background file worker downloads the file and updates the filename to the local path
 - SSRF protection: `isUrlFromPeer()` validates attachment URL hostname matches peer origin
 
-**Broadcast filtering:**
-- Skip members whose `homeInstance === sourceInstance` (they already have the message from their home instance)
+**Broadcast:** every local member of the conversation gets `dm_message_created`, members homed on the source instance included; a closed member is reopened first and gets `dm_channel_created` with the message (the same resurface sequence as `broadcastDmMessage`).
+
+### Relayed edits and deletes
+
+This is the one place the rule is written; other specs point here.
+
+DM edits and deletes are author-only on every path (REST `PATCH`/`DELETE /api/dm/messages/:id`, WS `dm_message_edit`/`dm_message_delete`). There is no moderation delete in DMs, group owners included, so a relayed edit or delete is authorized by authorship alone.
+
+**Outbound.** `update` and `delete` events carry `target: FederationMessageTarget` (`@backspace/shared`), built by `dmMessageMutationTarget(row, actorUserId)` (`federationOutbox.ts`):
+
+- `message`: the message as a `FederationMessageRef` (`dmMessageFederationRef`, see "Naming a message across instances"). A row that is itself a relayed copy is named by the id and origin it arrived with, never by this instance's id.
+- `federatedId`: the conversation's `federatedId` (1-on-1 and group alike).
+- `actor`: the editing or deleting user's federated identity (`relayActorOfUser`).
+
+The event's `messageId` stays the sender's local id: it is the outbox coalescing key and what older receivers match on. Deletes build the target before removing the row and store it in the mutation log payload, so the sync endpoint can replay it. A conversation without a `federatedId`, or an actor without a comparable identity, gets no target and the event goes out in the old shape.
+
+**Inbound** (`resolveRelayedMutationTarget`, `federation/events/dmMessages.ts`), for an event with a `target`:
+
+1. Malformed target: rejected `invalid_target` (terminal).
+2. `attributionRefusal(target.actor, sourceInstance)`, the same check every relay event runs (direct, or homeward via `localUserActsOnPeer`): a refusal is returned as its reason, `attribution_mismatch` (terminal) or `attribution_unproven` (retried: the homeward proof has not reached this instance yet). See `federation.md` §3.
+3. Resolve `target.message` with `resolveLocalDmMessage`, and require it to be in this instance's copy of `target.federatedId`: else `unknown_message`. Not terminal: the create may not have arrived yet, and the sender retries on the outbox backoff schedule.
+4. The signing peer must be one of `getGroupDmTargetOrigins(<the message's conversation>)`, the origins this instance relays that conversation to, or the instance the message itself arrived from (`dm_messages.sourceInstance`, compared with `normalizeOriginForCompare`; the relay targets are compared by domain, as in "Relayed message creates"): else `invalid_target` (terminal). A peer the conversation never reached cannot address its messages, whatever actor it names.
+5. The actor must be the message's author, compared as federated identities (`sameRelayActor(relayActorOfUser(author), target.actor)`: equal home user id, same home domain), never as local ids: else `not_message_author` (terminal). Nothing is modified.
+
+An event **without** a `target` (an older sender) is matched as `(sourceInstance, messageId)`. That only finds a message the sending instance created and relayed here, so the lookup is its own authorization, as before. An older receiver ignores `target` and keeps doing exactly that, so for it an edit or delete of a message the sender did not create still fails as `unknown_message`.
 
 ### Inbound: Message Update
 
 **Function:** `federation.ts:processUpdateEvent()`
 
-1. Find local message by `sourceInstance` + `sourceMessageId`
-2. Update content and `editedAt`
+1. Find and authorize the local message ("Relayed edits and deletes")
+2. Update content (mention tokens rewritten, "Mentions in relayed messages") and `editedAt`
 3. Broadcast `dm_message_updated` to all local members
 
 ### Inbound: Message Delete
 
 **Function:** `federation.ts:processDeleteEvent()`
 
-1. Find local message by `sourceInstance` + `sourceMessageId`
+1. Find and authorize the local message ("Relayed edits and deletes")
 2. Delete attachments, reactions, and message atomically
 3. Clean up attachment files from disk
 4. Broadcast `dm_message_deleted` to all local members
@@ -592,7 +665,7 @@ The full event includes `participants` (all channel members with their federated
 Triggered by a `read_state_update` relay event sent when a user on another instance acknowledges a DM channel.
 
 1. Resolve channel by `federatedId` — reject if not found
-2. Resolve user via `resolveLocalUser` — skip silently if not found
+2. Resolve user by `homeUserId` + `homeInstance` via `resolveRelayActor`: `user_not_found` if unknown
 3. Resolve message by `messageRef` (local ID or `source_instance + source_message_id`)
 4. Upsert `read_states` row for the resolved user and message
 5. Broadcast `channel_ack` to the user's local WebSocket connections for multi-tab sync
@@ -604,6 +677,9 @@ Not stored in the outbox or mutation log — fire-and-forget, missed deliveries 
 **Functions:** `federation.ts:processReactionAddEvent()`, `processReactionRemoveEvent()`
 
 - Uses `resolveLocalDmMessage()` for cross-instance message resolution (handles messages originating on this instance vs relayed messages)
+- **Scope** (`reactionScopeRefusal`), checked on the resolved message before anything changes:
+  1. The signing peer must pass the peer check of "Relayed edits and deletes" (step 4, `isPeerOfMessage`): one of the origins this instance relays the message's conversation to, or the instance the message came from. Else `invalid_target` (terminal). This holds for every message the event can name, including one that originated on this instance.
+  2. The reactor must be a member of the message's conversation here, matched by federated identity (`memberWithIdentity` over `dmChannelMembers`), as the local reaction handlers require (`isDmMember`). Else `nonMemberRefusal`, as for "Relayed message creates": `unauthorized_source` (retried) in a group, whose roster here may not yet hold a member added through a third instance; `invalid_target` in a 1-on-1.
 - Reaction add is idempotent (existing reaction accepted silently)
 - Broadcasts `reaction_added` / `reaction_removed` to local members
 
@@ -628,13 +704,29 @@ Not stored in the outbox or mutation log — fire-and-forget, missed deliveries 
 **Trigger:** `processMemberAddEvent()` finds the channel by `federatedId`.
 
 **Sequence:**
-1. Validate authority: `sourceInstance` must match `channel.ownerHomeInstance`
+1. Validate authority ("Relayed member adds" below)
 2. Cancel soft-delete if channel was pending GC (`deletedAt` set)
 3. Resolve added user via `resolveOrCreateReplicatedUser()`
 4. Enforce 10-member cap
 5. Insert `dm_members` row (idempotent)
 6. Insert system message for member addition
 7. Broadcast `dm_message_created` (system) and `dm_member_added` to local members
+
+### Relayed member adds
+
+This is the one place the rule is written; other specs point here.
+
+What decides the path is whether this instance holds a channel with the event's `federatedId` (soft-deleted or not):
+
+- **Bootstrap** (no such channel): the event must carry `group`, which must name an owner, and `attributionRefusal(group.owner, sourceInstance)` must pass: the sender speaks for the group's owner. The owner and roster are then resolved (`resolveOrCreateReplicatedUser`; tombstoned identities are dropped) and `mayRelayInto(<roster>, <owner>, sourceInstance)` must pass: the owner is in the roster and the signing peer is one of the instances the roster lives on. A missing owner or a failed roster check is `invalid_target` (terminal; the event carries everything it is judged on, so a retry cannot change the answer) and no channel is created. The roster it sends becomes this instance's copy. This is how a brand-new group, or a group this instance has never held, arrives.
+- **Incremental** (the channel exists): the add is judged against this instance's copy, mirroring `POST /api/dm/:id/members`:
+  1. `attributionRefusal(membership.addedBy, sourceInstance)`, as for every relay event.
+  2. The channel must be a group (`ownerId` set). A 1-on-1 has a fixed pair: else `invalid_target` (terminal).
+  3. The adder (`membership.addedBy`, required) must be a current member of this copy, matched by federated identity (`memberWithIdentity`: same home user id on the same home domain), and the signing peer one of `relayTargetOrigins(<the members before the add>)`, compared by domain (`mayRelayInto`, `federation/dmChannels.ts`, the same check "Relayed message creates" uses): else `unauthorized_source`. Nothing is added.
+
+`unauthorized_source` is retried by the sender. An add can legitimately arrive before the event that made its adder a member, when that member was added through a third instance; the retry applies it once that event has landed. The local route's friendship check is the adder's own instance's to make; the receiver cannot see that friendship.
+
+Known limit: a copy kept after all of this instance's members left keeps its roster from that time. An add by someone who joined later is refused until their own add reaches this instance, which it does not, since the group is no longer relayed here. Re-adding through the owner or any member still in that roster works.
 
 ### Bootstrap vs Incremental Batching
 
@@ -644,9 +736,9 @@ When a group DM is created with multiple remote members, the origin instance que
 
 **Function:** `federation.ts:processMemberRemoveEvent()`
 
-1. Find channel by `federatedId`. If not found, accept silently (idempotent).
+1. Find channel by `federatedId`. If not found, accept silently (idempotent). A kick (`reason` other than `leave`) on a channel without an owner, a 1-on-1, is refused `invalid_target` (terminal): a 1-on-1 has a fixed pair and no one who may kick.
 2. Authority check: for kicks, `sourceInstance` must match `ownerHomeInstance`. For self-leave (`reason === 'leave'`), any instance is accepted.
-3. Resolve user via `resolveLocalUser()` (they should already exist). If not found, accept silently.
+3. Resolve user by `homeUserId` + `homeInstance` via `resolveRelayActor()` (they should already exist). If not found, accept silently.
 4. Insert `member_removed` system message (before deletion so broadcast includes leaving user)
 5. Delete `dm_members` row
 6. Delete `read_states`
@@ -658,7 +750,7 @@ When a group DM is created with multiple remote members, the origin instance que
 **Function:** `federation.ts:processOwnershipTransferEvent()`
 
 1. Find channel by `federatedId`. If not found, accept silently.
-2. Authority check: `sourceInstance` must match `channel.ownerHomeInstance`
+2. The channel must be a group (`ownerId` set): a 1-on-1 has no owner to transfer, so the event is refused `invalid_target` (terminal). Then the authority check: `sourceInstance` must match `channel.ownerHomeInstance`
 3. Resolve new owner via `resolveOrCreateReplicatedUser()` -- **MUST guarantee non-null** (see invariant above)
 4. Update `dm_channels`: `ownerId`, `ownerHomeUserId`, `ownerHomeInstance`
 5. Broadcast `dm_owner_updated` to local members
@@ -779,7 +871,7 @@ const isLocalMember = (u: { homeInstance?: string | null }) =>
 
 | Action | Behavior |
 |--------|----------|
-| `addDmChannel(channel, origin?)` | Prepends to `dmChannels`, deduplicates by ID, records origin in `channelOriginMap` |
+| `upsertCopy(origin, channel, keySource)` (`dmConversations.ts`) | Adds or replaces the copy of a conversation from one origin under its key; `dmChannels`, `channelOriginMap` and the alternatives index are derived from the conversations, not written directly. Returns the pinned copy's channel id |
 | `removeDmChannel(id)` | Filters from `dmChannels`, cleans up unread/read state via `chatStore.removeChannelStates()` |
 | `addDmMember(dmChannelId, user)` | Appends user to channel's `members` array (dedup by ID) |
 | `removeDmMember(dmChannelId, userId)` | Filters user from channel's `members` array (reused for kick) |
@@ -803,7 +895,7 @@ Returns the channel's `ownerHomeInstance`. Used by all owner-only DM operations 
 
 | WS Event | Handler |
 |----------|---------|
-| `dm_channel_created` | Normalize remote user assets, upsert each member into `userViews`, call `addDmChannel(channel, origin)` |
+| `dm_channel_created` | Normalize remote user assets, upsert each member into `userViews`, add the copy through the DM merge module (`upsertCopy(origin, channel, 'stated')`, `dmConversations.ts`) |
 | `dm_channel_closed` | Call `removeDmChannel(dmChannelId)` |
 | `dm_channel_updated` | Call `updateDmMetadata(dmChannelId, { name, icon })` |
 | `dm_member_added` | Normalize remote user assets, upsert into `userViews`, call `addDmMember(dmChannelId, user)` |
@@ -899,9 +991,13 @@ const normalized = homeInstance.startsWith('http')
 - `limit`: 1-100, default 50
 - Results returned in chronological order (oldest first)
 
-### DM Channel List Sorting
+### DM Channel List
 
-`GET /api/dm` returns channels sorted by `lastMessage.createdAt` descending (newest activity first), falling back to `channel.createdAt` for channels with no messages.
+`GET /api/dm` returns the same entries as the `ready` payload's `dmChannels`: both call `loadOpenDmChannels()` (`utils/dmChannelWire.ts`). Every other emitter of a `DmChannel` (`dm_channel_created` on every path, the `POST /api/dm`, `POST /api/dm/group` and add-member payloads, re-attach) builds it with `loadDmChannelWire()`, which goes through the same `toDmChannelWire()`; without a message to deliver it uses the newest message's preview, so its payload equals the row's list entry. No `DmChannel` is built by hand. Every entry carries `id`, `federatedId`, `ownerId`, `ownerHomeUserId`, `ownerHomeInstance`, `createdAt`, `name`, `icon`, `metadataUpdatedAt`, `members` and `lastMessage`, with `null` (or `0` for `metadataUpdatedAt`) where the channel has no value. In the shared `DmChannel` type every field is required, nullable where the row can be null, so a payload that leaves one out does not compile. The last-message lookup is chunked by channel ids and runs as one grouped `MAX(created_at)` per chunk joined back to the rows, so any number of DMs stays under SQLite's limits and a long conversation costs one indexed pass, not one per message.
+
+Servers up to 1.6.1 built the list by hand and left out `federatedId`, the owner identity, `name`, `icon` and `metadataUpdatedAt`. A client connected to both instances of a conversation re-reads an instance's list to place a channel id it has not seen (`reloadDmsForOrigin`), and without the key it showed that instance's mirrored copy as a second row, once per conversation the instance mirrors. `reloadDmsForOrigin` still handles peers on those versions; see `client-federation.md` "WS event routing contract".
+
+The list is sorted by `lastMessage.createdAt` descending (newest activity first), falling back to `channel.createdAt` for channels with no messages.
 
 ---
 
@@ -913,7 +1009,7 @@ For full wire formats, see `docs/systems/websocket.md`.
 
 | Event | Direction | Triggered By |
 |-------|-----------|-------------|
-| `dm_channel_created` | S->C | Group DM bootstrap, new 1-on-1, soft-close reopen |
+| `dm_channel_created` | S->C | Group DM create and bootstrap, added member, reopen of a closed membership (including the first message of a new 1-on-1 for its recipient) |
 | `dm_channel_closed` | S->C | User closes DM, user leaves group |
 | `dm_channel_updated` | S->C | Group metadata (`name`/`icon`) updated; payload `{ dmChannelId, name, icon }` (no `metadataUpdatedAt` — server-side version vector only) |
 | `dm_member_added` | S->C | Incremental member add (not bootstrap) |

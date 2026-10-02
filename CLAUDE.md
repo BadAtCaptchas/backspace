@@ -40,6 +40,7 @@ You are the Lead Developer of Backspace, an open-source (AGPL-3.0, commercially 
 - Permission bits or resolution algorithm
 - Voice/streaming architecture
 - Design system (new surface tiers, input tiers, CSS classes)
+- Localization (new namespaces, error codes, formatters, languages)
 
 Do NOT update docs for standard UI/UX fixes or minor logic bugs. Only structural, architectural, or functional changes.
 
@@ -52,7 +53,7 @@ Full spec: `docs/systems/design-system.md`
 
 **Core:** Warm matte surfaces with subtle frosted glass accents. Calm over flashy. Warm over cool.
 **Two-material system:** Solid matte panels for content (75%), frosted glass for persistent controls (25%).
-**Colors:** Warm dark surfaces (#13131a chat, #1a1a23 sidebars), pastel accents (mint, peach, lavender, sky, amber, rose, coral).
+**Colors:** Warm dark surfaces (#13131a chat, #1a1a23 sidebars), pastel accents (mint, peach, lavender, sky, amber, rose, coral), brand primary lavender (`#7c6cf6`).
 
 ### Surface Tiers
 | Tier | Class | When to Use |
@@ -84,13 +85,14 @@ No resting border — sunken `surface-input` background provides differentiation
 
 | Layer | Tech |
 |-------|------|
-| Runtime | Node.js 20+, TypeScript strict, pnpm workspaces |
+| Runtime | Node.js 22+, TypeScript strict, pnpm workspaces |
 | Server | Fastify 4, Drizzle ORM, SQLite (better-sqlite3), JWT + bcrypt |
-| Frontend | React 18, Vite 6, Tailwind CSS 3, Zustand 5 |
+| Frontend | React 18, Vite 8, Tailwind CSS 3, Zustand 5 |
 | Voice | LiveKit (livekit-client + livekit-server-sdk), RNNoise |
 | Media | sharp (thumbnails), Cheerio (URL metadata), react-easy-crop |
 | Chat | react-markdown + remark-gfm, prism-react-renderer, emoji-mart |
-| Desktop | Electron 40, electron-updater, uiohook-napi |
+| i18n | i18next + react-i18next, `Intl.*` formatters, JSON catalogs per surface |
+| Desktop | Electron 43, electron-updater, uiohook-napi |
 | Testing | Vitest, @testing-library/react |
 
 **Do not introduce new dependencies without justification.**
@@ -105,9 +107,17 @@ packages/
   server/   — Fastify server, DB schema, routes, WS handler, federation, utils
   web/      — React SPA, stores, hooks, components (layout/chat/voice/modals/ui), platform layer
   desktop/  — Electron wrapper (main, preload, activity detector, keybind manager)
+scripts/
+  metrics/  — @backspace/metrics: repo traffic collector + dashboard bundler (workspace package)
+  pr-triage/ — @backspace/pr-triage: fork PR triage bot, comments a CI-approval verdict (workspace package)
+site/
+  index.html    — landing page (GitHub Pages)
+  insights/     — the metrics dashboard: one static page + vendored uPlot
 ```
 
-Data: `packages/server/data/` (backspace.db + uploads/)
+The metrics subsystem spans `scripts/metrics` (collector, bundler) and `site/insights` (the static dashboard the bundler feeds). See docs/systems/metrics.md.
+
+Data: `data/` at the repository root (backspace.db + uploads/ + backups/), mounted into the container at `/app/data`
 
 ---
 
@@ -122,6 +132,8 @@ Data: `packages/server/data/` (backspace.db + uploads/)
 **Config:** `packages/server/src/config.ts` reads env with defaults.
 
 **Dev:** `pnpm install && pnpm dev` → server :3005 + Vite :5173
+
+**Lint:** `pnpm lint` (ESLint flat config in `eslint.config.js`; violations that predate the lint step are counted in `eslint-suppressions.json`, so new ones fail the run)
 
 **Deployment:**
 - Docker Compose: `backspace` + `caddy` (auto-HTTPS) + `livekit` (optional)
@@ -156,11 +168,19 @@ Before modifying any subsystem, read its spec from `docs/systems/`. After making
 | [embeds.md](docs/systems/embeds.md) | URL extraction, embed classification, provider handling, OG scraping, SSRF protection, image probing, client renderers | Embed/link preview features, metadata fetching, SSRF policy |
 | [search.md](docs/systems/search.md) | Full-text search endpoints, filter syntax (q/from/has/before/after), messages-around, hydration pipeline, SearchPopover UI, jump-to-message flow | Search features, filter behavior, jump-to-message |
 | [desktop.md](docs/systems/desktop.md) | Electron main process, preload bridge, activity detection, global keybind manager, auto-update, build system (afterPack hook) | Desktop app, Electron, activity detection, keybinds, builds |
+| [desktop-security.md](docs/systems/desktop-security.md) | Electron webPreferences posture, security fuses (RunAsNode/EnableNodeCliInspectArguments/OnlyLoadAppFromAsar), asar-integrity posture and its ad-hoc-signing limits, `will-navigate` top-level navigation policy, code-signing/notarization procurement steps | Electron hardening work, fuses, navigation security, desktop code-signing |
 | [mobile-ui.md](docs/systems/mobile-ui.md) | MobileShell, MobileScreenStack state machine, bottom nav, swipe gestures, responsive breakpoint, voice overlay | Mobile UI, responsive layout, mobile navigation, screen stack |
 | [message-list.md](docs/systems/message-list.md) | Auto-scroll model, position memory (session-only), embed renderer dimension contract, known limitations | Touching MessageList.tsx, scroll behavior, embed renderers, position restore |
 | [deployment.md](docs/systems/deployment.md) | Hosting pipeline: Docker/Caddy build, admin bootstrap, DB backup/restore, image pinning, env vars | Any deploy, backup/restore, or hosting change |
 | [activity-presence.md](docs/systems/activity-presence.md) | Presence states, rich activities, activity types/priorities, broadcast pipeline, visibility control, ActivityCard/Panel | Presence, rich activities, activity display, status management |
-| [security-scanning.md](docs/systems/security-scanning.md) | CI security pipeline: Dependabot, CodeQL SAST, gitleaks, OSV-Scanner, Trivy (config/license; image scan in a later plan), OpenSSF Scorecard, SHA-pinning, harden-runner, tiered enforcement policy, maintainer settings checklist | Any CI security work, adding/changing scanners, enabling enforcement, supply-chain hardening |
+| [security-scanning.md](docs/systems/security-scanning.md) | CI security pipeline: Dependabot, CodeQL SAST, gitleaks, OSV-Scanner, Trivy (config, license, and the published image), OpenSSF Scorecard, ZAP baseline DAST, SHA-pinning, harden-runner, tiered enforcement policy, triage policy and dismissal register, the fork PR triage bot (`pr-triage.yml`, what the approval click releases, the signal table), maintainer settings checklist | Any CI security work, adding/changing scanners, enabling enforcement, supply-chain hardening |
+| [web-security.md](docs/systems/web-security.md) | Content Security Policy construction and rollout state, the CORS posture and why the origin is reflected, security-header ownership between Caddy and the app, the route-level policy override for served files | Any CSP, CORS or security-header work; before "tightening" CORS |
+| [localization.md](docs/systems/localization.md) | i18next setup, semantic surface-scoped keys, typed catalogs, plural policy, `Intl` formatters bound to the selected language, lazy locale loading, the `ErrorCode` wire contract and `sendError`/`describeError`, desktop main-process catalog and `set-language` IPC, the consistency check and its pending list, sweep order | **Any user-facing string, date, count or error message**; adding a language; converting a surface; adding a server error code |
+| [telemetry.md](docs/systems/telemetry.md) | Opt-in daily instance ping: the schema-1 payload and its field semantics, the two-significant-digit rounding, the never-sent list, the four `instance_settings` opt-in columns and their transition rules, `last_active_day`/`last_client` activity tracking, the reporter's slot minute and one-attempt-per-day rule, the admin routes, the ask's snooze rules, the Cloudflare Worker receiver and its 90-day retention, how the aggregates reach the insights page, `TELEMETRY_ENDPOINT` and `TELEMETRY` | Any telemetry work: payload fields, opt-in state, the reporter, the receiver, the ask, or what an instance does and does not send |
+| [telemetry-opt-in-rate.md](docs/systems/telemetry-opt-in-rate.md) | Estimated opt-in fraction for the hello (point estimate and range), how the ask is built and re-asked, participation figures from Home Assistant, Go, Debian, Ubuntu, Firefox and others with sources, the consent-design experiments, the population that never sees the ask, what would raise or lower the rate | Reading fleet numbers against the real fleet, changing the ask's copy, buttons or cadence, or citing opt-in comparables |
+| [directory.md](docs/systems/directory.md) | Opt-in space directory ("Outer Space"): the three-facts model, the five `instance_settings`/`spaces` columns and the dirty flag, the public `GET /api/directory/spaces` document and its one asset rule, the pinger's answer table and per-day guard, the feed proxy, the Cloudflare hub's routes, tables, validator and diff writes, the blocklist procedure, the WAF rule and rollout checklist, `DIRECTORY_ENDPOINT` and what empty means, the Explore page's Inner/Outer sections and connect-then-join, known limits | Any directory work: listing state, the document, the pinger, the hub, the Explore page's Outer Space, the admin toggle or the per-space switch |
+| [project-hub.md](docs/systems/project-hub.md) | The Backspace page at `/backspace`: the cards and when each shows, `PROJECT_LINKS` in `projectLinks.ts` (null hides a card), the `HUB_ACTION`/`HubLinkAction` card conventions, the per-user seen-version table and the update dot on the sidebar item, You row and You tab, the community card's states and its click-only privacy rule, the three listing conditions, the maintainer's two setup steps, the design workbench | Any work on the Backspace page, its cards, the update dot, project links, or the Support card setting's effect |
+| [metrics.md](docs/systems/metrics.md) | Traffic archive: daily collection into the `metrics-data` branch, CSV/NDJSON schemas, upsert and write-if-absent semantics, backfill, the 202 stats problem, the traffic token (release bot app), the 60-day schedule hazard; the `site/insights` dashboard: `data.json` contract, 2 MB bundle budget and weekly downsampling, uPlot vendoring, Pages deploy wiring, empty-state behaviour | Any repo-analytics or dashboard work, changing collected series, changing the bundle contract, debugging a stalled collector or a red deploy |
 
 ---
 

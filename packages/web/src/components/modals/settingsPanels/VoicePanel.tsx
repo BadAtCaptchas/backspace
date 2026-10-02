@@ -1,10 +1,15 @@
+import { useTranslation } from 'react-i18next';
 import { useVoiceStore } from '../../../stores/voiceStore';
+import { useUIStore } from '../../../stores/uiStore';
+import { useFormatters } from '../../../i18n/formatters';
 import { Toggle } from '../../ui/Toggle';
 import { VideoSection } from './VideoSection';
 import { AudioInputSection } from './AudioInputSection';
 import { AudioOutputSection } from './AudioOutputSection';
 
 export function VoicePanel() {
+  const { t } = useTranslation(['settings']);
+  const f = useFormatters();
   const echoCancellation = useVoiceStore((s) => s.echoCancellation);
   const autoGainControl = useVoiceStore((s) => s.autoGainControl);
   const rnnoiseEnabled = useVoiceStore((s) => s.rnnoiseEnabled);
@@ -15,23 +20,29 @@ export function VoicePanel() {
   const setSoundEffectVolume = useVoiceStore((s) => s.setSoundEffectVolume);
   const messageSoundAllChannels = useVoiceStore((s) => s.messageSoundAllChannels);
   const setMessageSoundAllChannels = useVoiceStore((s) => s.setMessageSoundAllChannels);
+  const pipEnabled = useVoiceStore((s) => s.pipEnabled);
+  const setPipEnabled = useVoiceStore((s) => s.setPipEnabled);
+  // The floating window is mounted only by the desktop layout (AppLayout), and
+  // the mobile Voice settings screen renders this same panel, so the setting is
+  // offered only where it has an effect.
+  const isMobile = useUIStore((s) => s.isMobile);
 
   return (
     <div className="space-y-5">
-      <h2 className="text-lg font-semibold text-txt-primary mb-6">Voice &amp; Video</h2>
+      <h2 className="text-lg font-semibold text-txt-primary mb-6">{t('settings:voice.title')}</h2>
 
       <AudioInputSection />
       <AudioOutputSection />
 
       <div>
         <div className="text-[11px] font-semibold text-txt-tertiary uppercase tracking-wider mb-1.5">
-          Volume
+          {t('settings:voice.volume.sectionTitle')}
         </div>
         <div className="rounded-lg bg-white/[0.03] border border-white/[0.04] p-3.5">
           <div className="py-1">
             <div className="flex items-center justify-between mb-2">
-              <div className="text-sm text-txt-primary">Sound Effects Volume</div>
-              <div className="text-xs text-txt-tertiary tabular-nums">{soundEffectVolume}%</div>
+              <div className="text-sm text-txt-primary">{t('settings:voice.volume.soundEffects.label')}</div>
+              <div className="text-xs text-txt-tertiary tabular-nums">{f.formatPercent(soundEffectVolume)}</div>
             </div>
             <input
               type="range"
@@ -46,10 +57,10 @@ export function VoicePanel() {
             />
           </div>
           <div className="flex items-center justify-between py-2">
-            <div>
-              <div className="text-sm text-txt-primary">Play sound for every message</div>
+            <div className="flex-1 mr-4">
+              <div className="text-sm text-txt-primary">{t('settings:voice.volume.messageSound.label')}</div>
               <div className="text-xs text-txt-tertiary">
-                Off (default): only DMs and messages that mention you. On: every channel.
+                {t('settings:voice.volume.messageSound.description')}
               </div>
             </div>
             <Toggle enabled={messageSoundAllChannels} onChange={setMessageSoundAllChannels} />
@@ -57,33 +68,54 @@ export function VoicePanel() {
         </div>
       </div>
 
+      {!isMobile && (
+        <div>
+          <div className="text-[11px] font-semibold text-txt-tertiary uppercase tracking-wider mb-1.5">
+            {t('settings:voice.pip.sectionTitle')}
+          </div>
+          <div className="rounded-lg bg-white/[0.03] border border-white/[0.04] p-3.5">
+            <div className="flex items-center justify-between py-2">
+              <div className="flex-1 mr-4">
+                <div className="text-sm text-txt-primary">{t('settings:voice.pip.showOnSwitch.label')}</div>
+                <div className="text-xs text-txt-tertiary">{t('settings:voice.pip.showOnSwitch.description')}</div>
+              </div>
+              <Toggle
+                enabled={pipEnabled}
+                onChange={setPipEnabled}
+                ariaLabel={t('settings:voice.pip.showOnSwitch.label')}
+              />
+            </div>
+          </div>
+        </div>
+      )}
+
       <VideoSection />
 
       <div>
         <div className="text-[11px] font-semibold text-txt-tertiary uppercase tracking-wider mb-1.5">
-          Voice Processing
+          {t('settings:voice.processing.sectionTitle')}
         </div>
         <div className="rounded-lg bg-white/[0.03] border border-white/[0.04] p-3.5">
           <div className="flex items-center justify-between py-2">
-            <div>
-              <div className="text-sm text-txt-primary">AI Noise Suppression</div>
-              <div className="text-xs text-txt-tertiary">ML-based noise removal (RNNoise) — filters keyboard, fans, and background noise</div>
+            <div className="flex-1 mr-4">
+              <div className="text-sm text-txt-primary">{t('settings:voice.processing.noiseSuppression.label')}</div>
+              <div className="text-xs text-txt-tertiary">{t('settings:voice.processing.noiseSuppression.description')}</div>
             </div>
             <Toggle enabled={rnnoiseEnabled} onChange={setRnnoiseEnabled} />
           </div>
 
           <div className="flex items-center justify-between py-2">
-            <div>
-              <div className="text-sm text-txt-primary">Echo Cancellation</div>
-              <div className="text-xs text-txt-tertiary">Cancels echo from your speakers feeding back into the mic. Always on for voice channels and calls.</div>
+            <div className="flex-1 mr-4">
+              <div className="text-sm text-txt-primary">{t('settings:voice.processing.echoCancellation.label')}</div>
+              <div className="text-xs text-txt-tertiary">{t('settings:voice.processing.echoCancellation.description')}</div>
             </div>
             <Toggle enabled={echoCancellation} onChange={setEchoCancellation} />
           </div>
 
           <div className="flex items-center justify-between py-2">
-            <div>
-              <div className="text-sm text-txt-primary">Auto Gain Control</div>
-              <div className="text-xs text-txt-tertiary">Auto-adjusts mic volume — can cause voice ducking during streams</div>
+            <div className="flex-1 mr-4">
+              <div className="text-sm text-txt-primary">{t('settings:voice.processing.autoGain.label')}</div>
+              <div className="text-xs text-txt-tertiary">{t('settings:voice.processing.autoGain.description')}</div>
             </div>
             <Toggle enabled={autoGainControl} onChange={setAutoGainControl} />
           </div>

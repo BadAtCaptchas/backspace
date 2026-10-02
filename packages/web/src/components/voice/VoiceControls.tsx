@@ -1,20 +1,19 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
+import { useTranslation } from 'react-i18next';
 import { useVoiceStore } from '../../stores/voiceStore';
 import { useSpaceStore, getChannelOrigin } from '../../stores/spaceStore';
-import { getActiveRoom } from '../../hooks/useLiveKit';
 import { wsSend } from '../../hooks/useWebSocket';
 import { ScreenShareSettingsPopover } from './ScreenShareSettingsPopover';
 import { ConnectionInfoPopover } from './ConnectionInfoPopover';
-import { startScreenShare, stopScreenShare } from '../../utils/screenShare';
 import { hasPermissionBit, PermissionBits } from '../../utils/permissions';
-import { broadcastVoiceStatus } from '../../utils/voice';
-import { handleCameraAction } from '../../utils/voiceActions';
+import { handleCameraAction, handleScreenShareAction } from '../../utils/voiceActions';
 
 /**
  * VoiceControls renders the voice status + button rows.
  * It has NO wrapper/card styling — the parent provides the container.
  */
 export function VoiceControls() {
+  const { t } = useTranslation(['voice', 'common']);
   const currentVoiceChannelId = useVoiceStore((s) => s.currentVoiceChannelId);
   const isCameraOn = useVoiceStore((s) => s.isCameraOn);
   const isScreenSharing = useVoiceStore((s) => s.isScreenSharing);
@@ -22,12 +21,14 @@ export function VoiceControls() {
   const setRnnoiseEnabled = useVoiceStore((s) => s.setRnnoiseEnabled);
   const connectionError = useVoiceStore((s) => s.connectionError);
   const isLiveKitConnected = useVoiceStore((s) => s.isLiveKitConnected);
+  const voiceConnectionStatus = useVoiceStore((s) => s.voiceConnectionStatus);
   const connectionQuality = useVoiceStore((s) => s.connectionQuality);
   const channels = useSpaceStore((s) => s.channels);
-  const [showScreenShareSettings, setShowScreenShareSettings] = useState(false);
+  // Screen-share button: idle → source picker; live → settings + stop menu.
+  const [showShareMenu, setShowShareMenu] = useState(false);
   const [showConnectionInfo, setShowConnectionInfo] = useState(false);
   const connectionBtnRef = useRef<HTMLButtonElement>(null);
-  const qualityBtnRef = useRef<HTMLButtonElement>(null);
+  const shareBtnRef = useRef<HTMLButtonElement>(null);
 
   const activeDmCall = useVoiceStore((s) => s.activeDmCall);
   const channelPerms = useSpaceStore((s) => currentVoiceChannelId ? s.channelPermissions.get(currentVoiceChannelId) : undefined);
@@ -39,26 +40,30 @@ export function VoiceControls() {
 
   const voiceOrigin = currentVoiceChannelId ? getChannelOrigin(currentVoiceChannelId) : '';
 
+  // A share that ends outside the menu (OS "Stop sharing" bar, track loss,
+  // keybind) must not leave a stale settings popover anchored to the button.
+  useEffect(() => {
+    if (!isScreenSharing) setShowShareMenu(false);
+  }, [isScreenSharing]);
+
   if (!currentVoiceChannelId && !activeDmCall) return null;
 
   const channel = channels.find(c => c.id === currentVoiceChannelId);
-  const channelName = channel?.name ?? (activeDmCall ? 'DM Call' : 'Voice Channel');
+  const channelName = channel?.name ?? (activeDmCall ? t('voice:status.dmCall') : t('voice:status.voiceChannel'));
 
-  const handleScreenShare = async () => {
-    const room = getActiveRoom();
-    console.log('[SS] handleScreenShare clicked, room:', !!room, 'isScreenSharing:', isScreenSharing);
-    if (!room) return;
-    try {
-      if (!isScreenSharing) {
-        const started = await startScreenShare(room);
-        if (started) broadcastVoiceStatus();
-      } else {
-        await stopScreenShare(room);
-        broadcastVoiceStatus();
-      }
-    } catch (err) {
-      console.error('[VoiceControls] Failed to toggle screen share:', err);
+  const handleScreenShare = () => {
+    if (isScreenSharing) {
+      const next = !showShareMenu;
+      setShowShareMenu(next);
+      if (next) setShowConnectionInfo(false);
+      return;
     }
+    handleScreenShareAction();
+  };
+
+  const handleStopSharing = () => {
+    setShowShareMenu(false);
+    handleScreenShareAction();
   };
 
   const handleDisconnect = () => {
@@ -73,6 +78,29 @@ export function VoiceControls() {
     }
     if (disconnectFn) disconnectFn();
   };
+
+  const handleRetry = () => {
+    const { connectFn, activeDmCall, currentVoiceChannelId } = useVoiceStore.getState();
+    const target = activeDmCall?.dmChannelId ?? currentVoiceChannelId;
+    if (connectFn && target) void connectFn(target, !!activeDmCall);
+  };
+
+  const connectionDetail = connectionError === 'network_disconnect'
+    ? t('voice:status.connectionLost')
+    : connectionError === 'connect_failed'
+      ? t('voice:status.connectionFailed')
+      : connectionError;
+
+  const statusLabel = voiceConnectionStatus === 'reconnecting'
+    ? t('voice:status.reconnecting')
+    : connectionError === 'network_disconnect'
+      ? t('voice:status.disconnected')
+      : connectionError
+        ? t('voice:status.connectionFailed')
+        : isLiveKitConnected
+          ? t('voice:status.connected')
+          : t('voice:status.connecting');
+  const detailLabel = connectionDetail ?? channelName;
 
   const statusColor = connectionError
     ? 'text-txt-danger'
@@ -106,10 +134,10 @@ export function VoiceControls() {
           ref={connectionBtnRef}
           onClick={() => {
             setShowConnectionInfo(!showConnectionInfo);
-            if (!showConnectionInfo) setShowScreenShareSettings(false);
+            if (!showConnectionInfo) setShowShareMenu(false);
           }}
           className={`w-8 h-8 rounded-lg ${statusBgColor} flex items-center justify-center flex-shrink-0 hover:brightness-125 transition-all`}
-          title="Connection Info"
+          title={t('voice:controls.connectionInfo')}
         >
           <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" className={qualityColor}>
             <path d="M1 9l2 2c4.97-4.97 13.03-4.97 18 0l2-2C16.93 2.93 7.08 2.93 1 9zm8 8l3 3 3-3c-1.65-1.66-4.34-1.66-6 0zm-4-4l2 2c2.76-2.76 7.24-2.76 10 0l2-2C15.14 9.14 8.87 9.14 5 13z" />
@@ -117,19 +145,27 @@ export function VoiceControls() {
         </button>
 
         <div className="min-w-0 flex-1">
-          <div className={`text-[13px] font-semibold leading-[18px] ${statusColor}`}>
-            {connectionError ? 'Connection Failed' : isLiveKitConnected ? 'Voice Connected' : 'Connecting...'}
+          <div title={statusLabel} className={`truncate text-[13px] font-semibold leading-[18px] ${statusColor}`}>
+            {statusLabel}
           </div>
-          <div className="text-[12px] text-txt-tertiary truncate leading-[16px]">
-            {connectionError ? connectionError : channelName}
+          <div title={detailLabel} className="text-[12px] text-txt-tertiary truncate leading-[16px]">
+            {detailLabel}
           </div>
         </div>
 
         <div className="flex items-center gap-0.5 flex-shrink-0">
+          {voiceConnectionStatus === 'disconnected' && connectionError && (
+            <button
+              onClick={handleRetry}
+              className="px-2 h-7 text-[12px] text-accent-primary hover:bg-interactive-hover rounded"
+            >
+              {t('voice:status.retry')}
+            </button>
+          )}
           <button
             onClick={handleDisconnect}
             className="w-7 h-7 flex items-center justify-center text-txt-tertiary hover:text-txt-primary transition-colors rounded"
-            title="Disconnect"
+            title={t('voice:controls.disconnect')}
           >
             <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
               <path d="M12 9C10.4 9 8.85 9.25 7.4 9.72V12.82C7.4 13.22 7.17 13.56 6.84 13.72C5.86 14.21 4.97 14.84 4.18 15.57C4 15.75 3.75 15.85 3.48 15.85C3.2 15.85 2.95 15.74 2.77 15.56L0.29 13.08C0.11 12.9 0 12.65 0 12.38C0 12.1 0.11 11.85 0.29 11.67C3.34 8.78 7.46 7 12 7S20.66 8.78 23.71 11.67C23.89 11.85 24 12.1 24 12.38C24 12.65 23.89 12.9 23.71 13.08L21.23 15.56C21.05 15.74 20.8 15.85 20.52 15.85C20.25 15.85 20 15.75 19.82 15.57C19.03 14.84 18.14 14.21 17.16 13.72C16.83 13.56 16.6 13.22 16.6 12.82V9.72C15.15 9.25 13.6 9 12 9Z" />
@@ -145,7 +181,7 @@ export function VoiceControls() {
         />
       </div>
 
-      {/* Row 2: Camera, Screen Share, Video Quality, Noise Suppression */}
+      {/* Row 2: Camera, Screen Share, Noise Suppression */}
       <div className="relative flex items-center gap-1 px-3 pb-2 pt-1">
         {canSpeak && (
           <button
@@ -155,7 +191,7 @@ export function VoiceControls() {
                 ? 'bg-surface-base text-status-online hover:bg-surface-channel'
                 : btnDefaultStyle
             }`}
-            title={isCameraOn ? 'Turn Off Camera' : 'Turn On Camera'}
+            title={isCameraOn ? t('voice:controls.cameraOff') : t('voice:controls.cameraOn')}
           >
             {isCameraOn ? (
               <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
@@ -172,13 +208,18 @@ export function VoiceControls() {
 
         {canStream && (
           <button
+            ref={shareBtnRef}
             onClick={handleScreenShare}
+            // Idle the button starts a share; live it toggles a menu, so it
+            // only claims a popup in the state where it actually opens one.
+            aria-haspopup={isScreenSharing ? 'dialog' : undefined}
+            aria-expanded={isScreenSharing ? showShareMenu : undefined}
             className={`${btnBase} ${
               isScreenSharing
                 ? 'bg-surface-base text-status-online hover:bg-surface-channel'
                 : btnDefaultStyle
             }`}
-            title={isScreenSharing ? 'Stop Sharing' : 'Share Screen'}
+            title={isScreenSharing ? t('voice:controls.shareOptions') : t('voice:controls.shareScreen')}
           >
             <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
               <path d="M20 18C21.1 18 22 17.1 22 16V6C22 4.9 21.1 4 20 4H4C2.9 4 2 4.9 2 6V16C2 17.1 2.9 18 4 18H0V20H24V18H20ZM4 6H20V16H4V6Z" />
@@ -186,26 +227,6 @@ export function VoiceControls() {
             </svg>
           </button>
         )}
-
-        {/* Video Quality */}
-        <button
-          ref={qualityBtnRef}
-          onClick={() => {
-            setShowScreenShareSettings(!showScreenShareSettings);
-            if (!showScreenShareSettings) setShowConnectionInfo(false);
-          }}
-          className={`${btnBase} ${
-            showScreenShareSettings
-              ? 'bg-surface-base text-accent-primary hover:bg-surface-channel'
-              : btnDefaultStyle
-          }`}
-          title="Video Quality"
-        >
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
-            <path d="M3 5v14h18V5H3zm16 12H5V7h14v10z" />
-            <path d="M8 15l2.5-3.21L13 15l2-2.5L18 17H6z" />
-          </svg>
-        </button>
 
         {/* AI Noise Suppression (RNNoise) */}
         <button
@@ -215,7 +236,7 @@ export function VoiceControls() {
               ? 'bg-surface-base text-status-online hover:bg-surface-channel'
               : btnDefaultStyle
           }`}
-          title={rnnoiseEnabled ? 'Disable AI Noise Suppression' : 'Enable AI Noise Suppression'}
+          title={rnnoiseEnabled ? t('voice:controls.noiseSuppressionOff') : t('voice:controls.noiseSuppressionOn')}
         >
           <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
             <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z" opacity={rnnoiseEnabled ? 0.15 : 0.08} />
@@ -235,11 +256,12 @@ export function VoiceControls() {
           </svg>
         </button>
 
-        {/* Screen Share Settings Popover */}
+        {/* Screen share menu — quality settings + stop, anchored to the share button */}
         <ScreenShareSettingsPopover
-          open={showScreenShareSettings}
-          onClose={() => setShowScreenShareSettings(false)}
-          anchorRef={qualityBtnRef}
+          open={showShareMenu && isScreenSharing}
+          onClose={() => setShowShareMenu(false)}
+          anchorRef={shareBtnRef}
+          onStopSharing={handleStopSharing}
         />
       </div>
     </>

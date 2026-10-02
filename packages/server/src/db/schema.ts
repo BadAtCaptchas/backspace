@@ -7,7 +7,16 @@ export const users = sqliteTable('users', {
   displayName: text('display_name'),
   passwordHash: text('password_hash').notNull(),
   avatar: text('avatar'),
+  /** Live presence: the chosen status while connected, 'offline' with no connection. */
   status: text('status').default('offline'),
+  /**
+   * The status the user picked ('online' | 'idle' | 'dnd'). Survives disconnects
+   * and restarts; published as `status` when a connection authenticates.
+   * Meaningful only on rows that own their choice (native or detached,
+   * `ownsChosenStatus` in @backspace/shared): a replicated row's copy is never
+   * read or written.
+   */
+  chosenStatus: text('chosen_status').notNull().default('online'),
   customStatus: text('custom_status'),
   isAdmin: integer('is_admin').default(0),
   homeInstance: text('home_instance'),
@@ -25,8 +34,21 @@ export const users = sqliteTable('users', {
   federationRegistryUpdatedAt: integer('federation_registry_updated_at').default(0),
   federationHealPending: integer('federation_heal_pending').default(0),
   federationHomeOrphaned: integer('federation_home_orphaned').default(0),
+  /** UTC day (YYYY-MM-DD) of the last authenticated WebSocket activity; written at most once per day. */
+  lastActiveDay: text('last_active_day'),
+  /** 'web' | 'desktop' | 'mobile', from the client's auth message. */
+  lastClient: text('last_client'),
   createdAt: integer('created_at').notNull(),
-});
+}, (table) => ({
+  /**
+   * Every federated identity lookup starts with `home_user_id = ?`
+   * (`resolveRelayActor`, `resolveLocalUser`, the relay mention lists).
+   * Single column on purpose: a home user id matches about one row, and most
+   * pair lookups compare `home_instance` normalized or in code, where a
+   * composite's second column cannot be used.
+   */
+  homeUserIdx: index('idx_users_home_user_id').on(table.homeUserId),
+}));
 
 export const spaces = sqliteTable('spaces', {
   id: text('id').primaryKey(),
@@ -37,6 +59,7 @@ export const spaces = sqliteTable('spaces', {
   ownerId: text('owner_id').notNull().references(() => users.id),
   inviteCode: text('invite_code').unique(),
   visibility: text('visibility').default('private'),
+  directoryListed: integer('directory_listed').notNull().default(0),
   description: text('description'),
   createdAt: integer('created_at').notNull(),
 });
@@ -329,6 +352,30 @@ export const instanceSettings = sqliteTable('instance_settings', {
   federationRelayTtlDays: integer('federation_relay_ttl_days').notNull().default(30),
   defaultAutoRotateIntervalDays: integer('default_auto_rotate_interval_days').notNull().default(90),
   autoAcceptPeering: integer('auto_accept_peering').notNull().default(1),
+  /** null = never asked, 0 = off, 1 = on. */
+  telemetryEnabled: integer('telemetry_enabled'),
+  /** Random UUID, minted on the first off-to-on transition and kept through off. Never the federation instance_id. */
+  telemetryId: text('telemetry_id'),
+  /** Last UTC day successfully reported. */
+  telemetryLastDay: text('telemetry_last_day'),
+  /** JSON { day, status } of the last failed attempt, null after a success. */
+  telemetryLastError: text('telemetry_last_error'),
+  /** The server version running when telemetry was last switched off; the ask returns on the next minor. */
+  telemetryDeclinedVersion: text('telemetry_declined_version'),
+  /** The admin allows spaces on this instance to be listed in the directory. */
+  directoryEnabled: integer('directory_enabled').notNull().default(0),
+  /** A directory ping is owed. Survives restarts and the toggle being off. */
+  directoryDirty: integer('directory_dirty').notNull().default(0),
+  /** ms timestamp of the last successful directory ping. */
+  directoryLastPingAt: integer('directory_last_ping_at'),
+  /** JSON DirectoryPingError of the last failed ping, null after a success. */
+  directoryLastError: text('directory_last_error'),
+  /** People on this instance see spaces from other instances in Explore. */
+  directoryBrowseEnabled: integer('directory_browse_enabled').notNull().default(1),
+  /** The web client's Backspace page shows the Support card. Hides only that card; the server does nothing else with it. */
+  supportCardEnabled: integer('support_card_enabled', { mode: 'boolean' }).notNull().default(true),
+  /** First-boot timestamp (ms); backfilled by ensureDefaults, so non-null after boot. */
+  installedAt: integer('installed_at'),
   updatedAt: integer('updated_at').notNull(),
 });
 
@@ -373,6 +420,17 @@ export const federationPeers = sqliteTable('federation_peers', {
   instanceName: text('instance_name'),
   hmacSecret: text('hmac_secret').notNull(),
   status: text('status').notNull().default('active'),
+  // Who caused this row to exist. Only 'admin' is proof that a local admin
+  // deliberately authorized peering with this origin, which is what the
+  // inbound /peer/accept gate consults when autoAcceptPeering = 0:
+  //   'admin'  — POST /peer/initiate, or an approval/denial decision in
+  //              routes/federation/handlers/approvals.ts.
+  //   'auto'   — created by local traffic without an admin decision: the
+  //              outbox placeholder, or ensurePeered() auto-peering.
+  //   'remote' — created by an inbound /peer/accept from the remote itself.
+  // Rows that predate this column read as 'auto' (fail closed): a stale
+  // pending row cannot stand in for an admin decision.
+  initiatedBy: text('initiated_by', { enum: ['admin', 'auto', 'remote'] }).notNull().default('auto'),
   lastSeenAt: integer('last_seen_at'),
   lastFailureAt: integer('last_failure_at'),
   consecutiveFailures: integer('consecutive_failures').notNull().default(0),
@@ -521,6 +579,30 @@ export const userFederationRegistry = sqliteTable('user_federation_registry', {
   lastConnectedAt: integer('last_connected_at'),
   disconnectedAt: integer('disconnected_at'),
   errorMessage: text('error_message'),
+}, (table) => ({
+  pk: primaryKey({ columns: [table.userId, table.origin] }),
+}));
+
+// Per-remote credential this user's client presents when registering or logging
+// in as itself on ANOTHER instance. Home-instance-only state: the row is written
+// and read exclusively by the account's own home instance, is never federated,
+// and never leaves the home server except to the account's authenticated client.
+//
+// Why it exists: the client used to reuse the account's home password verbatim
+// for every remote it connected to, handing a reusable home credential to every
+// remote operator. Each remote now gets its own high-entropy secret with no
+// relationship to the home password or to any other remote's secret.
+//
+// `provisionedAt` is the migration marker: NULL means the remote account may
+// still be carrying a credential this instance did not issue (a pre-existing
+// connection), so the client rotates it the next time it holds a live session
+// there. Set once the remote account is known to use `secret`.
+export const userFederationCredentials = sqliteTable('user_federation_credentials', {
+  userId: text('user_id').notNull().references(() => users.id, { onDelete: 'cascade' }),
+  origin: text('origin').notNull(),
+  secret: text('secret').notNull(),
+  createdAt: integer('created_at').notNull(),
+  provisionedAt: integer('provisioned_at'),
 }, (table) => ({
   pk: primaryKey({ columns: [table.userId, table.origin] }),
 }));

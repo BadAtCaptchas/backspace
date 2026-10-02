@@ -4,9 +4,10 @@ import { collectProfileBroadcastTargetIds } from '../../../utils/userDeletion.js
 import { connectionManager } from '../../../ws/handler.js';
 import { getDmMessageWithUser } from '../../dm.js';
 import { and, eq, isNull } from 'drizzle-orm';
-import type { FederationRelayEvent } from '@backspace/shared';
-import { buildDmChannelPayload } from '../dmChannels.js';
-import { extractDomain, resolveLocalUser } from '../identity.js';
+import type { Activity, FederationRelayEvent } from '@backspace/shared';
+import { loadDmChannelWire } from '../../../utils/dmChannelWire.js';
+import { presenceUpdateEvent, validateActivities } from '../../../ws/presenceEvent.js';
+import { extractDomain, resolveRelayActor, attributionRefusal } from '../identity.js';
 
 export function processFileRejectedEvent(
   event: FederationRelayEvent,
@@ -135,7 +136,8 @@ export function processFileRejectedEvent(
  * the source peer's domain (attribution check, mirrors profile_update).
  *
  * Effect on success:
- *   1. Update the local stub's status column.
+ *   1. Update the local stub's status column and keep the relayed activities
+ *      for it in connectionManager (cleared by `[]` or offline).
  *   2. Broadcast a WS presence_update to local users via collectProfileBroadcastTargetIds
  *      (friends + DM members + space co-members), so the green dot updates without a
  *      page refresh on every connected client that knows this user.
@@ -146,6 +148,10 @@ export function processFileRejectedEvent(
  *   - homeInstance domain mismatch on the existing stub → ignore (collision against
  *     a stub of a different identity).
  *   - Invalid status string → reject; sender is buggy, surface for diagnosis.
+ *   - Activities that fail `validateActivities` → status applied, activities
+ *     treated as absent (unchanged).
+ *   - No `activities` field (a peer that predates always sending it) →
+ *     activities unchanged; `[]` or offline clears them.
  */
 export function processPresenceUpdateEvent(
   event: FederationRelayEvent,
@@ -173,24 +179,16 @@ export function processPresenceUpdateEvent(
     return;
   }
 
-  const localUser = db
-    .select()
-    .from(schema.users)
-    .where(and(
-      eq(schema.users.homeUserId, payload.homeUserId),
-      eq(schema.users.isDeleted, 0),
-    ))
-    .get();
 
-  if (!localUser) {
+  // The row updated is the one that IS the payload's identity, homed on the
+  // sending peer (`resolveRelayActor`). A native user of this instance is never
+  // one, so its presence is only ever set here. No such row: accept as a no-op.
+  const identity = resolveRelayActor(payload, db);
+  if (identity.kind !== 'found' || !identity.user.homeInstance) {
     accepted.push(event.messageId);
     return;
   }
-
-  if (localUser.homeInstance && extractDomain(localUser.homeInstance) !== payloadDomain) {
-    accepted.push(event.messageId);
-    return;
-  }
+  const localUser = identity.user;
 
   // Detached accounts are sovereign: the domain now belongs to a different
   // incarnation, which must never flip the established account's presence by
@@ -207,14 +205,31 @@ export function processPresenceUpdateEvent(
     .where(eq(schema.users.id, localUser.id))
     .run();
 
-  // Broadcast presence_update WS event to local users who care.
+  // Keep the relayed activities on the replicated row, so the ready payload
+  // and the friendship snapshot can report a remote user's activity that
+  // began before a local user started watching (#340).
+  //   - offline: none.
+  //   - a list (`[]` included): the full set. Held in memory and re-sent in
+  //     ready payloads, so held to the local activity_update limits; a list
+  //     that fails them is ignored like an absent one, and the status applies.
+  //   - absent: unchanged. A peer that predates always sending the list
+  //     relays status alone on every connect and in its activation snapshot,
+  //     also while its user is playing.
+  let activities: Activity[] | undefined;
+  if (payload.status === 'offline') {
+    activities = [];
+  } else if (payload.activities !== undefined) {
+    const valid = validateActivities(payload.activities);
+    if (valid) activities = valid;
+    else console.warn(`[federation] presence_update for ${localUser.id}: activities over the limits, status applied, activities ignored`);
+  }
+  if (activities !== undefined) connectionManager.setUserActivities(localUser.id, activities);
+
+  // Broadcast presence_update WS event to local users who care. When the
+  // activities changed they are included (possibly empty, which clears on
+  // clients); otherwise the client keeps what it has.
   const targetUserIds = collectProfileBroadcastTargetIds(localUser.id);
-  const wsPayload = {
-    type: 'presence_update' as const,
-    userId: localUser.id,
-    status: payload.status,
-    ...(payload.activities && payload.activities.length > 0 ? { activities: payload.activities } : {}),
-  };
+  const wsPayload = presenceUpdateEvent(localUser, payload.status, activities);
   for (const uid of targetUserIds) {
     connectionManager.sendToUser(uid, wsPayload);
   }
@@ -237,6 +252,14 @@ export function processReadStateUpdateEvent(
     return;
   }
 
+  // Attribution: the peer must be entitled to speak for the acking identity.
+  const refusal = attributionRefusal(event.readState.user, sourceInstance, db);
+  if (refusal) {
+    console.warn(`[federation] Attribution refused (${refusal}) in read_state_update: user homeInstance=${extractDomain(event.readState.user.homeInstance)} source=${extractDomain(sourceInstance)}`);
+    rejected.push({ messageId: event.messageId, reason: refusal });
+    return;
+  }
+
   // Find the local DM channel by federatedId
   const channel = db.select({ id: schema.dmChannels.id })
     .from(schema.dmChannels)
@@ -251,12 +274,18 @@ export function processReadStateUpdateEvent(
     return;
   }
 
-  // Resolve the user locally
-  const localUser = resolveLocalUser(event.readState.user.homeUserId, db);
-  if (!localUser) {
+  // Resolve the user locally, matched on homeUserId + homeInstance
+  const reader = resolveRelayActor(event.readState.user, db);
+  if (reader.kind === 'mismatch') {
+    console.warn('[federation] Refused read_state_update: the user homeUserId names a local user of another identity');
+    rejected.push({ messageId: event.messageId, reason: 'attribution_mismatch' });
+    return;
+  }
+  if (reader.kind === 'unknown') {
     rejected.push({ messageId: event.messageId, reason: 'user_not_found' });
     return;
   }
+  const localUser = reader.user;
 
   // Translate messageRef to a local message ID
   const { sourceInstance: refSource, sourceMessageId: refId } = event.readState.messageRef;
@@ -335,6 +364,14 @@ export function processDmCloseEvent(
     return;
   }
 
+  // Attribution: the peer must be entitled to speak for the closing identity.
+  const refusal = attributionRefusal(event.dmCloseReopen, sourceInstance, db);
+  if (refusal) {
+    console.warn(`[federation] Attribution refused (${refusal}) in dm_close: user homeInstance=${extractDomain(event.dmCloseReopen.homeInstance)} source=${extractDomain(sourceInstance)}`);
+    rejected.push({ messageId: event.messageId, reason: refusal });
+    return;
+  }
+
   // Find the local DM channel by federatedId
   const channel = db.select({ id: schema.dmChannels.id })
     .from(schema.dmChannels)
@@ -350,13 +387,19 @@ export function processDmCloseEvent(
     return;
   }
 
-  // Resolve the user locally
-  const localUser = resolveLocalUser(event.dmCloseReopen.homeUserId, db);
-  if (!localUser) {
+  // Resolve the user locally, matched on homeUserId + homeInstance
+  const actor = resolveRelayActor(event.dmCloseReopen, db);
+  if (actor.kind === 'mismatch') {
+    console.warn('[federation] Refused dm_close: the user homeUserId names a local user of another identity');
+    rejected.push({ messageId: event.messageId, reason: 'attribution_mismatch' });
+    return;
+  }
+  if (actor.kind === 'unknown') {
     // User not found locally — silently accept
     accepted.push(event.messageId);
     return;
   }
+  const localUser = actor.user;
 
   // Verify user is a DM member
   const membership = db.select()
@@ -404,6 +447,14 @@ export function processDmReopenEvent(
     return;
   }
 
+  // Attribution: the peer must be entitled to speak for the reopening identity.
+  const refusal = attributionRefusal(event.dmCloseReopen, sourceInstance, db);
+  if (refusal) {
+    console.warn(`[federation] Attribution refused (${refusal}) in dm_reopen: user homeInstance=${extractDomain(event.dmCloseReopen.homeInstance)} source=${extractDomain(sourceInstance)}`);
+    rejected.push({ messageId: event.messageId, reason: refusal });
+    return;
+  }
+
   // Find the local DM channel by federatedId
   const channel = db.select({ id: schema.dmChannels.id })
     .from(schema.dmChannels)
@@ -419,13 +470,19 @@ export function processDmReopenEvent(
     return;
   }
 
-  // Resolve the user locally
-  const localUser = resolveLocalUser(event.dmCloseReopen.homeUserId, db);
-  if (!localUser) {
+  // Resolve the user locally, matched on homeUserId + homeInstance
+  const actor = resolveRelayActor(event.dmCloseReopen, db);
+  if (actor.kind === 'mismatch') {
+    console.warn('[federation] Refused dm_reopen: the user homeUserId names a local user of another identity');
+    rejected.push({ messageId: event.messageId, reason: 'attribution_mismatch' });
+    return;
+  }
+  if (actor.kind === 'unknown') {
     // User not found locally — silently accept
     accepted.push(event.messageId);
     return;
   }
+  const localUser = actor.user;
 
   // Verify user is a DM member
   const membership = db.select()
@@ -452,7 +509,7 @@ export function processDmReopenEvent(
     .run();
 
   // Build full DM channel payload and broadcast dm_channel_created
-  const payload = buildDmChannelPayload(channel.id, db);
+  const payload = loadDmChannelWire(db, channel.id);
   if (payload) {
     connectionManager.sendToUser(localUser.id, {
       type: 'dm_channel_created',

@@ -3,13 +3,15 @@ import { getDb, schema } from '../../../db/index.js';
 import { canonicalizeHomeInstance, getOurOrigin, normalizeOriginForCompare } from '../../../utils/federationAuth.js';
 import { deleteUploadFile } from '../../../utils/fileCleanup.js';
 import { sanitizeUser } from '../../../utils/sanitize.js';
+import { loadDmChannelWire } from '../../../utils/dmChannelWire.js';
 import { generateSnowflake } from '../../../utils/snowflake.js';
 import { connectionManager } from '../../../ws/handler.js';
 import { GROUP_DM_NAME_MAX_LENGTH, GROUP_DM_NAME_MIN_LENGTH } from '@backspace/shared/src/constants.js';
-import { and, eq, inArray, or } from 'drizzle-orm';
-import type { DmChannel, DmMessageWithUser, FederationRelayEvent } from '@backspace/shared';
-import { extractDomain, resolveLocalUser, resolveOrCreateReplicatedUser, verifyAttribution } from '../identity.js';
+import { and, eq, or } from 'drizzle-orm';
+import type { DmMessageWithUser, FederationRelayEvent } from '@backspace/shared';
+import { extractDomain, resolveOrCreateReplicatedUser, resolveRelayActor, attributionRefusal } from '../identity.js';
 import { downloadProfileAsset, processProfileUpdateEvent } from '../profile.js';
+import { dmChannelMembers, mayRelayInto, memberWithIdentity } from '../dmChannels.js';
 
 export async function processMemberAddEvent(
   event: FederationRelayEvent,
@@ -50,24 +52,41 @@ export async function processMemberAddEvent(
 
   let bootstrapped = false;
 
-  // Bootstrap: channel doesn't exist yet — create from group metadata
+  // Bootstrap: channel doesn't exist yet — create from group metadata.
+  // The sender speaks for the group's owner (FED-010), the owner is in the
+  // roster, and the sender is one of the instances the roster lives on
+  // ("Relayed member adds" in dm-system.md). The roster and owner arrive in
+  // this event, so a refusal here is terminal.
   if (!channel && event.group) {
-    // Attribution: only the owner's instance can bootstrap a group (FED-010)
-    if (event.group.owner && !verifyAttribution(event.group.owner.homeInstance, sourceInstance)) {
-      console.warn(`[federation] Attribution mismatch in member_add bootstrap: owner homeInstance=${extractDomain(event.group.owner.homeInstance)} source=${extractDomain(sourceInstance)}`);
-      rejected.push({ messageId: event.messageId, reason: 'attribution_mismatch' });
+    const owner = event.group.owner;
+    if (!owner) {
+      console.warn(`[federation] Refused member_add bootstrap of ${event.federatedId}: the group names no owner`);
+      rejected.push({ messageId: event.messageId, reason: 'invalid_target' });
+      return;
+    }
+    const refusal = attributionRefusal(owner, sourceInstance, db);
+    if (refusal) {
+      console.warn(`[federation] Attribution refused (${refusal}) in member_add bootstrap: owner homeInstance=${extractDomain(owner.homeInstance)} source=${extractDomain(sourceInstance)}`);
+      rejected.push({ messageId: event.messageId, reason: refusal });
+      return;
+    }
+
+    // Resolve owner and roster, creating replicated stubs for users not seen
+    // before. Tombstoned identities are skipped: they can't be added to a DM.
+    const ownerLocal = resolveOrCreateReplicatedUser(owner.homeUserId, owner.homeInstance, db, { username: owner.profile?.username, status: owner.profile?.status, deleted: owner.profile?.deleted });
+    const roster: Array<typeof schema.users.$inferSelect> = [];
+    for (const member of event.group.members) {
+      const rosterUser = resolveOrCreateReplicatedUser(member.homeUserId, member.homeInstance, db, { username: member.profile?.username, status: member.profile?.status, deleted: member.profile?.deleted });
+      if (rosterUser && !roster.some(r => r.id === rosterUser.id)) roster.push(rosterUser);
+    }
+    if (!ownerLocal || !mayRelayInto(roster, ownerLocal.id, sourceInstance)) {
+      console.warn(`[federation] Refused member_add bootstrap of ${event.federatedId}: the owner is not in the roster, or ${extractDomain(sourceInstance)} is not one of its instances`);
+      rejected.push({ messageId: event.messageId, reason: 'invalid_target' });
       return;
     }
 
     const channelId = generateSnowflake();
     const now = Date.now();
-
-    // Resolve owner — create a replicated stub if unknown
-    let ownerId: string | null = null;
-    if (event.group.owner) {
-      const ownerLocal = resolveOrCreateReplicatedUser(event.group.owner.homeUserId, event.group.owner.homeInstance, db, { username: event.group.owner.profile?.username, status: event.group.owner.profile?.status, deleted: event.group.owner.profile?.deleted });
-      ownerId = ownerLocal?.id ?? null;
-    }
 
     // Group metadata snapshot. Older peers omit these fields — fall back
     // to safe defaults (null name/icon, metadataUpdatedAt=0). When an icon
@@ -86,12 +105,12 @@ export async function processMemberAddEvent(
       .values({
         id: channelId,
         federatedId: event.federatedId,
-        ownerId,
-        ownerHomeUserId: event.group.owner?.homeUserId ?? null,
+        ownerId: ownerLocal.id,
+        ownerHomeUserId: owner.homeUserId,
         // Canonicalize on storage so future authority comparisons against
         // `sourceInstance` (always a full URL) match cleanly. Defensive: older
         // peers may have sent a bare host on the wire.
-        ownerHomeInstance: canonicalizeHomeInstance(event.group.owner?.homeInstance) ?? null,
+        ownerHomeInstance: canonicalizeHomeInstance(owner.homeInstance) ?? null,
         createdAt: now,
         name: bootstrapName,
         icon: bootstrapResolvedIcon,
@@ -99,24 +118,12 @@ export async function processMemberAddEvent(
       })
       .run();
 
-    // Add all roster members — create replicated user stubs for any
-    // participants from remote instances that haven't been seen before.
-    for (const member of event.group.members) {
-      const rosterUser = resolveOrCreateReplicatedUser(member.homeUserId, member.homeInstance, db, { username: member.profile?.username, status: member.profile?.status, deleted: member.profile?.deleted });
-      // Skip deleted identities — tombstoned users can't be added to a DM
-      if (!rosterUser) continue;
-      const existing = db.select().from(schema.dmMembers)
-        .where(and(
-          eq(schema.dmMembers.dmChannelId, channelId),
-          eq(schema.dmMembers.userId, rosterUser.id),
-        )).get();
-      if (!existing) {
-        db.insert(schema.dmMembers).values({
-          dmChannelId: channelId,
-          userId: rosterUser.id,
-          closed: 0,
-        }).run();
-      }
+    for (const rosterUser of roster) {
+      db.insert(schema.dmMembers).values({
+        dmChannelId: channelId,
+        userId: rosterUser.id,
+        closed: 0,
+      }).run();
     }
 
     channel = db.select().from(schema.dmChannels)
@@ -137,10 +144,34 @@ export async function processMemberAddEvent(
   // The attribution check below still validates that addedBy belongs to the source instance.
 
   // Attribution: adder must belong to source instance (FED-010)
-  if (event.membership.addedBy && !verifyAttribution(event.membership.addedBy.homeInstance, sourceInstance)) {
-    console.warn(`[federation] Attribution mismatch in member_add: addedBy homeInstance=${extractDomain(event.membership.addedBy.homeInstance)} source=${extractDomain(sourceInstance)}`);
-    rejected.push({ messageId: event.messageId, reason: 'attribution_mismatch' });
-    return;
+  if (event.membership.addedBy) {
+    const refusal = attributionRefusal(event.membership.addedBy, sourceInstance, db);
+    if (refusal) {
+      console.warn(`[federation] Attribution refused (${refusal}) in member_add: addedBy homeInstance=${extractDomain(event.membership.addedBy.homeInstance)} source=${extractDomain(sourceInstance)}`);
+      rejected.push({ messageId: event.messageId, reason: refusal });
+      return;
+    }
+  }
+
+  // Incremental add: this instance already holds the group, so the add is
+  // judged against its copy ("Relayed member adds" in dm-system.md). A 1-on-1
+  // has a fixed pair; otherwise, like the local add route, the adder must be a
+  // current member, and the signing peer one of the origins this copy is
+  // relayed to before the add. A bootstrap is authorized above instead, by the
+  // owner's attribution.
+  if (!bootstrapped) {
+    if (!channel.ownerId) {
+      console.warn(`[federation] Refused member_add into 1-on-1 ${channel.id}`);
+      rejected.push({ messageId: event.messageId, reason: 'invalid_target' });
+      return;
+    }
+    const members = dmChannelMembers(channel.id, db);
+    const adder = event.membership.addedBy ? memberWithIdentity(members, event.membership.addedBy) : undefined;
+    if (!adder || !mayRelayInto(members, adder.id, sourceInstance)) {
+      console.warn(`[federation] Refused member_add in group DM ${channel.id}: the adder is not a member, or ${extractDomain(sourceInstance)} is not a peer of the conversation`);
+      rejected.push({ messageId: event.messageId, reason: 'unauthorized_source' });
+      return;
+    }
   }
 
   // Cancel soft-delete if channel was pending GC
@@ -218,7 +249,7 @@ export async function processMemberAddEvent(
     sourceMessageId: event.messageId,
   }).run();
 
-  const systemMessagePayload = {
+  const systemMessagePayload: DmMessageWithUser = {
     id: addSysMsgId,
     dmChannelId: channel.id,
     userId: actorId,
@@ -240,41 +271,26 @@ export async function processMemberAddEvent(
     // duplicate sidebar entries for users connected to multiple instances).
     // Include the system message we just persisted as lastMessage so the sidebar
     // preview and unread calculation use the same anchor as future messages.
-    const memberRows = db.select()
-      .from(schema.dmMembers)
-      .where(eq(schema.dmMembers.dmChannelId, channel.id))
-      .all();
-    const memberUserIds = memberRows.map(m => m.userId);
-    const memberUsers = memberUserIds.length > 0
-      ? db.select().from(schema.users).where(inArray(schema.users.id, memberUserIds)).all()
-      : [];
-
-    const bootstrapResult = {
-      id: channel.id,
-      federatedId: channel.federatedId,
-      ownerId: channel.ownerId,
-      createdAt: channel.createdAt,
-      members: memberUsers.map(u => sanitizeUser(u)),
-      lastMessage: systemMessagePayload,
-    };
-
-    const bootstrapOrigin = getOurOrigin();
-    for (const mu of memberUsers) {
-      const muHome = mu.homeInstance
-        ? (mu.homeInstance.startsWith('http') ? mu.homeInstance : `https://${mu.homeInstance}`)
-        : bootstrapOrigin;  // null homeInstance = native local user
-      if (muHome !== bootstrapOrigin) continue;
-      connectionManager.sendToUser(mu.id, {
-        type: 'dm_channel_created',
-        dmChannel: bootstrapResult as unknown as DmChannel,
-      });
+    const bootstrapResult = loadDmChannelWire(db, channel.id, systemMessagePayload);
+    if (bootstrapResult) {
+      const bootstrapOrigin = getOurOrigin();
+      for (const mu of bootstrapResult.members) {
+        const muHome = mu.homeInstance
+          ? (mu.homeInstance.startsWith('http') ? mu.homeInstance : `https://${mu.homeInstance}`)
+          : bootstrapOrigin;  // null homeInstance = native local user
+        if (muHome !== bootstrapOrigin) continue;
+        connectionManager.sendToUser(mu.id, {
+          type: 'dm_channel_created',
+          dmChannel: bootstrapResult,
+        });
+      }
     }
   } else {
     // Incremental: channel already exists for local members, so broadcast the
     // structural change (dm_member_added) and the chat message.
     connectionManager.sendToDmMembers(channel.id, {
       type: 'dm_message_created',
-      message: systemMessagePayload as unknown as DmMessageWithUser,
+      message: systemMessagePayload,
     });
     connectionManager.sendToDmMembers(channel.id, {
       type: 'dm_member_added',
@@ -300,9 +316,10 @@ export function processMemberRemoveEvent(
   }
 
   // Attribution: for self-leave, user must belong to source instance (FED-010)
-  if (event.membership.reason === 'leave' && !verifyAttribution(event.membership.user.homeInstance, sourceInstance)) {
-    console.warn(`[federation] Attribution mismatch in member_remove: user homeInstance=${extractDomain(event.membership.user.homeInstance)} source=${extractDomain(sourceInstance)}`);
-    rejected.push({ messageId: event.messageId, reason: 'attribution_mismatch' });
+  const refusal = event.membership.reason === 'leave' ? attributionRefusal(event.membership.user, sourceInstance, db) : null;
+  if (refusal) {
+    console.warn(`[federation] Attribution refused (${refusal}) in member_remove: user homeInstance=${extractDomain(event.membership.user.homeInstance)} source=${extractDomain(sourceInstance)}`);
+    rejected.push({ messageId: event.messageId, reason: refusal });
     return;
   }
 
@@ -334,6 +351,13 @@ export function processMemberRemoveEvent(
     return;
   }
 
+  // A kick is a group operation: a 1-on-1 has no owner and a fixed pair.
+  if (event.membership.reason !== 'leave' && !channel.ownerId) {
+    console.warn(`[federation] Refused member_remove kick in 1-on-1 ${channel.id}`);
+    rejected.push({ messageId: event.messageId, reason: 'invalid_target' });
+    return;
+  }
+
   // Validate authority: owner's instance for kicks, any instance for self-leave.
   //
   // `sourceInstance` arrives as a full URL from `federationWorker.ts` (always
@@ -352,11 +376,21 @@ export function processMemberRemoveEvent(
     return;
   }
 
-  const localUser = resolveLocalUser(event.membership.user.homeUserId, db);
-  if (!localUser) {
+  // The leaving or kicked user, matched on homeUserId + homeInstance. For a
+  // leave that user is the attributed actor, so an id that names a local user
+  // of another identity is refused; a kick target that is not held here has
+  // nothing to remove.
+  const removed = resolveRelayActor(event.membership.user, db);
+  if (removed.kind === 'mismatch' && event.membership.reason === 'leave') {
+    console.warn('[federation] Refused member_remove: the leaving homeUserId names a local user of another identity');
+    rejected.push({ messageId: event.messageId, reason: 'attribution_mismatch' });
+    return;
+  }
+  if (removed.kind !== 'found') {
     accepted.push(event.messageId);
     return;
   }
+  const localUser = removed.user;
 
   // Insert system message for member leaving (before deletion so the broadcast
   // still reaches the departing user's connections). Tagged with source for dedup.
@@ -454,9 +488,10 @@ export function processOwnershipTransferEvent(
   }
 
   // Attribution: previous owner must belong to source instance (FED-010)
-  if (event.ownership.previousOwner && !verifyAttribution(event.ownership.previousOwner.homeInstance, sourceInstance)) {
-    console.warn(`[federation] Attribution mismatch in ownership_transfer: previousOwner homeInstance=${extractDomain(event.ownership.previousOwner.homeInstance)} source=${extractDomain(sourceInstance)}`);
-    rejected.push({ messageId: event.messageId, reason: 'attribution_mismatch' });
+  const refusal = event.ownership.previousOwner ? attributionRefusal(event.ownership.previousOwner, sourceInstance, db) : null;
+  if (refusal) {
+    console.warn(`[federation] Attribution refused (${refusal}) in ownership_transfer: previousOwner homeInstance=${extractDomain(event.ownership.previousOwner.homeInstance)} source=${extractDomain(sourceInstance)}`);
+    rejected.push({ messageId: event.messageId, reason: refusal });
     return;
   }
 
@@ -487,6 +522,13 @@ export function processOwnershipTransferEvent(
     return;
   }
 
+  // Ownership is a group's: a 1-on-1 has no owner to transfer.
+  if (!channel.ownerId) {
+    console.warn(`[federation] Refused ownership_transfer of 1-on-1 ${channel.id}`);
+    rejected.push({ messageId: event.messageId, reason: 'invalid_target' });
+    return;
+  }
+
   // Validate authority: only the current owner's instance can transfer ownership.
   //
   // See the matching note in `processMemberRemoveEvent`: `sourceInstance` is
@@ -498,6 +540,20 @@ export function processOwnershipTransferEvent(
     rejected.push({ messageId: event.messageId, reason: 'unauthorized_source' });
     return;
   }
+
+  // The previous owner is the attributed actor, matched on homeUserId +
+  // homeInstance. Resolved before anything changes, so an id that names a local
+  // user of another identity refuses the whole transfer. One not held here
+  // leaves the system message to the channel's recorded owner.
+  const prevOwner = event.ownership.previousOwner
+    ? resolveRelayActor(event.ownership.previousOwner, db)
+    : null;
+  if (prevOwner?.kind === 'mismatch') {
+    console.warn('[federation] Refused ownership_transfer: the previous owner homeUserId names a local user of another identity');
+    rejected.push({ messageId: event.messageId, reason: 'attribution_mismatch' });
+    return;
+  }
+  const prevOwnerLocal = prevOwner?.kind === 'found' ? prevOwner.user : null;
 
   // Resolve new owner to local user. If the new owner's identity has been
   // deleted, we cannot complete the transfer — reject so the event can be
@@ -538,9 +594,6 @@ export function processOwnershipTransferEvent(
     newOwnerHomeInstance: canonicalOwnerHome,
   });
 
-  const prevOwnerLocal = event.ownership.previousOwner
-    ? resolveLocalUser(event.ownership.previousOwner.homeUserId, db)
-    : null;
   const ownerSysMsgId = generateSnowflake();
   const ownerSysCreatedAt = Date.now();
   const newOwnerBaseName = newOwnerLocal?.username?.includes('@') ? newOwnerLocal.username.split('@')[0] : (newOwnerLocal?.username ?? 'Unknown');
