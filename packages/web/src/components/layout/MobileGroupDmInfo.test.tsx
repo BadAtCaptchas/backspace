@@ -18,7 +18,7 @@ vi.mock('../../audio/AudioManager', () => ({
 // `bottom` style must resolve.
 vi.mock('../../hooks/useVisualViewportInset', () => ({
   useVisualViewportInset: () => ({
-    value: 'env(safe-area-inset-bottom)',
+    value: 'var(--safe-bottom)',
     keyboardOpen: false,
     height: 800,
     offsetTop: 0,
@@ -68,7 +68,10 @@ const mockUpdateMetadata = vi.fn();
 const mockLeave = vi.fn();
 const mockKickMember = vi.fn();
 const mockTransferOwnership = vi.fn();
-vi.mock('../../api/client', () => ({
+// Spread the real module: stores loaded through this tree extend HttpError
+// at load time, so a bare object mock breaks the import.
+vi.mock('../../api/client', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../../api/client')>(),
   api: {
     dm: {
       updateMetadata: (...args: unknown[]) => mockUpdateMetadata(...args),
@@ -181,6 +184,7 @@ function setStoreState(opts: { dmChannel: DmChannel; authUser: User | null }) {
 }
 
 beforeEach(() => {
+  useSpaceStore.setState({ channelOriginMap: new Map() });
   mockUpdateMetadata.mockReset();
   mockLeave.mockReset();
   mockKickMember.mockReset();
@@ -401,5 +405,51 @@ describe('MobileGroupDmInfo — member row interactions', () => {
     // Owner-caller + non-self → Transfer + Remove visible too.
     expect(screen.queryByText('Transfer Ownership')).not.toBeNull();
     expect(screen.queryByText('Remove from Group')).not.toBeNull();
+  });
+});
+
+
+describe('MobileGroupDmInfo — adding group members', () => {
+  function openMembers(dm: DmChannel) {
+    setStoreState({ dmChannel: dm, authUser: makeUser() });
+    renderScreen();
+  }
+
+  it('hides the add-member entry point from a non-owner', () => {
+    openMembers(makeGroupDm({ ownerId: 'user-2' }));
+    expect(document.querySelector('[data-mobile-group-add-member]')).toBeNull();
+    expect(screen.queryByText(/Group is full/i)).not.toBeInTheDocument();
+  });
+
+  it('lets the local owner open the add-member modal', async () => {
+    openMembers(makeGroupDm());
+    const button = document.querySelector('[data-mobile-group-add-member]') as HTMLButtonElement;
+    expect(button).toBeEnabled();
+    await userEvent.click(button);
+    expect(useUIStore.getState().activeModal).toBe('addDmMember');
+    expect(useUIStore.getState().modalData.dmChannelId).toBe('dm-1');
+  });
+
+  it('recognizes the owner on a remote copy and removes the entry point after transfer', () => {
+    const dm = makeGroupDm({
+      ownerId: 'self-on-peer',
+      members: [
+        makeUser({ id: 'self-on-peer', homeUserId: 'user-self', homeInstance: window.location.host }),
+        makeUser({ id: 'user-2', username: 'alice' }),
+      ],
+    });
+    useSpaceStore.setState({ channelOriginMap: new Map([[dm.id, 'https://peer.example']]) });
+    openMembers(dm);
+    expect(document.querySelector('[data-mobile-group-add-member]')).toBeEnabled();
+    act(() => useSpaceStore.setState({ dmChannels: [{ ...dm, ownerId: 'user-2' }] }));
+    expect(document.querySelector('[data-mobile-group-add-member]')).toBeNull();
+  });
+
+  it('keeps the full-group hint for an owner at capacity', () => {
+    openMembers(makeGroupDm({
+      members: [makeUser(), ...Array.from({ length: 9 }, (_, index) => makeUser({ id: `member-${index}`, username: `member-${index}` }))],
+    }));
+    expect(document.querySelector('[data-mobile-group-add-member]')).toBeDisabled();
+    expect(screen.getByText(/group is full/i)).toBeInTheDocument();
   });
 });

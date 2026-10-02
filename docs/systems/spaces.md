@@ -7,6 +7,8 @@ Source files:
 - `packages/server/src/routes/users.ts` — Space layout (sidebar folders/ordering) persistence via `PUT /api/users/@me/space-layout`
 - `packages/web/src/stores/spaceStore.ts` — Client-side space state, multi-instance merge, LWW layout sync
 - `packages/web/src/stores/exploreStore.ts` — Explore page state, multi-instance discovery aggregation
+- `packages/web/src/stores/directoryStore.ts` - Outer Space: the directory feed, origin dedupe, connect-then-join (see [directory.md](directory.md))
+- `packages/web/src/components/chat/ExplorePage.tsx`, `SpaceCard.tsx`, `OuterSpaceSection.tsx` - the Explore page's two sections and the card both use
 - `packages/web/src/components/modals/CreateSpace.tsx` — Space creation modal (icon crop, color, visibility)
 - `packages/web/src/components/modals/JoinSpace.tsx` — Join-by-code modal with federation connect phases
 - `packages/web/src/components/modals/ExploreSpacePreviewCard.tsx` — Compact discoverable-space card rendered inside the Join Space modal
@@ -80,7 +82,9 @@ Cross-references: [database.md](database.md) (table schemas), [permissions.md](p
 **Endpoint:** `PATCH /api/spaces/:id`
 **Permission:** `MANAGE_SPACE`
 
-**Updatable fields:** name (1-100 chars), icon, banner, avatarColor (validated against AVATAR_COLORS), visibility (public/request/private), description (max 200 chars).
+**Updatable fields:** name (1-100 chars), icon, banner, avatarColor (validated against AVATAR_COLORS), visibility (public/request/private), description (max 200 chars), directoryListed (boolean).
+
+**Directory listing:** `directoryListed: true` is refused with `400 directory_private_space` when the resulting visibility is `private`, and a listed space switched to `private` has the flag cleared in the same write. A change to the flag, or to name, description, icon, banner, avatarColor or visibility while the space is listed, calls `markDirectoryDirty()` so the directory pinger tells the hub; deleting a listed space does the same. See [directory.md](directory.md) §3.
 
 **Side effects:**
 - Old icon/banner files deleted from disk when replaced
@@ -112,6 +116,8 @@ Cross-references: [database.md](database.md) (table schemas), [permissions.md](p
 **Permission:** `CREATE_INVITE`
 
 **Behavior:** Returns existing `inviteCode` if one exists. Only generates a new one (`crypto.randomBytes(4).toString('hex')`) if the space has no invite code. Invite codes are permanent (no expiration).
+
+**Visibility gate:** returns `403` for `request`-visibility spaces — they are approval-gated and have no usable invite link (the join endpoints reject invite-code joins for them), so the endpoint refuses to hand one out. The client (`InviteModal`) shows an "invite by join request" notice instead of the invite UI for such spaces, and `POST /api/dm/space-invite` likewise rejects a `request`-visibility **local** space with `403 space_requires_approval` (remote request spaces are enforced by their home instance at join time).
 
 **Response:** `{ inviteCode: string }`
 
@@ -168,7 +174,9 @@ Two endpoints serve the same purpose:
 | `POST /api/spaces/:id/join` | Join when spaceId is known (body: `{ inviteCode }`) |
 | `POST /api/spaces/join` | Join by code only, spaceId looked up from `inviteCode` |
 
-**Validations:** invite code match, not banned, not already a member.
+**Validations:** invite code match, not banned, not already a member, and **space visibility is not `request`**.
+
+**Visibility gate:** invite-code joins are rejected (`403`) for `request`-visibility spaces — entry to a request-only space must go through `POST /api/spaces/:id/request-join` + manager approval, never a bearer invite code. `private` spaces remain invite-joinable (an invite is their only entry path); `public` spaces are joinable by code or via `POST /api/spaces/:id/public-join`. Combined with the permission membership gate (a non-member cannot obtain `CREATE_INVITE`, see [permissions.md](permissions.md)), this closes the invite-bypass path where a non-member could mint a code for a request-only space and self-join without approval.
 
 **Side effects:**
 1. Insert `space_members` row
@@ -184,7 +192,7 @@ Public route at `/join/:inviteCode`. Handles five phases:
 |-------|---------|-----|
 | `preview` | Initial load | Space preview card + join button (auth) or login/register links (unauth) |
 | `connect` | `NotConnectedError` on join attempt | Password prompt for federation connect |
-| `fallback` | `DifferentPasswordError` on connect | Username + password for existing remote account |
+| `fallback` | `RemoteLoginRequiredError` on connect | Username + password for an account on the remote, under the `FallbackNotice` its `reason` selects |
 | `other-instance` | User clicks "I use another instance" | Domain input for federation redirect |
 | `already-member` | Join returns "already a member" | Green checkmark + auto-redirect (2s timer) |
 
@@ -237,6 +245,10 @@ point, not a replacement.
 | `request` | Listed | Submit join request, requires approval |
 | `public` | Listed | Instant join, no invite needed |
 
+A `request` or `public` space whose owner has switched on "List in the global Backspace directory" (`spaces.directoryListed`) is additionally served on `GET /api/directory/spaces` while the instance admin allows it (`instance_settings.directoryEnabled`, which itself requires discovery on), and from there appears in Outer Space on other instances. The switch lives in the space settings Discovery panel, always rendered, and disabled with the first reason that applies, read from the settings document of the instance the space lives on (`streamingLimits` for a home space; a remote space asks its own instance's `GET /api/settings/streaming` on mount, and a load whose origin changed under it writes nothing): the instance has no `DIRECTORY_ENDPOINT` (`directoryConfigured: false`), so a listing would reach no hub and the administrator's own switch cannot change that; then the administrator's listing opt-in is off (`directoryEnabled: false`); then the space is private. The endpoint is asked first because it is the fact the administrator cannot fix from the settings the second reason points at. A fourth state is not a reason: while the document is unknown the switch is disabled and says nothing, and a load that came back empty says so with a Retry (see below). The opt-in reason has a second voice for the administrator of the instance the space lives on, who is told which setting is off rather than that an administrator has to act, and is offered "Turn it on" beside it; that action confirms first and then writes the whole global rung (`discoveryEnabled` and `directoryEnabled` together, the pair the server requires). It is offered only when `settingsStore.isAdmin` is true and the space's `_instanceOrigin` is empty, because admin rights are per instance and the client holds that flag only for home, and because the write goes to home; a remote space keeps the owner-voiced sentence unchanged. The switch is followed by a one-sentence disclosure of what listing makes public. See [directory.md](directory.md) §10.
+
+The panel fetches that settings document itself when the store has none, and says so when the fetch comes back empty. `streamingLimits` is filled once per session by the WS `ready` handler and by nothing else a member can reach, so a `ready` whose fetch failed used to leave the switch disabled with no reason and no way to ask again: the round that stopped the panel guessing (`?? true` / `?? false` asserted "discovery on, not listed" from a document nobody had read) made the silence permanent. Unknown now says it is unknown, in the treatment the Streaming panel uses for its own failed load: the line from `common:states.loadSettingsFailed` under the switch and a `common:actions.retry` button that runs the load again, the remote client's `GET /settings/streaming` for a remote space and `fetchStreamingLimits` for a home one. A remote fetch that fails while home holds a document is not reported: that is the fallback doing its job.
+
 ### Explore Endpoint
 
 **Endpoint:** `GET /api/spaces/explore` (`explore.ts:exploreRoutes`)
@@ -266,14 +278,64 @@ point, not a replacement.
 
 Also returns `total` (filtered count), `totalAll` (all discoverable), `discoveryEnabled`.
 
+### Explore Page Sections
+
+One page, one search box, two sections in fixed order. **Inner Space** is the list described here (the unjoined grid, then the collapsible joined group), from `exploreStore.fetchSpaces()`. **Outer Space**, below it, is the space directory: entries from `directoryStore` read through `GET /api/directory`, minus every origin the session is connected to, paginated 50 at a time, rendered only on an instance that browses a directory. The search box drives both through one 300 ms debounce. Both sections render `SpaceCard`; an Outer card's action opens the connect-then-join dialog instead of joining directly. The home view's channel sidebar also has an "Explore" entry that routes to `/explore`. Full description in [directory.md](directory.md) §9.
+
 ### Multi-Instance Discovery (`exploreStore.ts`)
 
 `fetchSpaces()` queries home + all connected remote instances in parallel:
-1. Waits for `instanceStore._autoConnectDone` to avoid querying with incomplete instance list
-2. `Promise.allSettled` across home API + all connected instance APIs
-3. Deduplicates by `spaceId:origin` key
-4. Normalizes remote asset URLs via `resolveAssetUrl`
-5. Merges into `TaggedExploreSpace[]` with `_instanceOrigin`
+1. Takes a sequence number, so a reply for an older query cannot land on a newer one (see below)
+2. Waits for `instanceStore._autoConnectDone` to avoid querying with incomplete instance list
+3. Asks home + every connected instance in parallel, each call settling into a result tagged with its origin, so a client that did not answer is named rather than counted
+4. Deduplicates by `spaceId:origin` key
+5. Normalizes remote asset URLs via `resolveAssetUrl`
+6. Merges into `TaggedExploreSpace[]` with `_instanceOrigin`, and records `resultsQuery`
+
+**One fan-out at a time wins.** `fetchSpaces` captures a module-level
+`fetchSeq` on entry and drops its own result if the counter moved while it
+ran, the same guard `directoryStore` runs on Outer Space. A fan-out lasts as
+long as its slowest instance, and one search box drives both stores through
+one debounce, so without it the Inner list could settle on the previous
+query's answer while Outer showed the current one. A superseded run also
+leaves `isLoading` alone: the run that superseded it is still going, and its
+spinner is not the old one's to take down. `fetchMyRequests` has the same
+guard on a counter of its own, for the same reason: it was one call to home
+before multi-instance discovery and is now a fan-out too, and the page calls
+the two together. `reset()` bumps both counters, so a fan-out still in flight
+when the session ends is orphaned rather than landing in the next one: this
+store and `directoryStore` are both cleared on sign-out, on account deletion
+and when another account signs in, through `authStore.resetUserStores`
+([auth.md](auth.md#resetuserstores)).
+
+**`resultsQuery` is the query the spaces on screen answer**, recorded when a
+fan-out lands rather than when it is asked for. The empty copy reads it, not
+`searchQuery`: the box is live and the fetch is debounced, so deciding from
+the box made the copy flip between "no matches" and "nothing yet" about a
+list that had not moved.
+
+**A failure is a state, not a sentence.** `error` is
+`ExploreFetchFailure | null`: `{ kind: 'none_answered' }` when every client in
+the fan-out rejected, and `{ kind: 'failed', cause }` when the fan-out could
+not be run at all. The words belong to the surface, so `ExplorePage` renders
+the first from `spaces:explore.inner.noneAnswered` and the second through
+`describeError(cause)`; the store keeping English text was English on screen
+for every reader of the other three languages. `JoinSpace` reads the same
+field as a boolean and has copy of its own.
+
+**One instance short is also reported.** `error` covers the fan-out nobody
+answered; `unansweredOrigins` covers the rest. It is the list of origins
+whose client did not answer the fan-out that produced the current `spaces`
+(`''` for home, as `_instanceOrigin` encodes it), written by the same `set`
+that publishes the list, cleared when a fetch starts and on `reset()`, and
+dropped by a superseded fan-out along with everything else it would have
+written. `ExplorePage` renders it above the Inner grid as
+`spaces:explore.inner.unreachable`, naming the hosts. The two are exclusive:
+the `none_answered` branch publishes no list, so it leaves this empty and the
+page never shows both. Before this, one instance of several rejecting was
+dropped on the floor and the page showed the survivors' spaces in silence.
+`fetchMyRequests` still reports nothing when a client does not answer: it
+keeps the rows it has and says nothing about the rest.
 
 ### Public Join
 
@@ -317,6 +379,7 @@ Decline flow:
 
 **User's own requests:** `GET /api/users/@me/join-requests?status=<optional>`
 - Returns all requests for the current user, optionally filtered by status
+- Client side, `exploreStore.fetchMyRequests()` asks the home instance and every connected instance (`Promise.allSettled`) and tags each request with `_instanceOrigin` (`''` for home); `useSpaceJoin.isPending` matches on `(origin, spaceId)`, since space ids are local to their instance
 
 ### Space Managers Resolution (`explore.ts:getSpaceManagers`)
 
@@ -349,6 +412,8 @@ All paths: insert `space_members`, register in `connectionManager`, broadcast `m
 **Owner restriction:** Owner cannot leave. Must transfer ownership or delete the space.
 **Owner protection:** Cannot kick the owner.
 
+**Role hierarchy:** kicking someone else needs a higher top role than theirs (`403 role_hierarchy`, permissions.md).
+
 **Cleanup on removal:**
 1. Delete `space_members` row
 2. Delete `voice_restrictions` for the member in this space
@@ -361,7 +426,7 @@ All paths: insert `space_members`, register in `connectionManager`, broadcast `m
 **Permission:** `BAN_MEMBERS`
 **Body:** `{ userId: string, reason?: string }`
 
-**Protections:** Cannot ban owner, cannot ban self, 409 if already banned.
+**Protections:** Cannot ban owner, cannot ban self, 409 if already banned, `403 role_hierarchy` unless the actor outranks the target.
 
 **Atomic transaction:**
 1. Insert `bans` row (with `reason`, `bannedBy`, `createdAt`)
@@ -397,6 +462,7 @@ Updates `spaces.ownerId`, broadcasts `space_updated` WS event.
 - Cannot change own roles
 - Cannot modify owner's roles (unless you are the owner)
 - @everyone role (id=spaceId) cannot be assigned
+- Role hierarchy: the member must rank below the actor, and every role added or removed must sit below the actor's top role (`403 role_hierarchy`, permissions.md)
 - Atomically deletes all existing `member_roles` then inserts new ones
 - Triggers `connectionManager.pushReadyPayload(uid)` to force re-sync
 - Triggers `checkVoicePermissions(spaceId)` to enforce voice changes
@@ -404,6 +470,8 @@ Updates `spaces.ownerId`, broadcasts `space_updated` WS event.
 **Add single role:** `POST /api/spaces/:id/members/:uid/roles` — body `{ roleId }`, requires `MANAGE_ROLES`
 
 **Remove single role:** `DELETE /api/spaces/:id/members/:uid/roles/:roleId` — requires `MANAGE_ROLES`
+
+Both single-role routes apply the same checks as the replace route (not own roles, not the owner's, member of the space, role of this space other than @everyone, role hierarchy) and push the target a ready payload.
 
 ---
 
@@ -417,8 +485,8 @@ Updates `spaces.ownerId`, broadcasts `space_updated` WS event.
 
 - Name defaults to `'new role'` if empty
 - Duplicate name check (case-insensitive, raw SQL COLLATE NOCASE)
-- Permissions default to `DEFAULT_EVERYONE_PERMISSIONS` if not provided
-- Position defaults to 0
+- Permissions default to `DEFAULT_EVERYONE_PERMISSIONS` limited to the bits the actor holds; given permissions must all be held (`403 cannot_grant_unowned_permissions`, permissions.md "Held-bits rule")
+- Created at the bottom: position 1, the other roles move up one (`normalizeRolePositions`); refused with `403 role_hierarchy` unless the actor ranks above 1
 - Color defaults to `'#b9bbbe'`
 - After creation: pushes ready payload to all space members, checks voice permissions
 
@@ -429,7 +497,10 @@ Updates `spaces.ownerId`, broadcasts `space_updated` WS event.
 **Body:** `{ name?, color?, position?, permissions? }`
 
 - Name: trimmed, non-empty, duplicate check (case-insensitive, excludes self)
-- Permissions: validated as valid bigint string
+- Permissions: a non-negative integer string (`400 permissions_invalid`); only bits the actor holds may be switched (`403 cannot_grant_unowned_permissions` on, `403 cannot_change_unowned_permissions` off; permissions.md "Held-bits rule")
+- `404 role_not_in_space` for a role of another space; `403 role_hierarchy` for a role at or above the actor's top role
+- Position: an integer from 1 (not for @everyone, `400 validation_failed`) below the actor's top role; the role moves there and the others are renumbered so positions stay distinct
+- Client: the role list in Space Settings > Roles sends `{ position }` alone to reorder (drag handle, arrow keys, up and down buttons; permissions.md, "Setting the order")
 - After update: pushes ready payload to all members, checks voice permissions
 
 ### Delete Role
@@ -438,7 +509,8 @@ Updates `spaces.ownerId`, broadcasts `space_updated` WS event.
 **Permission:** `MANAGE_ROLES`
 
 - Cannot delete @everyone role (roleId === spaceId)
-- Deletes channel overrides referencing this role
+- `404 role_not_in_space` for a role of another space; `403 role_hierarchy` for a role at or above the actor's top role; `403 cannot_change_unowned_permissions` for a role carrying a bit the actor does not hold (permissions.md "Held-bits rule")
+- Deletes channel and category overrides referencing this role, then renumbers the remaining roles
 - After delete: pushes ready payload to all members, checks voice permissions
 
 ---
@@ -459,7 +531,7 @@ Updates `spaces.ownerId`, broadcasts `space_updated` WS event.
 
 | Field | Validation |
 |-------|------------|
-| name | Required, trimmed, lowercased, spaces→hyphens, 1-100 chars |
+| name | Required, a string; stored as `normalizeChannelName(name)` from `@backspace/shared` (trimmed, lowercased, each whitespace run → one hyphen), 1-100 chars |
 | type | Required, `'text'` or `'voice'` |
 | topic | Optional, trimmed |
 | categoryId | Optional, validated against space's categories |
@@ -478,7 +550,7 @@ Position: `max(existing positions) + 1`.
 **Permission:** `MANAGE_CHANNELS` (checked with channel-level override context)
 **Body:** `{ name?, topic?, position?, categoryId? }`
 
-- Name: same normalization as create
+- Name: same normalization as create; a non-string answers `channel_name_required`
 - Position: non-negative number
 - categoryId: `null` to unassign, or valid category ID in same space
 
@@ -486,10 +558,12 @@ Position: `max(existing positions) + 1`.
 - If `categoryId` changed: calls `broadcastOverrideChange` (per-user VIEW_CHANNEL recheck, may send `channel_deleted` to users who lost access)
 - Otherwise: simple `channel_updated` broadcast to channel viewers
 
+**Client:** the Overview tab of channel settings renames through the `updateChannel` store action, which sends the request to the space's own instance and applies the returned row, so the editor shows the stored (normalized) name at once. The editor is the shared `InlineNameEditor` (`components/ui/`): Save or Enter commits, Cancel or Escape abandons, blur does nothing, and Escape never reaches the settings modal's own close handler. It compares edits with `normalizeChannelName` and sends nothing when the stored name would not change. The control shows when the user holds `MANAGE_CHANNELS` on that channel (see "Client gating" in permissions.md).
+
 ### Delete Channel
 
 **Endpoint:** `DELETE /api/channels/:id`
-**Permission:** `MANAGE_CHANNELS`
+**Permission:** `MANAGE_CHANNELS` (checked with channel-level override context)
 
 **Cleanup sequence:**
 1. Disconnect all voice participants (if voice channel)
@@ -505,7 +579,7 @@ Position: `max(existing positions) + 1`.
 
 **Create:** `POST /api/spaces/:id/categories` — permission: `MANAGE_CHANNELS`, name 1-100 chars, auto-position. Broadcasts `category_created`.
 
-**Update:** `PATCH /api/categories/:id` — permission: `MANAGE_CHANNELS`, updatable: name, position. Broadcasts `category_updated` (includes `isPrivate` flag).
+**Update:** `PATCH /api/categories/:id` — permission: `MANAGE_CHANNELS`, updatable: name (a string, stored as `normalizeCategoryName(name)`, which trims and keeps case and spacing, 1-100 chars; a non-string answers `category_name_required`), position. Broadcasts `category_updated` (includes `isPrivate` flag). The category settings Overview renames through the `updateCategory` store action with the same `InlineNameEditor` as channels.
 
 **Delete:** `DELETE /api/categories/:id` — permission: `MANAGE_CHANNELS`. Transaction nulls `categoryId` on child channels, then deletes category. Broadcasts `category_deleted` then `channel_layout_updated` (per-user filtered).
 
@@ -539,11 +613,11 @@ Override endpoints documented here for API completeness:
 | Endpoint | Permission | Notes |
 |----------|------------|-------|
 | `GET /api/channels/:id/overrides` | `MANAGE_ROLES` | List channel overrides |
-| `PUT /api/channels/:id/overrides` | `MANAGE_ROLES` | Upsert (delete+insert in tx). Privilege escalation guard. |
-| `DELETE /api/channels/:id/overrides/:targetType/:targetId` | `MANAGE_ROLES` | Remove override |
+| `PUT /api/channels/:id/overrides` | `MANAGE_ROLES` | Upsert (delete+insert in tx). Role hierarchy on the target, held-bits rule against the stored row. |
+| `DELETE /api/channels/:id/overrides/:targetType/:targetId` | `MANAGE_ROLES` | Remove override; refused for a target at or above the actor, or when it sets a bit the actor does not hold |
 | `GET /api/categories/:id/overrides` | `MANAGE_ROLES` | List category overrides |
-| `PUT /api/categories/:id/overrides` | `MANAGE_ROLES` | Upsert with escalation guard |
-| `DELETE /api/categories/:id/overrides/:targetType/:targetId` | `MANAGE_ROLES` | Remove override |
+| `PUT /api/categories/:id/overrides` | `MANAGE_ROLES` | Upsert; role hierarchy on the target, held-bits rule against the stored row |
+| `DELETE /api/categories/:id/overrides/:targetType/:targetId` | `MANAGE_ROLES` | Remove override; refused for a target at or above the actor, or when it sets a bit the actor does not hold |
 
 All override mutations call `broadcastOverrideChange` (channel) or `broadcastCategoryOverrideChange` (category) which re-evaluates VIEW_CHANNEL per-user and sends `channel_updated` (gained access) or `channel_deleted` (lost access). Voice permission enforcement via `checkVoicePermissions` runs after every override change.
 
@@ -726,7 +800,7 @@ Used for self-leave (`leaveSpace` calls `removeMember` with the correct user ID 
 4. If not connected → NotConnectedError thrown
 5. JoinSpaceModal/JoinPage enters 'connect' phase
 6. User provides password → connectToRemote(origin, password)
-7. If password mismatch → DifferentPasswordError → 'fallback' phase
+7. If only the account's own credentials can get in → RemoteLoginRequiredError → 'fallback' phase (reasons: client-federation.md, connect flow step 7)
 8. On success: joinByCode retried, space added to store with _instanceOrigin
 ```
 

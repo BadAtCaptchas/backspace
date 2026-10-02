@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import Fastify, { type FastifyInstance } from 'fastify';
 import Database from 'better-sqlite3';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
@@ -142,6 +142,11 @@ describe('POST /api/dm/:id/members — group DM authorization', () => {
     app = await buildApp();
   });
 
+  afterEach(async () => {
+    await app.close();
+    sqlite.close();
+  });
+
   it('rejects non-owner members before they can add friends to a private group DM', async () => {
     seedGroupDm('dm-private');
     currentUserId = 'member-B';
@@ -153,13 +158,37 @@ describe('POST /api/dm/:id/members — group DM authorization', () => {
     });
 
     expect(res.statusCode).toBe(403);
-    expect(res.json().error).toMatch(/owner/i);
+    expect(res.json().code).toBe('dm_owner_only');
 
     const membership = testDb.select().from(schema.dmMembers).where(and(
       eq(schema.dmMembers.dmChannelId, 'dm-private'),
       eq(schema.dmMembers.userId, 'target-C'),
     )).get();
     expect(membership).toBeUndefined();
+  });
+
+  it('uses the current owner after ownership changes', async () => {
+    seedGroupDm('dm-transferred');
+    testDb.update(schema.dmChannels).set({ ownerId: 'member-B' })
+      .where(eq(schema.dmChannels.id, 'dm-transferred')).run();
+
+    const oldOwner = await app.inject({ method: 'POST', url: '/api/dm/dm-transferred/members', payload: { userId: 'target-C' } });
+    expect(oldOwner.statusCode).toBe(403);
+    expect(oldOwner.json().code).toBe('dm_owner_only');
+    currentUserId = 'member-B';
+    const newOwner = await app.inject({ method: 'POST', url: '/api/dm/dm-transferred/members', payload: { userId: 'target-C' } });
+    expect(newOwner.statusCode).toBe(200);
+  });
+
+  it('does not add a third person to a 1-on-1 DM', async () => {
+    testDb.insert(schema.dmChannels).values({ id: 'dm-pair', createdAt: Date.now() }).run();
+    for (const userId of ['owner-A', 'member-B']) {
+      testDb.insert(schema.dmMembers).values({ dmChannelId: 'dm-pair', userId }).run();
+    }
+    const res = await app.inject({ method: 'POST', url: '/api/dm/dm-pair/members', payload: { userId: 'target-C' } });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().code).toBe('dm_not_group');
+    expect(testDb.select().from(schema.dmMembers).where(eq(schema.dmMembers.dmChannelId, 'dm-pair')).all()).toHaveLength(2);
   });
 
   it('allows the group owner to add a friend', async () => {

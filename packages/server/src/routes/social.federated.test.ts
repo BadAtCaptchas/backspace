@@ -31,10 +31,19 @@ vi.mock('../utils/federationAuth.js', async (importActual) => {
   const actual = await importActual<typeof import('../utils/federationAuth.js')>();
   return { ...actual, getOurOrigin: () => 'https://home.test' };
 });
-vi.mock('../utils/federationPeering.js', () => ({
-  ensurePeered: (...args: unknown[]) => ensurePeeredMock(...args),
-  racePeering: vi.fn(),
-}));
+// Spread the real module rather than listing exports: this suite asserts that a
+// placeholder peer row IS created, which runs through createAutoPlaceholderPeer.
+// A hand-written export list silently drops anything added later, and
+// queueOutboxEvent swallows the resulting throw — the assertion would fail with
+// no hint of why.
+vi.mock('../utils/federationPeering.js', async (importActual) => {
+  const actual = await importActual<typeof import('../utils/federationPeering.js')>();
+  return {
+    ...actual,
+    ensurePeered: (...args: unknown[]) => ensurePeeredMock(...args),
+    racePeering: vi.fn(),
+  };
+});
 vi.mock('../utils/federationLookup.js', () => ({
   lookupRemoteUser: (...args: unknown[]) => lookupRemoteUserMock(...args),
 }));
@@ -193,7 +202,7 @@ describe('POST /api/social/requests — federated branch (peer status)', () => {
       payload: { username: 'alice@orbit.test' },
     });
     expect(res.statusCode).toBe(403);
-    expect(JSON.parse(res.body).error).toBe('peer_rejected');
+    expect(JSON.parse(res.body).code).toBe('peer_rejected');
     expect(testDb.select().from(schema.friendRequests).all()).toHaveLength(0);
   });
 
@@ -206,7 +215,7 @@ describe('POST /api/social/requests — federated branch (peer status)', () => {
       payload: { username: 'alice@orbit.test' },
     });
     expect(res.statusCode).toBe(503);
-    expect(JSON.parse(res.body).error).toBe('peer_unreachable');
+    expect(JSON.parse(res.body).code).toBe('peer_unreachable');
     expect(testDb.select().from(schema.friendRequests).all()).toHaveLength(0);
   });
 
@@ -226,7 +235,7 @@ describe('POST /api/social/requests — federated branch (peer status)', () => {
       payload: { username: 'alice@orbit.test' },
     });
     expect(res.statusCode).toBe(409);
-    expect(JSON.parse(res.body).error).toBe('peer_pending_approval');
+    expect(JSON.parse(res.body).code).toBe('peer_pending_approval');
   });
 
   it('returns 409 peer_pending when peering is pending and no peer row exists (handshake in flight)', async () => {
@@ -238,7 +247,7 @@ describe('POST /api/social/requests — federated branch (peer status)', () => {
       payload: { username: 'alice@orbit.test' },
     });
     expect(res.statusCode).toBe(409);
-    expect(JSON.parse(res.body).error).toBe('peer_pending');
+    expect(JSON.parse(res.body).code).toBe('peer_pending');
   });
 });
 
@@ -258,7 +267,7 @@ describe('POST /api/social/requests — federated branch (lookup failures)', () 
       payload: { username: 'alice@orbit.test' },
     });
     expect(res.statusCode).toBe(404);
-    expect(JSON.parse(res.body).error).toBe('user_not_found');
+    expect(JSON.parse(res.body).code).toBe('user_not_found');
     expect(testDb.select().from(schema.friendRequests).all()).toHaveLength(0);
   });
 
@@ -271,7 +280,7 @@ describe('POST /api/social/requests — federated branch (lookup failures)', () 
       payload: { username: 'alice@orbit.test' },
     });
     expect(res.statusCode).toBe(503);
-    expect(JSON.parse(res.body).error).toBe('peer_unreachable');
+    expect(JSON.parse(res.body).code).toBe('peer_unreachable');
   });
 
   it('returns 503 (not 500) when lookup throws unexpectedly — defense-in-depth (BUG-3)', async () => {
@@ -283,7 +292,7 @@ describe('POST /api/social/requests — federated branch (lookup failures)', () 
       payload: { username: 'alice@orbit.test' },
     });
     expect(res.statusCode).toBe(503);
-    expect(JSON.parse(res.body).error).toBe('peer_unreachable');
+    expect(JSON.parse(res.body).code).toBe('peer_unreachable');
     expect(testDb.select().from(schema.friendRequests).all()).toHaveLength(0);
   });
 
@@ -296,7 +305,7 @@ describe('POST /api/social/requests — federated branch (lookup failures)', () 
       payload: { username: 'alice@orbit.test' },
     });
     expect(res.statusCode).toBe(429);
-    expect(JSON.parse(res.body).error).toBe('lookup_rate_limited');
+    expect(JSON.parse(res.body).code).toBe('lookup_rate_limited');
     expect(res.headers['retry-after']).toBe('30');
   });
 
@@ -309,7 +318,7 @@ describe('POST /api/social/requests — federated branch (lookup failures)', () 
       payload: { username: 'alice@orbit.test' },
     });
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toBe('invalid_target_domain');
+    expect(JSON.parse(res.body).code).toBe('invalid_target_domain');
   });
 });
 
@@ -332,7 +341,7 @@ describe('POST /api/social/requests — federated branch (authority + self-frien
       payload: { username: 'alice@orbit.test' },
     });
     expect(res.statusCode).toBe(403);
-    expect(JSON.parse(res.body).error).toBe('not_authoritative_for_sender');
+    expect(JSON.parse(res.body).code).toBe('not_authoritative_for_sender');
   });
 
   it('passes authority check when sender homeInstance is stored as bare host', async () => {
@@ -366,7 +375,7 @@ describe('POST /api/social/requests — federated branch (authority + self-frien
       payload: { username: 'caller@otherhost' },
     });
     expect(res.statusCode).toBe(400);
-    expect(JSON.parse(res.body).error).toBe('cannot_friend_self');
+    expect(JSON.parse(res.body).code).toBe('cannot_friend_self');
   });
 
   it('returns 409 already_friends if friendship row exists', async () => {
@@ -396,7 +405,7 @@ describe('POST /api/social/requests — federated branch (authority + self-frien
       payload: { username: 'alice@orbit.test' },
     });
     expect(res.statusCode).toBe(409);
-    expect(JSON.parse(res.body).error).toBe('already_friends');
+    expect(JSON.parse(res.body).code).toBe('already_friends');
   });
 
   it('returns 200 + existing requestId when same-direction request already pending (idempotent)', async () => {
@@ -465,9 +474,9 @@ describe('POST /api/social/requests — federated branch (authority + self-frien
       payload: { username: 'alice@orbit.test' },
     });
     expect(res.statusCode).toBe(409);
-    const body = JSON.parse(res.body) as { error: string; requestId: string };
-    expect(body.error).toBe('incoming_request_exists');
-    expect(body.requestId).toBe('incoming-req');
+    const body = JSON.parse(res.body) as { code: string; details: { requestId: string } };
+    expect(body.code).toBe('incoming_request_exists');
+    expect(body.details.requestId).toBe('incoming-req');
   });
 });
 
@@ -517,7 +526,7 @@ describe('POST /api/social/requests — federated branch (limbo-window peer_rese
     });
 
     expect(res.statusCode).toBe(409);
-    expect(JSON.parse(res.body).error).toBe('peer_reset_pending');
+    expect(JSON.parse(res.body).code).toBe('peer_reset_pending');
     // Short-circuits before peering/lookup — neither is consulted.
     expect(ensurePeeredMock).not.toHaveBeenCalled();
     expect(lookupRemoteUserMock).not.toHaveBeenCalled();

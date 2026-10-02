@@ -3,7 +3,13 @@ import ReactDOM from 'react-dom/client';
 import { BrowserRouter } from 'react-router-dom';
 import { App } from './App';
 import { startPendingMessageOrchestrator } from './stores/pendingMessageRehydrate';
+import i18n, { initI18n } from './i18n';
 import './styles/globals.css';
+import { initializeInterfaceScale } from './platform/interfaceScale';
+import { loadDiscordEmojiAliases } from './utils/emojiShortcodes';
+
+const stopInterfaceScale = initializeInterfaceScale();
+if (import.meta.hot) import.meta.hot.dispose(stopInterfaceScale);
 
 class ErrorBoundary extends React.Component<
   { children: React.ReactNode },
@@ -35,18 +41,17 @@ class ErrorBoundary extends React.Component<
     if (this.state.hasError) {
       return (
         <div style={{
-          height: '100vh',
+          height: 'calc(100*var(--app-vh))',
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'center',
           backgroundColor: '#0b0b10',
           color: '#efefef',
-          fontFamily: "'DM Sans', sans-serif",
           flexDirection: 'column',
           gap: '16px',
           padding: '24px',
         }}>
-          <h1 style={{ fontSize: '24px', fontWeight: 'bold' }}>Something went wrong</h1>
+          <h1 style={{ fontSize: '24px', fontWeight: 'bold' }}>{i18n.t('common:crash.title')}</h1>
           <p style={{ color: '#a0a0aa', maxWidth: '480px', textAlign: 'center' }}>{this.state.error?.message}</p>
           <div style={{ display: 'flex', gap: '12px' }}>
             <button
@@ -59,10 +64,9 @@ class ErrorBoundary extends React.Component<
                 borderRadius: '8px',
                 cursor: 'pointer',
                 fontSize: '14px',
-                fontFamily: "'DM Sans', sans-serif",
               }}
             >
-              Try Again
+              {i18n.t('common:actions.tryAgain')}
             </button>
             <button
               onClick={() => window.location.reload()}
@@ -74,10 +78,9 @@ class ErrorBoundary extends React.Component<
                 borderRadius: '8px',
                 cursor: 'pointer',
                 fontSize: '14px',
-                fontFamily: "'DM Sans', sans-serif",
               }}
             >
-              Reload Page
+              {i18n.t('common:crash.reload')}
             </button>
           </div>
           {this.state.error?.stack && (
@@ -87,7 +90,7 @@ class ErrorBoundary extends React.Component<
               style={{ maxWidth: '600px', width: '100%', marginTop: '8px' }}
             >
               <summary style={{ color: '#a0a0aa', cursor: 'pointer', fontSize: '13px' }}>
-                Error details
+                {i18n.t('common:crash.details')}
               </summary>
               <pre style={{
                 marginTop: '8px',
@@ -117,12 +120,23 @@ if (!root) throw new Error('Root element not found');
 
 startPendingMessageOrchestrator();
 
-ReactDOM.createRoot(root).render(
-  <React.StrictMode>
-    <ErrorBoundary>
-      <BrowserRouter>
-        <App />
-      </BrowserRouter>
-    </ErrorBoundary>
-  </React.StrictMode>
-);
+function render(): void {
+  ReactDOM.createRoot(root!).render(
+    <React.StrictMode>
+      <ErrorBoundary>
+        <BrowserRouter>
+          <App />
+        </BrowserRouter>
+      </ErrorBoundary>
+    </React.StrictMode>
+  );
+}
+
+// The selected language's catalogs are loaded before the first paint, so
+// nothing flashes English first. English itself is bundled, so if loading a
+// language fails the app still renders, in English, rather than not at all.
+// Discord's emoji shortcode names (a chunk of their own) load alongside, so
+// text renders with them from the first paint; that load never rejects.
+const i18nReady = initI18n()
+  .catch((err) => { console.error('[i18n] Failed to initialise, rendering in English:', err); });
+Promise.all([i18nReady, loadDiscordEmojiAliases()]).finally(render);

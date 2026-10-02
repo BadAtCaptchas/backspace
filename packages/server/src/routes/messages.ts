@@ -1,4 +1,4 @@
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { eq, and, desc, lt, inArray } from 'drizzle-orm';
 import { getDb, schema } from '../db/index.js';
 import { authenticate } from '../utils/auth.js';
@@ -16,6 +16,7 @@ import {
 } from '@backspace/shared';
 import { sanitizeUser } from '../utils/sanitize.js';
 import { deleteAttachmentFiles } from '../utils/fileCleanup.js';
+import { sendError } from '../utils/httpErrors.js';
 import { fetchEmbedsForMessages, resolveEmbeds, reResolveEmbeds, embedRowToEmbed } from '../utils/embedResolver.js';
 
 /**
@@ -57,10 +58,26 @@ export function fetchReactionsForMessages(messageIds: string[]): Map<string, Rea
 }
 
 /**
- * Fetch reply-to messages for a set of message IDs.
- * Returns a map from messageId to its reply parent MessageWithUser.
+ * Batch-fetch the reply targets for a set of channel messages, confined to one channel.
+ *
+ * A reply target only ever names a message in the same channel, so the lookup is
+ * scoped to `channelId`. That scoping is what keeps hydration from surfacing a
+ * message from a channel the reader may not have access to, including for rows
+ * written before the create-time check existed.
+ *
+ * The scope has to be the channel rather than the reader's permissions: one
+ * hydrated message is fanned out by `sendToChannel` to an audience whose members
+ * hold different permissions, so there is no single reader to resolve against.
+ * Confining the target to the message's own channel puts the reply preview under
+ * exactly the VIEW_CHANNEL gate that already guards the message carrying it.
+ *
+ * Returns a map from reply-target id to its hydration. Embeds and reactions are
+ * left empty because reply previews do not render them.
  */
-export function fetchReplyToMessages(messages: (typeof schema.messages.$inferSelect)[]): Map<string, MessageWithUser> {
+export function fetchReplyToMessages(
+  channelId: string,
+  messages: (typeof schema.messages.$inferSelect)[],
+): Map<string, MessageWithUser> {
   const replyToIds = messages
     .map(m => m.replyToId)
     .filter((id): id is string => id !== null && id !== undefined);
@@ -71,7 +88,10 @@ export function fetchReplyToMessages(messages: (typeof schema.messages.$inferSel
   const uniqueReplyIds = [...new Set(replyToIds)];
   const replyMessages = db.select()
     .from(schema.messages)
-    .where(inArray(schema.messages.id, uniqueReplyIds))
+    .where(and(
+      inArray(schema.messages.id, uniqueReplyIds),
+      eq(schema.messages.channelId, channelId),
+    ))
     .all();
 
   // Fetch users for reply messages
@@ -129,6 +149,27 @@ export function fetchReplyToMessages(messages: (typeof schema.messages.$inferSel
   return map;
 }
 
+/**
+ * True when `replyToId` names an existing message inside `channelId`.
+ *
+ * Used by both channel message-create paths (REST and WebSocket) so a reply can
+ * only ever point at the channel it is posted into. Author permissions are not
+ * enough on their own: an author who may read a restricted channel would
+ * otherwise be able to pull one of its messages into a channel with a wider
+ * audience.
+ */
+export function isReplyTargetInChannel(channelId: string, replyToId: string): boolean {
+  const db = getDb();
+  const target = db.select({ id: schema.messages.id })
+    .from(schema.messages)
+    .where(and(
+      eq(schema.messages.id, replyToId),
+      eq(schema.messages.channelId, channelId),
+    ))
+    .get();
+  return target !== undefined;
+}
+
 export function buildMessageWithUser(
   message: typeof schema.messages.$inferSelect,
   user: typeof schema.users.$inferSelect,
@@ -179,11 +220,11 @@ export async function messageRoutes(app: FastifyInstance): Promise<void> {
 
     const spaceId = getChannelSpaceId(id);
     if (!spaceId) {
-      return reply.code(404).send({ error: 'Channel not found', statusCode: 404 });
+      return sendError(reply, 404, 'channel_not_found');
     }
 
     if (!hasPermission(request.userId, spaceId, PermissionBits.VIEW_CHANNEL | PermissionBits.READ_MESSAGE_HISTORY, id)) {
-      return reply.code(403).send({ error: 'Missing VIEW_CHANNEL or READ_MESSAGE_HISTORY permission', statusCode: 403 });
+      return sendError(reply, 403, 'missing_permission', { permission: 'VIEW_CHANNEL or READ_MESSAGE_HISTORY' });
     }
 
     const db = getDb();
@@ -243,8 +284,8 @@ export async function messageRoutes(app: FastifyInstance): Promise<void> {
     // Batch fetch embeds for all messages
     const embedMap = fetchEmbedsForMessages(messageIds);
 
-    // Batch fetch reply-to messages
-    const replyToMap = fetchReplyToMessages(messageRows);
+    // Batch fetch reply-to messages, confined to this channel
+    const replyToMap = fetchReplyToMessages(id, messageRows);
 
     const messages: MessageWithUser[] = messageRows
       .map(m => {
@@ -266,7 +307,10 @@ export async function messageRoutes(app: FastifyInstance): Promise<void> {
       rateLimit: {
         max: 5,
         timeWindow: '5 seconds',
-        keyGenerator: (request: any) => request.userId || request.ip,
+        // Per client address, like every limit in this app. A route limit runs
+        // on `onRequest` too, before `authenticate`, so there is no user on the
+        // request to key on. See docs/systems/api.md, "Rate limiting".
+        keyGenerator: (request: FastifyRequest) => request.ip,
       },
     },
   }, async (request, reply) => {
@@ -275,27 +319,32 @@ export async function messageRoutes(app: FastifyInstance): Promise<void> {
 
     const spaceId = getChannelSpaceId(id);
     if (!spaceId) {
-      return reply.code(404).send({ error: 'Channel not found', statusCode: 404 });
+      return sendError(reply, 404, 'channel_not_found');
     }
 
     if (!hasPermission(request.userId, spaceId, PermissionBits.SEND_MESSAGES, id)) {
-      return reply.code(403).send({ error: 'Missing SEND_MESSAGES permission', statusCode: 403 });
+      return sendError(reply, 403, 'missing_permission', { permission: 'SEND_MESSAGES' });
     }
 
     if (attachmentIds && attachmentIds.length > 0 &&
         !hasPermission(request.userId, spaceId, PermissionBits.ATTACH_FILES, id)) {
-      return reply.code(403).send({ error: 'Missing ATTACH_FILES permission', statusCode: 403 });
+      return sendError(reply, 403, 'missing_permission', { permission: 'ATTACH_FILES' });
     }
 
     const hasContent = content && typeof content === 'string' && content.trim().length > 0;
     const hasAttachments = attachmentIds && attachmentIds.length > 0;
 
     if (!hasContent && !hasAttachments) {
-      return reply.code(400).send({ error: 'Message must have content or attachments', statusCode: 400 });
+      return sendError(reply, 400, 'message_empty');
     }
 
     if (content && content.length > MAX_MESSAGE_LENGTH) {
-      return reply.code(400).send({ error: `Message content must be ${MAX_MESSAGE_LENGTH} characters or less`, statusCode: 400 });
+      return sendError(reply, 400, 'content_too_long', { max: MAX_MESSAGE_LENGTH });
+    }
+
+    // A reply may only target a message in the channel it is posted into.
+    if (replyToId && !isReplyTargetInChannel(id, replyToId)) {
+      return sendError(reply, 400, 'reply_target_invalid');
     }
 
     const db = getDb();
@@ -307,11 +356,11 @@ export async function messageRoutes(app: FastifyInstance): Promise<void> {
       for (const attId of attachmentIds) {
         const att = db.select().from(schema.attachments).where(eq(schema.attachments.id, attId)).get();
         if (!att || att.messageId || att.dmMessageId) {
-          return reply.code(400).send({ error: 'Invalid or already-used attachment', statusCode: 400 });
+          return sendError(reply, 400, 'attachment_invalid');
         }
         // Skip ownership check for legacy uploads (null uploaderId)
         if (att.uploaderId && att.uploaderId !== request.userId) {
-          return reply.code(400).send({ error: 'You do not own this attachment', statusCode: 400 });
+          return sendError(reply, 400, 'attachment_not_owned');
         }
       }
     }
@@ -339,7 +388,7 @@ export async function messageRoutes(app: FastifyInstance): Promise<void> {
 
     const user = db.select().from(schema.users).where(eq(schema.users.id, request.userId)).get();
     if (!user) {
-      return reply.code(500).send({ error: 'User not found', statusCode: 500 });
+      return sendError(reply, 500, 'internal_error');
     }
 
     const attachmentRows = db.select()
@@ -349,13 +398,14 @@ export async function messageRoutes(app: FastifyInstance): Promise<void> {
 
     const message = db.select().from(schema.messages).where(eq(schema.messages.id, messageId)).get();
     if (!message) {
-      return reply.code(500).send({ error: 'Failed to create message', statusCode: 500 });
+      return sendError(reply, 500, 'internal_error');
     }
 
-    // Hydrate the reply-to message if present
+    // Hydrate the reply-to message if present. Reply targets are confined to
+    // the message's own channel.
     let replyTo: MessageWithUser | null = null;
     if (message.replyToId) {
-      const replyToMap = fetchReplyToMessages([message]);
+      const replyToMap = fetchReplyToMessages(message.channelId, [message]);
       replyTo = replyToMap.get(message.replyToId) ?? null;
     }
 
@@ -383,21 +433,21 @@ export async function messageRoutes(app: FastifyInstance): Promise<void> {
     const { content } = request.body;
 
     if (!content || typeof content !== 'string' || content.trim().length === 0) {
-      return reply.code(400).send({ error: 'Content is required', statusCode: 400 });
+      return sendError(reply, 400, 'content_required');
     }
 
     if (content.length > MAX_MESSAGE_LENGTH) {
-      return reply.code(400).send({ error: `Message content must be ${MAX_MESSAGE_LENGTH} characters or less`, statusCode: 400 });
+      return sendError(reply, 400, 'content_too_long', { max: MAX_MESSAGE_LENGTH });
     }
 
     const db = getDb();
     const message = db.select().from(schema.messages).where(eq(schema.messages.id, id)).get();
     if (!message) {
-      return reply.code(404).send({ error: 'Message not found', statusCode: 404 });
+      return sendError(reply, 404, 'message_not_found');
     }
 
     if (message.userId !== request.userId) {
-      return reply.code(403).send({ error: 'You can only edit your own messages', statusCode: 403 });
+      return sendError(reply, 403, 'message_edit_not_author');
     }
 
     const now = Date.now();
@@ -408,12 +458,12 @@ export async function messageRoutes(app: FastifyInstance): Promise<void> {
 
     const updatedMessage = db.select().from(schema.messages).where(eq(schema.messages.id, id)).get();
     if (!updatedMessage) {
-      return reply.code(500).send({ error: 'Failed to update message', statusCode: 500 });
+      return sendError(reply, 500, 'internal_error');
     }
 
     const user = db.select().from(schema.users).where(eq(schema.users.id, message.userId)).get();
     if (!user) {
-      return reply.code(500).send({ error: 'User not found', statusCode: 500 });
+      return sendError(reply, 500, 'internal_error');
     }
 
     const attachmentRows = db.select()
@@ -429,16 +479,19 @@ export async function messageRoutes(app: FastifyInstance): Promise<void> {
     const reactions = reactionsMap.get(id) ?? [];
     let replyTo: MessageWithUser | null = null;
     if (updatedMessage.replyToId) {
-      const replyToMap = fetchReplyToMessages([updatedMessage]);
+      const replyToMap = fetchReplyToMessages(updatedMessage.channelId, [updatedMessage]);
       replyTo = replyToMap.get(updatedMessage.replyToId) ?? null;
     }
 
     const messageWithUser = buildMessageWithUser(updatedMessage, user, attachmentRows, reactions, replyTo, []);
 
-    // Broadcast edit (with empty embeds — new ones arrive via embeds_resolved)
+    // Broadcast edit (with empty embeds — new ones arrive via embeds_resolved).
+    // The audience is the channel, not the space: the payload carries the full
+    // message, so it goes to the same VIEW_CHANNEL holders that received the
+    // original message_created. Matches the WebSocket message_edit handler.
     const spaceId = getChannelSpaceId(message.channelId);
     if (spaceId) {
-      connectionManager.sendToSpace(spaceId, {
+      connectionManager.sendToChannel(spaceId, message.channelId, {
         type: 'message_updated',
         message: messageWithUser,
       });
@@ -461,19 +514,19 @@ export async function messageRoutes(app: FastifyInstance): Promise<void> {
 
     const message = db.select().from(schema.messages).where(eq(schema.messages.id, id)).get();
     if (!message) {
-      return reply.code(404).send({ error: 'Message not found', statusCode: 404 });
+      return sendError(reply, 404, 'message_not_found');
     }
 
     const spaceId = getChannelSpaceId(message.channelId);
     if (!spaceId) {
-      return reply.code(404).send({ error: 'Channel not found', statusCode: 404 });
+      return sendError(reply, 404, 'channel_not_found');
     }
 
     const isAuthor = message.userId === request.userId;
     const canManageMessages = hasPermission(request.userId, spaceId, PermissionBits.MANAGE_MESSAGES, message.channelId);
 
     if (!isAuthor && !canManageMessages) {
-      return reply.code(403).send({ error: 'You cannot delete this message', statusCode: 403 });
+      return sendError(reply, 403, 'message_delete_forbidden');
     }
 
     // Collect attachment filenames before deleting
@@ -491,8 +544,10 @@ export async function messageRoutes(app: FastifyInstance): Promise<void> {
     // Clean up files from disk after transaction commits
     deleteAttachmentFiles(attachmentRows);
 
-    // Broadcast deletion
-    connectionManager.sendToSpace(spaceId, {
+    // Broadcast deletion to the channel's audience. A member without
+    // VIEW_CHANNEL never saw the message and must not learn that it existed.
+    // Matches the WebSocket message_delete handler.
+    connectionManager.sendToChannel(spaceId, message.channelId, {
       type: 'message_deleted',
       messageId: id,
       channelId: message.channelId,

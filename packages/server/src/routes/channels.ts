@@ -4,10 +4,20 @@ import { getDb, schema } from '../db/index.js';
 import { authenticate } from '../utils/auth.js';
 import { generateSnowflake } from '../utils/snowflake.js';
 import { isMember, hasPermission, getChannelSpaceId, PermissionBits, computePermissions } from '../utils/permissions.js';
-import { permissionsToString } from '@backspace/shared/src/permissions.js';
+import { permissionsToString, stringToPermissions, overrideChangeRefusal, type HeldBitsRefusal, type OverrideBits } from '@backspace/shared/src/permissions.js';
+import {
+  CATEGORY_NAME_MAX_LENGTH,
+  CATEGORY_NAME_MIN_LENGTH,
+  CHANNEL_NAME_MAX_LENGTH,
+  CHANNEL_NAME_MIN_LENGTH,
+  normalizeCategoryName,
+  normalizeChannelName,
+} from '@backspace/shared/src/constants.js';
 import { connectionManager } from '../ws/handler.js';
 import { checkVoicePermissions } from '../ws/events.js';
 import { deleteAttachmentFiles } from '../utils/fileCleanup.js';
+import { sendError } from '../utils/httpErrors.js';
+import { canActOnMemberInSpace, canManageRoleInSpace } from '../utils/roleHierarchy.js';
 import type {
   CreateChannelRequest,
   UpdateChannelRequest,
@@ -134,6 +144,54 @@ function broadcastCategoryOverrideChange(spaceId: string, categoryId: string): v
   }
 }
 
+/**
+ * Role hierarchy for an override write (permissions.md, "Role hierarchy"): an
+ * override on a role changes what its holders can do in that channel or
+ * category, and one on a member moderates that member. So a role target must
+ * rank below the actor's top role, and a member target other than the actor
+ * must rank below the actor. `mode` 'delete' lets an override on a role that
+ * no longer exists be cleaned up; a write needs the role to be in the space.
+ */
+function overrideTargetRefusal(
+  actorId: string,
+  spaceId: string,
+  targetType: string,
+  targetId: string,
+  mode: 'write' | 'delete',
+): { status: 400 | 403; code: 'role_not_in_space' | 'role_hierarchy' } | null {
+  if (targetType === 'role') {
+    const role = getDb().select({ position: schema.roles.position }).from(schema.roles)
+      .where(and(eq(schema.roles.id, targetId), eq(schema.roles.spaceId, spaceId)))
+      .get();
+    if (!role) return mode === 'write' ? { status: 400, code: 'role_not_in_space' } : null;
+    return canManageRoleInSpace(spaceId, actorId, role.position ?? 0) ? null : { status: 403, code: 'role_hierarchy' };
+  }
+  if (targetType === 'member' && targetId !== actorId && !canActOnMemberInSpace(spaceId, actorId, targetId)) {
+    return { status: 403, code: 'role_hierarchy' };
+  }
+  return null;
+}
+
+/** A stored override row as bits, or null when there is none. */
+function storedOverrideBits(row: { allow: string; deny: string } | undefined): OverrideBits | null {
+  return row ? { allow: stringToPermissions(row.allow), deny: stringToPermissions(row.deny) } : null;
+}
+
+/**
+ * Held-bits rule for an override write (permissions.md, "Held-bits rule"):
+ * the actor may only switch bits they hold in the space. The comparison is
+ * against the stored row, so an unheld bit someone more senior set can stay
+ * while the actor edits the others. `after` null is a delete.
+ */
+function overrideWriteRefusal(
+  actorId: string,
+  spaceId: string,
+  before: { allow: string; deny: string } | undefined,
+  after: OverrideBits | null,
+): HeldBitsRefusal | null {
+  return overrideChangeRefusal(computePermissions(actorId, spaceId), storedOverrideBits(before), after);
+}
+
 export async function channelRoutes(app: FastifyInstance): Promise<void> {
   // GET /api/spaces/:id/channels - List channels in a space
   app.get<{ Params: { id: string } }>('/api/spaces/:id/channels', {
@@ -144,11 +202,11 @@ export async function channelRoutes(app: FastifyInstance): Promise<void> {
 
     const space = db.select().from(schema.spaces).where(eq(schema.spaces.id, id)).get();
     if (!space) {
-      return reply.code(404).send({ error: 'Space not found', statusCode: 404 });
+      return sendError(reply, 404, 'space_not_found');
     }
 
     if (!isMember(id, request.userId)) {
-      return reply.code(403).send({ error: 'You are not a member of this space', statusCode: 403 });
+      return sendError(reply, 403, 'not_space_member');
     }
 
     const allChannels = db.select()
@@ -178,24 +236,24 @@ export async function channelRoutes(app: FastifyInstance): Promise<void> {
 
     const space = db.select().from(schema.spaces).where(eq(schema.spaces.id, id)).get();
     if (!space) {
-      return reply.code(404).send({ error: 'Space not found', statusCode: 404 });
+      return sendError(reply, 404, 'space_not_found');
     }
 
     if (!hasPermission(request.userId, id, PermissionBits.MANAGE_CHANNELS)) {
-      return reply.code(403).send({ error: 'Missing MANAGE_CHANNELS permission', statusCode: 403 });
+      return sendError(reply, 403, 'missing_permission', { permission: 'MANAGE_CHANNELS' });
     }
 
     if (!name || typeof name !== 'string') {
-      return reply.code(400).send({ error: 'Channel name is required', statusCode: 400 });
+      return sendError(reply, 400, 'channel_name_required');
     }
 
-    const trimmedName = name.trim().toLowerCase().replace(/\s+/g, '-');
-    if (trimmedName.length < 1 || trimmedName.length > 100) {
-      return reply.code(400).send({ error: 'Channel name must be between 1 and 100 characters', statusCode: 400 });
+    const trimmedName = normalizeChannelName(name);
+    if (trimmedName.length < CHANNEL_NAME_MIN_LENGTH || trimmedName.length > CHANNEL_NAME_MAX_LENGTH) {
+      return sendError(reply, 400, 'channel_name_length', { min: CHANNEL_NAME_MIN_LENGTH, max: CHANNEL_NAME_MAX_LENGTH });
     }
 
     if (!type || !['text', 'voice'].includes(type)) {
-      return reply.code(400).send({ error: 'Channel type must be "text" or "voice"', statusCode: 400 });
+      return sendError(reply, 400, 'channel_type_invalid');
     }
 
     // Validate categoryId if provided
@@ -205,7 +263,7 @@ export async function channelRoutes(app: FastifyInstance): Promise<void> {
         .where(and(eq(schema.channelCategories.id, categoryId), eq(schema.channelCategories.spaceId, id)))
         .get();
       if (!cat) {
-        return reply.code(400).send({ error: 'Category not found in this space', statusCode: 400 });
+        return sendError(reply, 400, 'category_not_in_space', { id: categoryId });
       }
       validCategoryId = categoryId;
     }
@@ -234,7 +292,7 @@ export async function channelRoutes(app: FastifyInstance): Promise<void> {
 
     const channel = db.select().from(schema.channels).where(eq(schema.channels.id, channelId)).get();
     if (!channel) {
-      return reply.code(500).send({ error: 'Failed to create channel', statusCode: 500 });
+      return sendError(reply, 500, 'internal_error');
     }
 
     const channelData = rowToChannel(channel);
@@ -275,20 +333,23 @@ export async function channelRoutes(app: FastifyInstance): Promise<void> {
 
     const channel = db.select().from(schema.channels).where(eq(schema.channels.id, id)).get();
     if (!channel) {
-      return reply.code(404).send({ error: 'Channel not found', statusCode: 404 });
+      return sendError(reply, 404, 'channel_not_found');
     }
 
     const spaceId = channel.spaceId;
     if (!hasPermission(request.userId, spaceId, PermissionBits.MANAGE_CHANNELS, id)) {
-      return reply.code(403).send({ error: 'Missing MANAGE_CHANNELS permission', statusCode: 403 });
+      return sendError(reply, 403, 'missing_permission', { permission: 'MANAGE_CHANNELS' });
     }
 
     const updates: Partial<typeof schema.channels.$inferInsert> = {};
 
     if (name !== undefined) {
-      const trimmedName = name.trim().toLowerCase().replace(/\s+/g, '-');
-      if (trimmedName.length < 1 || trimmedName.length > 100) {
-        return reply.code(400).send({ error: 'Channel name must be between 1 and 100 characters', statusCode: 400 });
+      if (typeof name !== 'string') {
+        return sendError(reply, 400, 'channel_name_required');
+      }
+      const trimmedName = normalizeChannelName(name);
+      if (trimmedName.length < CHANNEL_NAME_MIN_LENGTH || trimmedName.length > CHANNEL_NAME_MAX_LENGTH) {
+        return sendError(reply, 400, 'channel_name_length', { min: CHANNEL_NAME_MIN_LENGTH, max: CHANNEL_NAME_MAX_LENGTH });
       }
       updates.name = trimmedName;
     }
@@ -299,7 +360,7 @@ export async function channelRoutes(app: FastifyInstance): Promise<void> {
 
     if (position !== undefined) {
       if (typeof position !== 'number' || position < 0) {
-        return reply.code(400).send({ error: 'Position must be a non-negative number', statusCode: 400 });
+        return sendError(reply, 400, 'position_invalid');
       }
       updates.position = position;
     }
@@ -312,21 +373,21 @@ export async function channelRoutes(app: FastifyInstance): Promise<void> {
           .where(and(eq(schema.channelCategories.id, categoryId), eq(schema.channelCategories.spaceId, spaceId)))
           .get();
         if (!cat) {
-          return reply.code(400).send({ error: 'Category not found in this space', statusCode: 400 });
+          return sendError(reply, 400, 'category_not_in_space', { id: categoryId });
         }
         updates.categoryId = categoryId;
       }
     }
 
     if (Object.keys(updates).length === 0) {
-      return reply.code(400).send({ error: 'No fields to update', statusCode: 400 });
+      return sendError(reply, 400, 'no_fields_to_update');
     }
 
     db.update(schema.channels).set(updates).where(eq(schema.channels.id, id)).run();
 
     const updated = db.select().from(schema.channels).where(eq(schema.channels.id, id)).get();
     if (!updated) {
-      return reply.code(500).send({ error: 'Failed to update channel', statusCode: 500 });
+      return sendError(reply, 500, 'internal_error');
     }
 
     const channelData = rowToChannel(updated);
@@ -358,12 +419,12 @@ export async function channelRoutes(app: FastifyInstance): Promise<void> {
 
     const channel = db.select().from(schema.channels).where(eq(schema.channels.id, id)).get();
     if (!channel) {
-      return reply.code(404).send({ error: 'Channel not found', statusCode: 404 });
+      return sendError(reply, 404, 'channel_not_found');
     }
 
     const spaceId = channel.spaceId;
     if (!hasPermission(request.userId, spaceId, PermissionBits.MANAGE_CHANNELS, id)) {
-      return reply.code(403).send({ error: 'Missing MANAGE_CHANNELS permission', statusCode: 403 });
+      return sendError(reply, 403, 'missing_permission', { permission: 'MANAGE_CHANNELS' });
     }
 
     // Disconnect voice users before deletion
@@ -432,11 +493,11 @@ export async function channelRoutes(app: FastifyInstance): Promise<void> {
 
     const channel = db.select().from(schema.channels).where(eq(schema.channels.id, id)).get();
     if (!channel) {
-      return reply.code(404).send({ error: 'Channel not found', statusCode: 404 });
+      return sendError(reply, 404, 'channel_not_found');
     }
 
     if (!hasPermission(request.userId, channel.spaceId, PermissionBits.MANAGE_ROLES)) {
-      return reply.code(403).send({ error: 'Missing MANAGE_ROLES permission', statusCode: 403 });
+      return sendError(reply, 403, 'missing_permission', { permission: 'MANAGE_ROLES' });
     }
 
     const overrides = db.select().from(schema.channelOverrides)
@@ -464,19 +525,19 @@ export async function channelRoutes(app: FastifyInstance): Promise<void> {
     const db = getDb();
 
     if (!targetType || !['role', 'member'].includes(targetType)) {
-      return reply.code(400).send({ error: 'targetType must be "role" or "member"', statusCode: 400 });
+      return sendError(reply, 400, 'override_target_invalid');
     }
     if (!targetId || typeof targetId !== 'string') {
-      return reply.code(400).send({ error: 'targetId is required', statusCode: 400 });
+      return sendError(reply, 400, 'override_target_required');
     }
 
     const channel = db.select().from(schema.channels).where(eq(schema.channels.id, id)).get();
     if (!channel) {
-      return reply.code(404).send({ error: 'Channel not found', statusCode: 404 });
+      return sendError(reply, 404, 'channel_not_found');
     }
 
     if (!hasPermission(request.userId, channel.spaceId, PermissionBits.MANAGE_ROLES)) {
-      return reply.code(403).send({ error: 'Missing MANAGE_ROLES permission', statusCode: 403 });
+      return sendError(reply, 403, 'missing_permission', { permission: 'MANAGE_ROLES' });
     }
 
     // Validate that allow/deny are valid bigint strings
@@ -486,20 +547,23 @@ export async function channelRoutes(app: FastifyInstance): Promise<void> {
       allowBits = BigInt(allow || '0');
       denyBits = BigInt(deny || '0');
     } catch {
-      return reply.code(400).send({ error: 'allow and deny must be valid decimal integer strings', statusCode: 400 });
+      return sendError(reply, 400, 'override_bits_invalid');
     }
 
-    // Privilege escalation guard: non-admin users can only grant permissions they possess
-    const callerPerms = computePermissions(request.userId, channel.spaceId);
-    if ((callerPerms & PermissionBits.ADMINISTRATOR) === 0n) {
-      const escalatedAllow = allowBits & ~callerPerms;
-      if (escalatedAllow !== 0n) {
-        return reply.code(403).send({ error: 'Cannot grant permissions you do not possess', statusCode: 403 });
-      }
-      const escalatedDeny = denyBits & ~callerPerms;
-      if (escalatedDeny !== 0n) {
-        return reply.code(403).send({ error: 'Cannot deny permissions you do not possess', statusCode: 403 });
-      }
+    const targetRefusal = overrideTargetRefusal(request.userId, channel.spaceId, targetType, targetId, 'write');
+    if (targetRefusal) {
+      return sendError(reply, targetRefusal.status, targetRefusal.code, targetRefusal.code === 'role_not_in_space' ? { roleId: targetId } : undefined);
+    }
+
+    // Privilege escalation guard: only bits the caller holds may change
+    const existingChannelOverride = db.select().from(schema.channelOverrides).where(and(
+      eq(schema.channelOverrides.channelId, id),
+      eq(schema.channelOverrides.targetType, targetType),
+      eq(schema.channelOverrides.targetId, targetId),
+    )).get();
+    const escalation = overrideWriteRefusal(request.userId, channel.spaceId, existingChannelOverride, { allow: allowBits, deny: denyBits });
+    if (escalation) {
+      return sendError(reply, 403, escalation);
     }
 
     // Upsert: delete existing then insert
@@ -538,11 +602,28 @@ export async function channelRoutes(app: FastifyInstance): Promise<void> {
 
       const channel = db.select().from(schema.channels).where(eq(schema.channels.id, id)).get();
       if (!channel) {
-        return reply.code(404).send({ error: 'Channel not found', statusCode: 404 });
+        return sendError(reply, 404, 'channel_not_found');
       }
 
       if (!hasPermission(request.userId, channel.spaceId, PermissionBits.MANAGE_ROLES)) {
-        return reply.code(403).send({ error: 'Missing MANAGE_ROLES permission', statusCode: 403 });
+        return sendError(reply, 403, 'missing_permission', { permission: 'MANAGE_ROLES' });
+      }
+
+      const targetRefusal = overrideTargetRefusal(request.userId, channel.spaceId, targetType, targetId, 'delete');
+      if (targetRefusal) {
+        return sendError(reply, targetRefusal.status, targetRefusal.code);
+      }
+
+      // Deleting clears every bit the override sets; without this check a
+      // delete and re-create would get round the held-bits rule on PUT.
+      const existing = db.select().from(schema.channelOverrides).where(and(
+        eq(schema.channelOverrides.channelId, id),
+        eq(schema.channelOverrides.targetType, targetType),
+        eq(schema.channelOverrides.targetId, targetId),
+      )).get();
+      const escalation = overrideWriteRefusal(request.userId, channel.spaceId, existing, null);
+      if (escalation) {
+        return sendError(reply, 403, escalation);
       }
 
       db.delete(schema.channelOverrides).where(
@@ -573,15 +654,15 @@ export async function channelRoutes(app: FastifyInstance): Promise<void> {
     const category = db.select().from(schema.channelCategories)
       .where(eq(schema.channelCategories.id, id)).get();
     if (!category) {
-      return reply.code(404).send({ error: 'Category not found', statusCode: 404 });
+      return sendError(reply, 404, 'category_not_found');
     }
 
     if (!isMember(category.spaceId, request.userId)) {
-      return reply.code(403).send({ error: 'Not a member of this space', statusCode: 403 });
+      return sendError(reply, 403, 'not_space_member');
     }
 
     if (!hasPermission(request.userId, category.spaceId, PermissionBits.MANAGE_ROLES)) {
-      return reply.code(403).send({ error: 'Missing MANAGE_ROLES permission', statusCode: 403 });
+      return sendError(reply, 403, 'missing_permission', { permission: 'MANAGE_ROLES' });
     }
 
     const overrides = db.select().from(schema.categoryOverrides)
@@ -609,20 +690,20 @@ export async function channelRoutes(app: FastifyInstance): Promise<void> {
     const db = getDb();
 
     if (!targetType || !['role', 'member'].includes(targetType)) {
-      return reply.code(400).send({ error: 'targetType must be "role" or "member"', statusCode: 400 });
+      return sendError(reply, 400, 'override_target_invalid');
     }
     if (!targetId || typeof targetId !== 'string') {
-      return reply.code(400).send({ error: 'targetId is required', statusCode: 400 });
+      return sendError(reply, 400, 'override_target_required');
     }
 
     const category = db.select().from(schema.channelCategories)
       .where(eq(schema.channelCategories.id, id)).get();
     if (!category) {
-      return reply.code(404).send({ error: 'Category not found', statusCode: 404 });
+      return sendError(reply, 404, 'category_not_found');
     }
 
     if (!hasPermission(request.userId, category.spaceId, PermissionBits.MANAGE_ROLES)) {
-      return reply.code(403).send({ error: 'Missing MANAGE_ROLES permission', statusCode: 403 });
+      return sendError(reply, 403, 'missing_permission', { permission: 'MANAGE_ROLES' });
     }
 
     let allowBits: bigint;
@@ -631,20 +712,23 @@ export async function channelRoutes(app: FastifyInstance): Promise<void> {
       allowBits = BigInt(allow || '0');
       denyBits = BigInt(deny || '0');
     } catch {
-      return reply.code(400).send({ error: 'allow and deny must be valid decimal integer strings', statusCode: 400 });
+      return sendError(reply, 400, 'override_bits_invalid');
+    }
+
+    const targetRefusal = overrideTargetRefusal(request.userId, category.spaceId, targetType, targetId, 'write');
+    if (targetRefusal) {
+      return sendError(reply, targetRefusal.status, targetRefusal.code, targetRefusal.code === 'role_not_in_space' ? { roleId: targetId } : undefined);
     }
 
     // Privilege escalation guard (matches channel override pattern)
-    const callerPerms = computePermissions(request.userId, category.spaceId);
-    if ((callerPerms & PermissionBits.ADMINISTRATOR) === 0n) {
-      const escalatedAllow = allowBits & ~callerPerms;
-      if (escalatedAllow !== 0n) {
-        return reply.code(403).send({ error: 'Cannot grant permissions you do not possess', statusCode: 403 });
-      }
-      const escalatedDeny = denyBits & ~callerPerms;
-      if (escalatedDeny !== 0n) {
-        return reply.code(403).send({ error: 'Cannot deny permissions you do not possess', statusCode: 403 });
-      }
+    const existingCategoryOverride = db.select().from(schema.categoryOverrides).where(and(
+      eq(schema.categoryOverrides.categoryId, id),
+      eq(schema.categoryOverrides.targetType, targetType),
+      eq(schema.categoryOverrides.targetId, targetId),
+    )).get();
+    const escalation = overrideWriteRefusal(request.userId, category.spaceId, existingCategoryOverride, { allow: allowBits, deny: denyBits });
+    if (escalation) {
+      return sendError(reply, 403, escalation);
     }
 
     db.transaction((tx) => {
@@ -682,11 +766,27 @@ export async function channelRoutes(app: FastifyInstance): Promise<void> {
       const category = db.select().from(schema.channelCategories)
         .where(eq(schema.channelCategories.id, id)).get();
       if (!category) {
-        return reply.code(404).send({ error: 'Category not found', statusCode: 404 });
+        return sendError(reply, 404, 'category_not_found');
       }
 
       if (!hasPermission(request.userId, category.spaceId, PermissionBits.MANAGE_ROLES)) {
-        return reply.code(403).send({ error: 'Missing MANAGE_ROLES permission', statusCode: 403 });
+        return sendError(reply, 403, 'missing_permission', { permission: 'MANAGE_ROLES' });
+      }
+
+      const targetRefusal = overrideTargetRefusal(request.userId, category.spaceId, targetType, targetId, 'delete');
+      if (targetRefusal) {
+        return sendError(reply, targetRefusal.status, targetRefusal.code);
+      }
+
+      // Deleting clears every bit the override sets (see the channel route).
+      const existing = db.select().from(schema.categoryOverrides).where(and(
+        eq(schema.categoryOverrides.categoryId, id),
+        eq(schema.categoryOverrides.targetType, targetType),
+        eq(schema.categoryOverrides.targetId, targetId),
+      )).get();
+      const escalation = overrideWriteRefusal(request.userId, category.spaceId, existing, null);
+      if (escalation) {
+        return sendError(reply, 403, escalation);
       }
 
       db.delete(schema.categoryOverrides).where(
@@ -716,20 +816,20 @@ export async function channelRoutes(app: FastifyInstance): Promise<void> {
 
     const space = db.select().from(schema.spaces).where(eq(schema.spaces.id, id)).get();
     if (!space) {
-      return reply.code(404).send({ error: 'Space not found', statusCode: 404 });
+      return sendError(reply, 404, 'space_not_found');
     }
 
     if (!hasPermission(request.userId, id, PermissionBits.MANAGE_CHANNELS)) {
-      return reply.code(403).send({ error: 'Missing MANAGE_CHANNELS permission', statusCode: 403 });
+      return sendError(reply, 403, 'missing_permission', { permission: 'MANAGE_CHANNELS' });
     }
 
     if (!name || typeof name !== 'string' || !name.trim()) {
-      return reply.code(400).send({ error: 'Category name is required', statusCode: 400 });
+      return sendError(reply, 400, 'category_name_required');
     }
 
-    const trimmedName = name.trim();
-    if (trimmedName.length > 100) {
-      return reply.code(400).send({ error: 'Category name must be 100 characters or less', statusCode: 400 });
+    const trimmedName = normalizeCategoryName(name);
+    if (trimmedName.length > CATEGORY_NAME_MAX_LENGTH) {
+      return sendError(reply, 400, 'category_name_length', { min: CATEGORY_NAME_MIN_LENGTH, max: CATEGORY_NAME_MAX_LENGTH });
     }
 
     const existing = db.select().from(schema.channelCategories)
@@ -751,7 +851,7 @@ export async function channelRoutes(app: FastifyInstance): Promise<void> {
     const category = db.select().from(schema.channelCategories)
       .where(eq(schema.channelCategories.id, categoryId)).get();
     if (!category) {
-      return reply.code(500).send({ error: 'Failed to create category', statusCode: 500 });
+      return sendError(reply, 500, 'internal_error');
     }
 
     const categoryData = rowToCategory(category);
@@ -775,32 +875,35 @@ export async function channelRoutes(app: FastifyInstance): Promise<void> {
     const category = db.select().from(schema.channelCategories)
       .where(eq(schema.channelCategories.id, id)).get();
     if (!category) {
-      return reply.code(404).send({ error: 'Category not found', statusCode: 404 });
+      return sendError(reply, 404, 'category_not_found');
     }
 
     if (!hasPermission(request.userId, category.spaceId, PermissionBits.MANAGE_CHANNELS)) {
-      return reply.code(403).send({ error: 'Missing MANAGE_CHANNELS permission', statusCode: 403 });
+      return sendError(reply, 403, 'missing_permission', { permission: 'MANAGE_CHANNELS' });
     }
 
     const updates: Partial<typeof schema.channelCategories.$inferInsert> = {};
 
     if (name !== undefined) {
-      const trimmedName = name.trim();
-      if (!trimmedName || trimmedName.length > 100) {
-        return reply.code(400).send({ error: 'Category name must be 1-100 characters', statusCode: 400 });
+      if (typeof name !== 'string') {
+        return sendError(reply, 400, 'category_name_required');
+      }
+      const trimmedName = normalizeCategoryName(name);
+      if (trimmedName.length < CATEGORY_NAME_MIN_LENGTH || trimmedName.length > CATEGORY_NAME_MAX_LENGTH) {
+        return sendError(reply, 400, 'category_name_length', { min: CATEGORY_NAME_MIN_LENGTH, max: CATEGORY_NAME_MAX_LENGTH });
       }
       updates.name = trimmedName;
     }
 
     if (position !== undefined) {
       if (typeof position !== 'number' || position < 0) {
-        return reply.code(400).send({ error: 'Position must be a non-negative number', statusCode: 400 });
+        return sendError(reply, 400, 'position_invalid');
       }
       updates.position = position;
     }
 
     if (Object.keys(updates).length === 0) {
-      return reply.code(400).send({ error: 'No fields to update', statusCode: 400 });
+      return sendError(reply, 400, 'no_fields_to_update');
     }
 
     db.update(schema.channelCategories).set(updates)
@@ -809,7 +912,7 @@ export async function channelRoutes(app: FastifyInstance): Promise<void> {
     const updated = db.select().from(schema.channelCategories)
       .where(eq(schema.channelCategories.id, id)).get();
     if (!updated) {
-      return reply.code(500).send({ error: 'Failed to update category', statusCode: 500 });
+      return sendError(reply, 500, 'internal_error');
     }
 
     const updatedData = { ...rowToCategory(updated), isPrivate: isCategoryPrivate(id, category.spaceId) };
@@ -832,11 +935,11 @@ export async function channelRoutes(app: FastifyInstance): Promise<void> {
     const category = db.select().from(schema.channelCategories)
       .where(eq(schema.channelCategories.id, id)).get();
     if (!category) {
-      return reply.code(404).send({ error: 'Category not found', statusCode: 404 });
+      return sendError(reply, 404, 'category_not_found');
     }
 
     if (!hasPermission(request.userId, category.spaceId, PermissionBits.MANAGE_CHANNELS)) {
-      return reply.code(403).send({ error: 'Missing MANAGE_CHANNELS permission', statusCode: 403 });
+      return sendError(reply, 403, 'missing_permission', { permission: 'MANAGE_CHANNELS' });
     }
 
     const spaceId = category.spaceId;
@@ -879,15 +982,15 @@ export async function channelRoutes(app: FastifyInstance): Promise<void> {
 
     const space = db.select().from(schema.spaces).where(eq(schema.spaces.id, id)).get();
     if (!space) {
-      return reply.code(404).send({ error: 'Space not found', statusCode: 404 });
+      return sendError(reply, 404, 'space_not_found');
     }
 
     if (!hasPermission(request.userId, id, PermissionBits.MANAGE_CHANNELS)) {
-      return reply.code(403).send({ error: 'Missing MANAGE_CHANNELS permission', statusCode: 403 });
+      return sendError(reply, 403, 'missing_permission', { permission: 'MANAGE_CHANNELS' });
     }
 
     if (!Array.isArray(channelUpdates) || !Array.isArray(categoryUpdates)) {
-      return reply.code(400).send({ error: 'channels and categories arrays are required', statusCode: 400 });
+      return sendError(reply, 400, 'layout_arrays_required');
     }
 
     // Validate all channel IDs belong to this space
@@ -896,10 +999,10 @@ export async function channelRoutes(app: FastifyInstance): Promise<void> {
     const spaceChannelIds = new Set(spaceChannels.map(ch => ch.id));
     for (const ch of channelUpdates) {
       if (!spaceChannelIds.has(ch.id)) {
-        return reply.code(400).send({ error: `Channel ${ch.id} does not belong to this space`, statusCode: 400 });
+        return sendError(reply, 400, 'channel_not_in_space', { id: ch.id });
       }
       if (typeof ch.position !== 'number' || ch.position < 0) {
-        return reply.code(400).send({ error: 'All positions must be non-negative numbers', statusCode: 400 });
+        return sendError(reply, 400, 'position_invalid');
       }
     }
 
@@ -909,17 +1012,17 @@ export async function channelRoutes(app: FastifyInstance): Promise<void> {
     const spaceCategoryIds = new Set(spaceCategories.map(c => c.id));
     for (const cat of categoryUpdates) {
       if (!spaceCategoryIds.has(cat.id)) {
-        return reply.code(400).send({ error: `Category ${cat.id} does not belong to this space`, statusCode: 400 });
+        return sendError(reply, 400, 'category_not_in_space', { id: cat.id });
       }
       if (typeof cat.position !== 'number' || cat.position < 0) {
-        return reply.code(400).send({ error: 'All positions must be non-negative numbers', statusCode: 400 });
+        return sendError(reply, 400, 'position_invalid');
       }
     }
 
     // Validate category references in channels
     for (const ch of channelUpdates) {
       if (ch.categoryId !== null && !spaceCategoryIds.has(ch.categoryId)) {
-        return reply.code(400).send({ error: `Category ${ch.categoryId} does not belong to this space`, statusCode: 400 });
+        return sendError(reply, 400, 'category_not_in_space', { id: ch.categoryId });
       }
     }
 

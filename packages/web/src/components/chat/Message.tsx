@@ -1,9 +1,14 @@
+import { layoutRect, layoutPixels } from '../../platform/interfaceScale';
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { createPortal } from 'react-dom';
-import type { MessageWithUser, Embed, User } from '@backspace/shared';
+import { Trans, useTranslation } from 'react-i18next';
+import type { TFunction } from 'i18next';
+import { formatters, useFormatters } from '../../i18n/formatters';
+import type { MessageWithUser, Embed, Reaction, User } from '@backspace/shared';
 import { MarkdownRenderer } from './MarkdownRenderer';
-import { MentionBadge } from './MentionBadge';
+import { InlineMessageText } from './InlineMessageText';
 import { Avatar } from '../ui/Avatar';
+import { ProfileAvatar } from '../ui/ProfileAvatar';
 import { useContextMenuStore } from '../../stores/contextMenuStore';
 import { buildMessageMenuItems } from './messageMenuItems';
 import { useAuthStore } from '../../stores/authStore';
@@ -13,12 +18,15 @@ import { useUIStore } from '../../stores/uiStore';
 import { AttachmentRenderer, attUrlOf } from './AttachmentRenderer';
 import { AttachmentProgress } from './AttachmentProgress';
 import { EmbedRenderer } from './EmbedRenderer';
-import { Username } from '../ui/Username';
+import { FederationGlobeIcon } from '../ui/Username';
+import { Tooltip } from '../ui/Tooltip';
 import { EmojiPicker } from './EmojiPicker';
 import { hasPermissionBit, PermissionBits } from '../../utils/permissions';
 import { isDeletedPartnerDm } from '../../utils/dmFormatters';
-import { isSelf, resolveDisplayIdentity } from '../../utils/identity';
+import { isFederationGlobeApplicable, isSelf, resolveDisplayIdentity, userDisplayName } from '../../utils/identity';
 import { useCanonicalUserView } from '../../utils/userViewLookup';
+import { useSelfIdInChannel } from '../../utils/channelUser';
+import { contentMentionsAny } from '../../utils/mentionTokens';
 import {
   isPendingMessage,
   usePendingMessageStore,
@@ -26,6 +34,9 @@ import {
   type PendingAttachmentView,
 } from '../../stores/pendingMessageStore';
 import { useTransferStore } from '../../stores/transferStore';
+import { useMessageJump } from './messageJumpContext';
+import { ReactionPill } from './ReactionPill';
+import { isOwnReaction } from './reactionSummary';
 
 interface MessageProps {
   message: MessageWithUser | PendingMessageView;
@@ -63,7 +74,31 @@ function PendingAttachmentTile({ transferId }: PendingAttachmentTileProps) {
   );
 }
 
-function formatTime(timestamp: number): string {
+/**
+ * A person's name in a message row (author, reply preview): the name as
+ * plain text, followed by the federation globe exactly when the person is
+ * from another instance (`isFederationGlobeApplicable`), with the full
+ * username as its tooltip. The same rule as the DM list and header.
+ */
+function PersonName({ name, person, className, style }: {
+  name: string;
+  person: Pick<User, 'username'>;
+  className: string;
+  style?: React.CSSProperties;
+}) {
+  return (
+    <span className={`inline-flex items-center gap-0.5 ${className}`} style={style}>
+      {name}
+      {isFederationGlobeApplicable(person) && (
+        <Tooltip content={person.username} position="top">
+          <FederationGlobeIcon />
+        </Tooltip>
+      )}
+    </span>
+  );
+}
+
+function formatMessageTimestamp(t: TFunction<['chat', 'common']>, fmt: typeof formatters, timestamp: number): string {
   const date = new Date(timestamp);
   const now = new Date();
   const isToday = date.toDateString() === now.toDateString();
@@ -71,25 +106,15 @@ function formatTime(timestamp: number): string {
   yesterday.setDate(yesterday.getDate() - 1);
   const isYesterday = date.toDateString() === yesterday.toDateString();
 
-  const time = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const time = fmt.formatTime(timestamp);
 
-  if (isToday) return `Today at ${time}`;
-  if (isYesterday) return `Yesterday at ${time}`;
-  return `${date.toLocaleDateString()} ${time}`;
+  if (isToday) return t('common:time.today', { time });
+  if (isYesterday) return t('common:time.yesterday', { time });
+  return fmt.formatDateTime(timestamp);
 }
 
 function formatHoverTime(timestamp: number): string {
-  return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-}
-
-/** Lightweight inline renderer that resolves <@userId> mentions to MentionBadge components. */
-function renderInlineWithMentions(content: string): React.ReactNode {
-  const parts = content.split(/(<@[a-zA-Z0-9_-]+>)/g);
-  return parts.map((part, i) => {
-    const match = part.match(/^<@([a-zA-Z0-9_-]+)>$/);
-    if (match) return <MentionBadge key={i} userId={match[1]!} />;
-    return part;
-  });
+  return formatters.formatTime(timestamp);
 }
 
 const GIF_URL_REGEX = /^https:\/\/(?:media\.tenor\.com|static\.klipy\.com)\/.+$/;
@@ -118,22 +143,41 @@ function getImageEmbedSourceUrl(content: string | null, embeds: Embed[]): string
 }
 
 export function Message({ message, isCompact, isFirstInGroup, previousMessageId }: MessageProps) {
-  const [isEditing, setIsEditing] = useState(false);
+  const { t } = useTranslation(['chat', 'common']);
+  const fmt = useFormatters();
   const [editContent, setEditContent] = useState(message.content ?? '');
   const [isHovered, setIsHovered] = useState(false);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [showReactionPicker, setShowReactionPicker] = useState(false);
   const confirmDeleteTimeout = useRef<ReturnType<typeof setTimeout>>();
+  const editTextareaRef = useRef<HTMLTextAreaElement>(null);
   const reactionPickerBtnRef = useRef<HTMLButtonElement>(null);
   const reactionPickerRef = useRef<HTMLDivElement>(null);
   const currentUser = useAuthStore((s) => s.user);
   const editMessage = useChatStore((s) => s.editMessage);
+  const editingMessageId = useChatStore((s) => s.editingMessageId);
+  const setEditingMessage = useChatStore((s) => s.setEditingMessage);
   const deleteMessage = useChatStore((s) => s.deleteMessage);
   const members = useSpaceStore((s) => s.members);
   const openUserProfile = useUIStore((s) => s.openUserProfile);
+  const jumpToMessage = useMessageJump();
 
   const pending = isPendingMessage(message) ? message.__pending : null;
   const showInteractions = !pending;
+  const isEditing = !pending && editingMessageId === message.id;
+
+  useEffect(() => {
+    if (!isEditing) return;
+    const content = message.content ?? '';
+    setEditContent(content);
+    const frame = requestAnimationFrame(() => {
+      const textarea = editTextareaRef.current;
+      if (!textarea) return;
+      textarea.focus();
+      textarea.setSelectionRange(content.length, content.length);
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [isEditing, message.content]);
 
   const transfersForRow = useTransferStore((s) => s.transfers);
   const inMemoryFiles = useTransferStore((s) => s.hasInMemoryFile);
@@ -157,6 +201,17 @@ export function Message({ message, isCompact, isFirstInGroup, previousMessageId 
     ? message.channelId || message.dmChannelId || ''
     : message.channelId || (message as MessageWithUser & { dmChannelId?: string }).dmChannelId || '';
   const isAuthor = isSelf(message.user, currentUser);
+  // The channel whose origin issued this message's ids; mentions resolve there.
+  const mentionChannelId = channelKey || null;
+  const selfIdHere = useSelfIdInChannel(mentionChannelId);
+  const startEditing = () => {
+    setEditContent(message.content ?? '');
+    setEditingMessage(message.id);
+  };
+  const stopEditing = () => {
+    setEditContent(message.content ?? '');
+    setEditingMessage(null);
+  };
   const channelPermissions = useSpaceStore((s) => s.channelPermissions);
   const myChPerms = channelPermissions.get(message.channelId);
   const isDmMessage = isPendingMessage(message)
@@ -189,13 +244,10 @@ export function Message({ message, isCompact, isFirstInGroup, previousMessageId 
   const _rawReplyUser = (!isPendingMessage(message) && message.replyTo?.user) ? message.replyTo.user : null;
   const _canonicalReplyUser = useCanonicalUserView(_rawReplyUser ?? _FALLBACK_USER);
 
-  const isOwnReaction = (r: { userId: string; user?: { id: string; username: string; homeInstance?: string | null } | null }) =>
-    r.user ? isSelf(r.user, currentUser) : r.userId === currentUser?.id;
-
   const toggleReaction = (emoji: string) => {
     // Read-only: a dead 1-on-1 DM accepts no reaction mutations (add OR remove).
     if (isDeadDmThread) return;
-    const hasReacted = message.reactions?.some(r => isOwnReaction(r) && r.emoji === emoji);
+    const hasReacted = message.reactions?.some(r => isOwnReaction(r, currentUser) && r.emoji === emoji);
     if (hasReacted) {
       removeReaction(message.id, emoji);
     } else if (canAddReactions) {
@@ -203,15 +255,13 @@ export function Message({ message, isCompact, isFirstInGroup, previousMessageId 
     }
   };
 
-  const reactionGroups = (message.reactions || []).reduce((acc, r) => {
-    const group = acc[r.emoji] || { count: 0, me: false };
-    group.count++;
-    if (isOwnReaction(r)) {
-      group.me = true;
-    }
-    acc[r.emoji] = group;
-    return acc;
-  }, {} as Record<string, { count: number; me: boolean }>);
+  // Reactions grouped by emoji, in the order each emoji first appeared.
+  const reactionGroups = new Map<string, Reaction[]>();
+  for (const r of message.reactions || []) {
+    const group = reactionGroups.get(r.emoji);
+    if (group) group.push(r);
+    else reactionGroups.set(r.emoji, [r]);
+  }
 
   // Auto-cancel delete confirmation after timeout
   const startDeleteConfirm = useCallback(() => {
@@ -262,16 +312,6 @@ export function Message({ message, isCompact, isFirstInGroup, previousMessageId 
     addReaction(message.id, emoji.native);
     setShowReactionPicker(false);
   }, [addReaction, message.id]);
-
-  const handleUsernameClick = (e: React.MouseEvent) => {
-    if (!message.user) return;
-    e.stopPropagation();
-    const rect = e.currentTarget.getBoundingClientRect();
-    openUserProfile(message.user, {
-      top: Math.min(rect.top, window.innerHeight - 450),
-      left: rect.right + 16,
-    });
-  };
 
   const handleContextMenu = (e: React.MouseEvent) => {
     if (pending) {
@@ -328,10 +368,7 @@ export function Message({ message, isCompact, isFirstInGroup, previousMessageId 
       canSendMessages,
       canManageMessages,
       onReply: () => setReplyTo(message),
-      onEdit: () => {
-        setEditContent(message.content ?? '');
-        setIsEditing(true);
-      },
+      onEdit: startEditing,
       onDelete: () => deleteMessage(message.id, channelKey),
       onReaction: (emoji: string) => toggleReaction(emoji),
       onOpenEmojiPicker: () => {
@@ -351,12 +388,11 @@ export function Message({ message, isCompact, isFirstInGroup, previousMessageId 
       e.preventDefault();
       if (editContent.trim()) {
         await editMessage(message.id, editContent.trim(), channelKey);
-        setIsEditing(false);
+        setEditingMessage(null);
       }
     }
     if (e.key === 'Escape') {
-      setIsEditing(false);
-      setEditContent(message.content ?? '');
+      stopEditing();
     }
   };
 
@@ -367,7 +403,7 @@ export function Message({ message, isCompact, isFirstInGroup, previousMessageId 
   const displayIdentity = (!isSelf(_resolvedIdentity, currentUser) && _rawMsgUser)
     ? _canonicalMsgUser
     : _resolvedIdentity;
-  const displayName = displayIdentity.displayName ?? displayIdentity.username;
+  const displayName = userDisplayName(displayIdentity);
 
   const spaces = useSpaceStore((s) => s.spaces);
   const currentSpaceId = useSpaceStore((s) => s.currentSpaceId);
@@ -386,15 +422,30 @@ export function Message({ message, isCompact, isFirstInGroup, previousMessageId 
 
   const roleColor = getMemberDisplayColor(message.userId);
 
+  // A space message's author is a member of the space it was posted in; the
+  // profile opened from it shows their roles there. message.userId is the id
+  // on the space's instance, the same id the loaded member list carries.
+  const authorMember = !isDmMessage && currentSpaceId
+    ? { spaceId: currentSpaceId, userId: message.userId }
+    : undefined;
+
+  const handleUsernameClick = (e: React.MouseEvent) => {
+    if (!message.user) return;
+    e.stopPropagation();
+    openUserProfile(message.user, e.currentTarget.getBoundingClientRect(), undefined, authorMember);
+  };
+
   const replyRoleColor = (msg: { userId: string }) => getMemberDisplayColor(msg.userId);
 
-  // Self-mention highlighting
-  const isMentioned = currentUser && message.content?.includes('<@' + currentUser.id + '>');
+  // Self-mention highlighting. A token carries an id on the channel's origin,
+  // so "me" is my id there, not my home id (#332). Tokens inside code are not
+  // mentions (the shared scan in utils/mentionTokens.ts).
+  const isMentioned = !!selfIdHere && !!message.content && contentMentionsAny(message.content, new Set([selfIdHere]));
 
   const content = (
     <div
       id={`msg-${message.id}`}
-      className={`group relative flex gap-4 px-5 py-[3px] transition-colors ${isFirstInGroup || message.replyTo ? 'mt-[1.0625rem]' : ''} ${
+      className={`group relative flex gap-4 px-5 py-[3px] transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent-primary/60 ${isFirstInGroup || message.replyTo ? 'mt-[1.0625rem]' : ''} ${
         isMentioned
           ? 'bg-accent-amber/10 border-l-2 border-l-accent-amber hover:bg-accent-amber/15'
           : 'hover:bg-[rgba(255,255,255,0.025)]'
@@ -417,11 +468,12 @@ export function Message({ message, isCompact, isFirstInGroup, previousMessageId 
       <div className="w-10 flex-shrink-0 flex items-start justify-start">
         {isFirstInGroup || message.replyTo ? (
           <div className="mt-0.5">
-            <Avatar
+            <ProfileAvatar
               src={displayIdentity.avatar}
               name={displayName}
               size={40}
               user={displayIdentity}
+              member={authorMember}
               className="hover:drop-shadow-md transition-all active:translate-y-[1px]"
             />
           </div>
@@ -435,37 +487,54 @@ export function Message({ message, isCompact, isFirstInGroup, previousMessageId 
       {/* Content */}
       <div className="flex-1 min-w-0">
         {message.replyTo && (() => {
-          const _rawReply = resolveDisplayIdentity(message.replyTo.user, currentUser);
+          const replyTo = message.replyTo;
+          const _rawReply = resolveDisplayIdentity(replyTo.user, currentUser);
           const replyIdentity = (!isSelf(_rawReply, currentUser) && _rawReplyUser)
             ? _canonicalReplyUser
             : _rawReply;
-          const replyDisplayName = replyIdentity.displayName ?? replyIdentity.username;
-          return (
-            <div className="flex items-center gap-1 mb-1 ml-[-4px] opacity-80 hover:opacity-100 cursor-pointer group/reply">
+          const replyDisplayName = userDisplayName(replyIdentity);
+          const preview = (
+            <>
               <Avatar src={replyIdentity.avatar} name={replyDisplayName} size={16} user={replyIdentity} />
-              <Username
-                username={replyDisplayName}
-                className="text-[14px] font-bold text-txt-primary hover:underline"
-                style={replyRoleColor(message.replyTo)}
+              <PersonName
+                name={replyDisplayName}
+                person={replyIdentity}
+                className="text-[14px] font-bold text-txt-primary"
+                style={replyRoleColor(replyTo)}
               />
-              <span className="text-[14px] text-txt-message truncate max-w-[400px] hover:text-txt-primary">
-                {message.replyTo.content ? renderInlineWithMentions(message.replyTo.content) : ''}
+              <span className="text-[14px] text-txt-message truncate max-w-[400px] group-hover/reply:text-txt-primary transition-colors">
+                {replyTo.content ? <InlineMessageText content={replyTo.content} channelId={mentionChannelId} /> : ''}
               </span>
-            </div>
+            </>
+          );
+          // Outside a message list (no jump handle) the preview stays inert.
+          if (!jumpToMessage) {
+            return <div className="flex items-center gap-1 mb-1 ml-[-4px] opacity-80 min-w-0">{preview}</div>;
+          }
+          return (
+            <button
+              type="button"
+              onClick={() => jumpToMessage(replyTo.id)}
+              className="group/reply flex items-center gap-1 max-w-full min-w-0 mb-1 ml-[-8px] pl-1 pr-1.5 rounded-md text-left opacity-80 hover:opacity-100 focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-accent-primary/60 transition-opacity cursor-pointer"
+            >
+              <span className="sr-only">{t('chat:message.reply.jump')}</span>
+              {preview}
+            </button>
           );
         })()}
 
         {(isFirstInGroup || message.replyTo) && (
           <div className="flex items-baseline gap-2 mb-0.5">
             <span onClick={handleUsernameClick}>
-              <Username
-                username={displayName}
+              <PersonName
+                name={displayName}
+                person={displayIdentity}
                 className="font-semibold cursor-pointer hover:underline text-[15px] leading-tight"
                 style={roleColor}
               />
             </span>
             <span className="text-[11px] text-txt-tertiary leading-tight hover:cursor-default">
-              {formatTime(message.createdAt)}
+              {formatMessageTimestamp(t, fmt, message.createdAt)}
             </span>
           </div>
         )}
@@ -473,6 +542,7 @@ export function Message({ message, isCompact, isFirstInGroup, previousMessageId 
         {isEditing ? (
           <div className="mt-1 w-full">
             <textarea
+              ref={editTextareaRef}
               value={editContent}
               onChange={(e) => setEditContent(e.target.value)}
               onKeyDown={handleEditSubmit}
@@ -481,13 +551,24 @@ export function Message({ message, isCompact, isFirstInGroup, previousMessageId 
               autoFocus
             />
             <p className="text-[12px] text-txt-tertiary mt-1.5 ml-1">
-              escape to <button onClick={() => setIsEditing(false)} className="text-txt-link hover:underline">cancel</button>
-              {' '}&bull; enter to <button onClick={() => {
-                if (editContent.trim()) {
-                  editMessage(message.id, editContent.trim(), channelKey);
-                  setIsEditing(false);
-                }
-              }} className="text-txt-link hover:underline">save</button>
+              <Trans
+                t={t}
+                i18nKey="chat:message.edit.hint"
+                components={{ // i18n-check: allow-literal (the next line is an object key after a JSX element, not text)
+                  cancel: <button onClick={stopEditing} className="text-txt-link hover:underline" />,
+                  save: (
+                    <button
+                      onClick={() => {
+                        if (editContent.trim()) {
+                          editMessage(message.id, editContent.trim(), channelKey);
+                          setEditingMessage(null);
+                        }
+                      }}
+                      className="text-txt-link hover:underline"
+                    />
+                  ),
+                }}
+              />
             </p>
           </div>
         ) : (
@@ -496,7 +577,7 @@ export function Message({ message, isCompact, isFirstInGroup, previousMessageId 
               <div className="mt-1 max-w-[400px]">
                 <img
                   src={message.content!.trim()}
-                  alt="GIF"
+                  alt={t('chat:message.gifAlt')}
                   className="max-w-full max-h-[300px] rounded-lg"
                   loading="lazy"
                 />
@@ -512,16 +593,16 @@ export function Message({ message, isCompact, isFirstInGroup, previousMessageId 
                   </div>
                 )}
                 {message.editedAt && (
-                  <span className="text-[10px] text-txt-tertiary select-none font-medium">(edited)</span>
+                  <span className="text-[10px] text-txt-tertiary select-none font-medium">{t('chat:message.edited')}</span>
                 )}
               </>
             ) : (
               <>
                 {message.content && (
                   <div className="text-txt-message text-[15px] leading-[1.5] break-words whitespace-pre-wrap selection:bg-accent-primary/30">
-                    <MarkdownRenderer content={message.content} />
+                    <MarkdownRenderer content={message.content} channelId={mentionChannelId} />
                     {message.editedAt && (
-                      <span className="text-[10px] text-txt-tertiary ml-1 select-none font-medium">(edited)</span>
+                      <span className="text-[10px] text-txt-tertiary ml-1 select-none font-medium">{t('chat:message.edited')}</span>
                     )}
                   </div>
                 )}
@@ -557,7 +638,7 @@ export function Message({ message, isCompact, isFirstInGroup, previousMessageId 
                   <svg width="13" height="13" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
                     <path fillRule="evenodd" d="M10 2a8 8 0 100 16 8 8 0 000-16zm0 4a.875.875 0 01.875.875v4a.875.875 0 11-1.75 0v-4A.875.875 0 0110 6zm0 8.25a1 1 0 100-2 1 1 0 000 2z" clipRule="evenodd" />
                   </svg>
-                  Upload failed
+                  {t('chat:message.upload.failed')}
                 </span>
                 <span className="w-px h-3.5 bg-accent-rose/25" aria-hidden="true" />
                 {canRetry && (
@@ -577,7 +658,7 @@ export function Message({ message, isCompact, isFirstInGroup, previousMessageId 
                     }}
                     className="px-2 py-0.5 rounded-md text-[11.5px] font-medium text-accent-mint bg-accent-mint/10 hover:bg-accent-mint/20 transition-colors"
                   >
-                    Retry
+                    {t('common:actions.retry')}
                   </button>
                 )}
                 <button
@@ -602,26 +683,21 @@ export function Message({ message, isCompact, isFirstInGroup, previousMessageId 
                   }}
                   className="px-2 py-0.5 rounded-md text-[11.5px] font-medium text-txt-secondary bg-surface-channel/50 hover:bg-accent-rose/15 hover:text-accent-rose transition-colors"
                 >
-                  Discard
+                  {t('chat:message.upload.discard')}
                 </button>
               </div>
             )}
 
             {/* Reactions */}
-            {showInteractions && Object.keys(reactionGroups).length > 0 && (
+            {showInteractions && reactionGroups.size > 0 && (
               <div className="flex flex-wrap gap-1">
-                {Object.entries(reactionGroups).map(([emoji, { count, me }]) => (
-                  <button
+                {[...reactionGroups].map(([emoji, reactions]) => (
+                  <ReactionPill
                     key={emoji}
-                    onClick={() => toggleReaction(emoji)}
-                    className={`glass-pill flex items-center gap-1 rounded-[6px] cursor-pointer transition-all duration-[120ms] ease-out ${
-                      me ? 'glass-pill-mine' : ''
-                    }`}
-                    style={{ padding: '2px 8px', fontSize: '13px', lineHeight: 1 }}
-                  >
-                    <span style={{ fontSize: '14px', lineHeight: 1 }}>{emoji}</span>
-                    <span className={`font-semibold ${me ? 'text-accent-mint' : 'text-txt-secondary'}`} style={{ fontSize: '12px' }}>{count}</span>
-                  </button>
+                    emoji={emoji}
+                    reactions={reactions}
+                    onToggle={() => toggleReaction(emoji)}
+                  />
                 ))}
               </div>
             )}
@@ -634,8 +710,8 @@ export function Message({ message, isCompact, isFirstInGroup, previousMessageId 
         const PICKER_HEIGHT = 400;
         const PICKER_WIDTH = 360;
         const MARGIN = 8;
-        const btnRect = reactionPickerBtnRef.current!.getBoundingClientRect();
-        const spaceBelow = window.innerHeight - btnRect.bottom;
+        const btnRect = layoutRect(reactionPickerBtnRef.current!.getBoundingClientRect());
+        const spaceBelow = layoutPixels(window.innerHeight) - btnRect.bottom;
         const spaceAbove = btnRect.top;
         const flipAbove = spaceBelow < (PICKER_HEIGHT + MARGIN) && spaceAbove > spaceBelow;
         const top = flipAbove
@@ -643,7 +719,7 @@ export function Message({ message, isCompact, isFirstInGroup, previousMessageId 
           : btnRect.bottom + MARGIN;
         const left = Math.min(
           Math.max(MARGIN, btnRect.left),
-          window.innerWidth - PICKER_WIDTH - MARGIN,
+          layoutPixels(window.innerWidth) - PICKER_WIDTH - MARGIN,
         );
         return createPortal(
           <div
@@ -679,7 +755,7 @@ export function Message({ message, isCompact, isFirstInGroup, previousMessageId 
                 className={`p-1 hover:bg-interactive-hover rounded transition-colors text-[14px] leading-none ${
                   showReactionPicker ? 'text-accent-primary' : 'text-txt-tertiary hover:text-txt-secondary'
                 }`}
-                title="Add reaction"
+                title={t('common:actions.addReaction')}
               >
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
                   <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8zm1-13h-2v4H7v2h4v4h2v-4h4v-2h-4V7z" />
@@ -690,7 +766,7 @@ export function Message({ message, isCompact, isFirstInGroup, previousMessageId 
           <button
             onClick={() => setReplyTo(message)}
             className="px-2 h-full text-txt-tertiary hover:text-txt-primary hover:bg-interactive-hover transition-all flex items-center justify-center"
-            title="Reply"
+            title={t('common:actions.reply')}
           >
             <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
               <path d="M10 9V5L3 12L10 19V14.9C15 14.9 18.5 16.5 21 20C20 15 17 10 10 9Z" />
@@ -698,12 +774,9 @@ export function Message({ message, isCompact, isFirstInGroup, previousMessageId 
           </button>
           {isAuthor && (
             <button
-              onClick={() => {
-                setEditContent(message.content ?? '');
-                setIsEditing(true);
-              }}
+              onClick={startEditing}
               className="px-2 h-full text-txt-tertiary hover:text-txt-primary hover:bg-interactive-hover transition-all flex items-center justify-center"
-              title="Edit"
+              title={t('common:actions.edit')}
             >
               <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
                 <path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.07.62-.07.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z" />
@@ -725,7 +798,7 @@ export function Message({ message, isCompact, isFirstInGroup, previousMessageId 
                   ? 'bg-green-500/20 text-green-400'
                   : 'text-txt-tertiary hover:text-txt-danger hover:bg-interactive-hover'
               }`}
-              title={confirmingDelete ? 'Confirm delete' : 'Delete'}
+              title={confirmingDelete ? t('chat:message.actions.confirmDelete') : t('common:actions.delete')}
             >
               {/* Trash icon */}
               <svg

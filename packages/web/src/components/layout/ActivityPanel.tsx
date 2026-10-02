@@ -1,9 +1,9 @@
 import React, { useEffect, useMemo } from 'react';
-import { useSocialStore } from '../../stores/socialStore';
+import { useTranslation } from 'react-i18next';
+import { useSocialStore, type TaggedFriend } from '../../stores/socialStore';
 import { useUIStore } from '../../stores/uiStore';
-import { useActivityStore } from '../../stores/activityStore';
+import { useActivityStore, activitiesFor } from '../../stores/activityStore';
 import { Avatar } from '../ui/Avatar';
-import { Username } from '../ui/Username';
 import { ActivityCard, hasRichActivity, getActivityAccentClass } from '../ui/ActivityCard';
 import type { Friend, Activity, User } from '@backspace/shared';
 import { getPrimaryActivity } from '@backspace/shared/src/activities.js';
@@ -48,10 +48,7 @@ function ActivityFriendRow({
         avatarColor={canonical.avatarColor}
       />
       <div className="flex-1 min-w-0">
-        <Username
-          username={friendDisplayName}
-          className={`text-[13.5px] leading-[1.2] font-medium truncate ${isOffline ? 'text-txt-tertiary' : 'text-txt-primary'}`}
-        />
+        <span className={`text-[13.5px] leading-[1.2] font-medium truncate ${isOffline ? 'text-txt-tertiary' : 'text-txt-primary'}`}>{friendDisplayName}</span>
         {!isOffline && isFederationGlobeApplicable(canonical) && (
           <div className="text-[10px] leading-[1.3] text-txt-tertiary truncate opacity-60">@{parseFederatedUsername(canonical.username).domain}</div>
         )}
@@ -67,6 +64,7 @@ function ActivityFriendRow({
 }
 
 export function ActivityPanel() {
+  const { t } = useTranslation(['social', 'common']);
   const friends = useSocialStore((s) => s.friends);
   const loadFriends = useSocialStore((s) => s.loadFriends);
   const memberListOpen = useUIStore((s) => s.memberListOpen);
@@ -78,16 +76,16 @@ export function ActivityPanel() {
   }, [loadFriends]);
 
   const { activeFriends, onlineFriends, offlineFriends } = useMemo(() => {
-    const active: Friend[] = [];
-    const online: Friend[] = [];
-    const offline: Friend[] = [];
+    const active: TaggedFriend[] = [];
+    const online: TaggedFriend[] = [];
+    const offline: TaggedFriend[] = [];
 
     for (const f of friends) {
       if (f.status === 'offline') {
         offline.push(f);
         continue;
       }
-      const activities = userActivities.get(f.homeUserId ?? f.id) ?? [];
+      const activities = activitiesFor(userActivities, f, f._instanceOrigin);
       const primary = getPrimaryActivity(activities);
       // Active = has a non-custom activity (playing, listening, watching, streaming)
       if (primary && primary.type !== 'custom') {
@@ -104,7 +102,6 @@ export function ActivityPanel() {
 
   const handleFriendClick = (e: React.MouseEvent, friend: Friend) => {
     e.stopPropagation();
-    const rect = e.currentTarget.getBoundingClientRect();
     openUserProfile(
       {
         id: friend.id,
@@ -123,15 +120,13 @@ export function ActivityPanel() {
         isAdmin: false,
         replicatedInstances: [],
       },
-      {
-        top: Math.min(rect.top, window.innerHeight - 450),
-        left: rect.left - 316,
-      }
+      e.currentTarget.getBoundingClientRect(),
+      'left',
     );
   };
 
-  const renderFriend = (friend: Friend, isOffline = false) => {
-    const activities = userActivities.get(friend.homeUserId ?? friend.id) ?? [];
+  const renderFriend = (friend: TaggedFriend, isOffline = false) => {
+    const activities = activitiesFor(userActivities, friend, friend._instanceOrigin);
     const isRichActivity = !isOffline && hasRichActivity(activities);
     const primary = getPrimaryActivity(activities);
     const accentClass = primary ? getActivityAccentClass(primary.type) : '';
@@ -149,15 +144,15 @@ export function ActivityPanel() {
   };
 
   return (
-    <div className="w-60 bg-surface-channel flex-shrink-0 overflow-y-auto select-none no-scrollbar hidden md:block border-l border-border-hard">
+    <div className="w-60 bg-surface-channel flex-shrink-0 overflow-y-auto select-none no-scrollbar hidden desktop:block border-l border-border-hard">
       <div className="p-3">
-        <h3 className="text-[20px] font-bold text-txt-primary mb-4 px-2">Active Now</h3>
+        <h3 className="text-[20px] font-bold text-txt-primary mb-4 px-2">{t('social:activity.title')}</h3>
 
         {activeFriends.length === 0 && onlineFriends.length === 0 && offlineFriends.length === 0 ? (
           <div className="text-center py-8">
-            <div className="text-[16px] font-bold text-txt-primary mb-1">It's quiet for now...</div>
+            <div className="text-[16px] font-bold text-txt-primary mb-1">{t('social:activity.quietTitle')}</div>
             <div className="text-[14px] text-txt-tertiary max-w-[200px] mx-auto">
-              When a friend starts an activity&#8212;like playing a game or hanging out on voice&#8212;we'll show it here!
+              {t('social:activity.quietDescription')}
             </div>
           </div>
         ) : (
@@ -170,7 +165,7 @@ export function ActivityPanel() {
             {onlineFriends.length > 0 && (
               <div className="mb-4">
                 <h3 className="text-[10.5px] font-bold text-txt-tertiary uppercase tracking-[0.06em] px-2 mb-1">
-                  ONLINE — {onlineFriends.length}
+                  {t('social:activity.online', { n: onlineFriends.length })}
                 </h3>
                 {onlineFriends.map(f => renderFriend(f))}
               </div>
@@ -178,7 +173,7 @@ export function ActivityPanel() {
             {offlineFriends.length > 0 && (
               <div>
                 <h3 className="text-[10.5px] font-bold text-txt-tertiary uppercase tracking-[0.06em] px-2 mb-1">
-                  OFFLINE — {offlineFriends.length}
+                  {t('social:activity.offline', { n: offlineFriends.length })}
                 </h3>
                 {offlineFriends.map(f => renderFriend(f, true))}
               </div>

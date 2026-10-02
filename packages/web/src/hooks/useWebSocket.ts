@@ -1,6 +1,6 @@
 import React, { useEffect, useRef } from 'react';
 import { useAuthStore } from '../stores/authStore';
-import { useSpaceStore, getChannelOrigin, getMyUserIdForOrigin, setMyUserIdForOrigin, resolveDmChannelId } from '../stores/spaceStore';
+import { useSpaceStore, getChannelOrigin, getMyUserIdForOrigin, setMyUserIdForOrigin } from '../stores/spaceStore';
 import { useChatStore } from '../stores/chatStore';
 import { useVoiceStore } from '../stores/voiceStore';
 import { useSocialStore } from '../stores/socialStore';
@@ -9,13 +9,17 @@ import type { ServerEvent, ClientEvent, ActiveCallInfo, Activity, User } from '@
 import { resolveAssetUrl, normalizeUserAssets, normalizeMessageAssets } from '../utils/assetUrls';
 import { broadcastVoiceStatus, broadcastDeafenViaLiveKit } from '../utils/voice';
 import { applySpaceVoiceState } from '../utils/voiceStateSync';
-import { sortDmChannels } from '../utils/dmSorting';
+import { applyIncomingDmMessage, applyIncomingDmChannel } from '../utils/dmMessageRouting';
 import { registerSelfId } from '../utils/identity';
+import { ownStatusReport, statusToAssertOnRemote } from '../utils/selfStatus';
 import { getActiveRoom } from './useLiveKit';
 import { useUIStore } from '../stores/uiStore';
 import { useActivityStore } from '../stores/activityStore';
+import { presenceSubjectOf, readyActivityEntries, readyRowIndex } from '../utils/presenceSubject';
 import { useDiscoverStore } from '../stores/discoverStore';
 import { useFederationStore } from '../stores/federationStore';
+import { detectClientKind } from '../platform/clientKind';
+import { ConnectionState as LiveKitConnectionState } from 'livekit-client';
 
 // ─── Rejected peer origins (for unreachable member indicators) ───────────────
 const rejectedPeerOrigins = new Set<string>();
@@ -162,12 +166,24 @@ export function teardownDmCall(): void {
   if (voice.disconnectFn && !voice.currentVoiceChannelId) voice.disconnectFn();
 }
 
+/**
+ * Whether `spaceId`, as `origin` issued it, is the space whose roster
+ * `spaceStore.members` holds: the open space (`loadSpaceDetail` sets both).
+ * `members` is one space's roster, so a join or leave in any other space, or
+ * in a space of the same id on another instance, is not about it.
+ */
+function isLoadedRosterSpace(spaceId: string, origin: string): boolean {
+  const { currentSpaceId, spaces } = useSpaceStore.getState();
+  if (spaceId !== currentSpaceId) return false;
+  return (spaces.find(s => s.id === spaceId)?._instanceOrigin ?? '') === origin;
+}
+
 function handleEvent(origin: string, event: ServerEvent): void {
   const isHome = origin === HOME_ORIGIN;
   const { setUser } = useAuthStore.getState();
-  const { populateFromReady, loadSpaceDetail, currentSpaceId, updateMemberPresence, addMember, removeMember, addDmChannel, removeDmChannel, upsertUserView } = useSpaceStore.getState();
+  const { populateFromReady, loadSpaceDetail, currentSpaceId, updateMemberPresence, addMember, removeMember, removeDmChannel, upsertUserView } = useSpaceStore.getState();
   const { addMessage, addRealtimeMessage, updateMessage, removeMessage, setTyping, clearTyping, onReactionAdded, onReactionRemoved } = useChatStore.getState();
-  const { addVoiceUser, removeVoiceUser, clearVoiceUsersForOrigin, setVoiceUsers, setVoiceUserStatus, clearVoiceUserStatus } = useVoiceStore.getState();
+  const { addVoiceUser, removeVoiceUser, clearVoiceUsersForOrigin, setVoiceUsers, setVoiceChannelElapsedSeconds, setVoiceUserStatus, clearVoiceUserStatus } = useVoiceStore.getState();
 
   switch (event.type) {
     case 'ready':
@@ -179,6 +195,15 @@ function handleEvent(origin: string, event: ServerEvent): void {
         useSettingsStore.getState().setIsAdmin(event.user.isAdmin ?? false);
         useSettingsStore.getState().fetchStreamingLimits();
         useSettingsStore.getState().fetchGifEnabled();
+        // Whose acknowledgements to read: the store cannot import authStore
+        // without dragging the audio pipeline into every settings test.
+        useSettingsStore.getState().setUpdateAckUser(event.user.id);
+        // This is what moved the release lookup off the Updates panel: the dot
+        // has to be able to appear before an admin ever navigates there. Gated
+        // on the flag this event just delivered, not on store state.
+        if (event.user.isAdmin === true) {
+          void useSettingsStore.getState().fetchUpdateStatus();
+        }
       }
 
       // Normalize asset URLs for remote origins before dispatching to stores
@@ -194,11 +219,27 @@ function handleEvent(origin: string, event: ServerEvent): void {
         }
       }
 
+      // The DM part goes through the merge module, whose pin rule moves a
+      // conversation first listed from a sibling to its home copy.
       populateFromReady(origin, event.spaces, event.folders, event.dmChannels, event.spaceLayout, event.layoutUpdatedAt);
 
       // Cache authoritative identity for this origin (federation-safe)
       if (!isHome) {
         setMyUserIdForOrigin(origin, event.user.id);
+      }
+
+      // The user's own chosen status (utils/selfStatus.ts): take it from this
+      // socket when it is the owner's report (the true home, for a session on
+      // a replicated row), and re-send it to this remote when this session owns
+      // the choice and the remote account is the same federated identity.
+      {
+        const authUser = useAuthStore.getState().user;
+        const report = ownStatusReport(authUser, { origin, isHome }, { userId: event.user.id, status: event.user.status });
+        if (report) useAuthStore.getState().applyOwnStatus(report);
+        if (!isHome) {
+          const status = statusToAssertOnRemote(authUser, event.user, window.location.host);
+          if (status) wsSend({ type: 'presence_update', status }, origin);
+        }
       }
 
       // Mark remote instance as connected in instanceStore
@@ -285,9 +326,19 @@ function handleEvent(origin: string, event: ServerEvent): void {
           setVoiceUsers(channelId, userIds);
         }
       }
-      // Initialize activity data from ready payload
-      if (event.userActivities) {
-        useActivityStore.getState().initActivities(event.userActivities);
+      if (event.voiceChannelElapsedSeconds) {
+        for (const [channelId, elapsedSeconds] of Object.entries(event.voiceChannelElapsedSeconds)) {
+          setVoiceChannelElapsedSeconds(channelId, elapsedSeconds);
+        }
+      }
+      // Activity data from the ready payload: this origin's full snapshot,
+      // replacing whatever it reported before the reconnect.
+      {
+        const olderServerRows = readyRowIndex(event);
+        useActivityStore.getState().setOriginRows(origin, olderServerRows);
+        if (event.userActivities) {
+          useActivityStore.getState().initActivities(readyActivityEntries(event), origin, olderServerRows);
+        }
       }
       if (event.user.showActivity !== undefined) {
         useActivityStore.setState({ showActivity: event.user.showActivity });
@@ -379,13 +430,36 @@ function handleEvent(origin: string, event: ServerEvent): void {
           if (voiceOrigin === origin) {
             const serverKnowsUs = event.voiceStates?.[currentVoiceChannelId]?.includes(event.user.id);
             if (!serverKnowsUs) {
-              // leaveVoice() clears currentVoiceChannelId first to prevent
-              // AppLayout from auto-reconnecting (disconnect() fires with
-              // CLIENT_INITIATED which skips handleForceDisconnect).
-              useVoiceStore.getState().leaveVoice();
-              getActiveRoom()?.disconnect();
+              const activeRoom = getActiveRoom();
+              const localStatus = useVoiceStore.getState().voiceConnectionStatus;
+              const recoverable = localStatus === 'connecting'
+                || localStatus === 'reconnecting'
+                || (activeRoom != null && (
+                  activeRoom.state === LiveKitConnectionState.Connected
+                  || activeRoom.state === LiveKitConnectionState.Connecting
+                  || activeRoom.state === LiveKitConnectionState.Reconnecting
+                ));
+              if (recoverable) {
+                // A ready snapshot can race the new socket's voice
+                // registration. Reassert the session and keep LiveKit's own
+                // reconnect machinery and local media intent intact.
+                wsSend({ type: 'voice_join', channelId: currentVoiceChannelId }, origin);
+                broadcastVoiceStatus(origin);
+              }
+              // A completed network disconnect intentionally retains the
+              // channel ID for the Retry action. Absence from a ready snapshot
+              // alone is not a terminal refusal, so leave that intent intact.
             }
           }
+        }
+      }
+
+      // Active DM calls do not use voice_join. Re-sending voice_status lets the
+      // server bind the new socket while its DM participant is still in grace.
+      {
+        const state = useVoiceStore.getState();
+        if (state.activeDmCall && (state.callOrigin || getChannelOrigin(state.activeDmCall.dmChannelId)) === origin) {
+          broadcastVoiceStatus(origin);
         }
       }
 
@@ -536,13 +610,23 @@ function handleEvent(origin: string, event: ServerEvent): void {
       break;
     }
 
-    case 'presence_update':
-      updateMemberPresence(event.userId, event.status);
-      useSocialStore.getState().updateFriendPresence(event.userId, event.status);
+    case 'presence_update': {
+      // The owner's report of the user's own status, e.g. a change made on
+      // another device (utils/selfStatus.ts); feeds the alert gate.
+      const report = ownStatusReport(useAuthStore.getState().user, { origin, isHome }, event);
+      if (report) useAuthStore.getState().applyOwnStatus(report);
+      // Members, friends and activities are keyed by the subject's home
+      // identity, so a replicated row's delivery and the home's native
+      // delivery agree (#340), and a same-id row of another instance is not
+      // mistaken for them.
+      const subject = presenceSubjectOf(event, origin);
+      updateMemberPresence(subject, origin, event.status);
+      useSocialStore.getState().updateFriendPresence(subject, origin, event.status);
       if (event.activities) {
-        useActivityStore.getState().setUserActivities(event.userId, event.activities);
+        useActivityStore.getState().setUserActivities(subject, origin, event.activities);
       }
       break;
+    }
 
     case 'user_updated': {
       if (!isHome) normalizeUserAssets(event.user, origin);
@@ -562,12 +646,17 @@ function handleEvent(origin: string, event: ServerEvent): void {
         }
         setUser(event.user);
       }
+      {
+        // The true home's row of a replicated session carries the choice too.
+        const report = ownStatusReport(useAuthStore.getState().user, { origin, isHome }, { userId: event.user.id, status: event.user.status });
+        if (report) useAuthStore.getState().applyOwnStatus(report);
+      }
 
       // Deleted user cleanup: remove from caches the existing pipeline doesn't cover
       if (event.user.isDeleted) {
         useSocialStore.getState().removeFriendLocally(event.user.id, origin);
         useSocialStore.getState().removeRequestsForUser(event.user.id);
-        useActivityStore.getState().clearUserActivities(event.user.id);
+        useActivityStore.getState().clearUserActivities(event.user, origin);
         useDiscoverStore.getState().removeUser(event.user.id);
         useChatStore.getState().clearTypingForUser(event.user.id);
       }
@@ -577,6 +666,9 @@ function handleEvent(origin: string, event: ServerEvent): void {
     case 'voice_state_update':
       if (event.action === 'join') {
         addVoiceUser(event.channelId, event.userId);
+        if (event.channelElapsedSeconds !== undefined) {
+          setVoiceChannelElapsedSeconds(event.channelId, event.channelElapsedSeconds);
+        }
       } else {
         removeVoiceUser(event.channelId, event.userId);
         clearVoiceUserStatus(event.userId);
@@ -660,11 +752,11 @@ function handleEvent(origin: string, event: ServerEvent): void {
     case 'member_joined':
       if (!isHome) normalizeUserAssets(event.member.user, origin);
       upsertUserView(event.member.user, origin);
-      addMember(event.member);
+      if (isLoadedRosterSpace(event.spaceId, origin)) addMember(event.spaceId, event.member);
       break;
 
     case 'member_left':
-      removeMember(event.userId);
+      if (isLoadedRosterSpace(event.spaceId, origin)) removeMember(event.spaceId, event.userId);
       break;
 
     case 'member_banned': {
@@ -696,81 +788,7 @@ function handleEvent(origin: string, event: ServerEvent): void {
       }
       if ((event.message as any).user) upsertUserView((event.message as any).user, origin);
       if ((event.message as any).replyTo?.user) upsertUserView((event.message as any).replyTo.user, origin);
-      const { dmChannels: currentDmChannels, setDmChannels: setDms, addDmChannel: addDmCh } = useSpaceStore.getState();
-      const knownDm = currentDmChannels.find(dm => dm.id === event.message.dmChannelId);
-
-      // Check if this is a relay-created channel that duplicates an existing DM
-      // (same conversation, different channel ID). If so, skip adding a new sidebar entry
-      // and route the message to the existing channel instead.
-      if (!knownDm) {
-        // dmAlternatives-based resolution: if this channelId is an alternate-origin
-        // local id for a DM whose primary is in dmChannels, reroute to the primary.
-        // Covers 1-on-1 AND group DMs uniformly; also the post-failover path where
-        // the reconnected original origin's WS still uses its old local id.
-        const primaryId = resolveDmChannelId(event.message.dmChannelId);
-        if (primaryId && primaryId !== event.message.dmChannelId) {
-          addRealtimeMessage(primaryId, { ...event.message, dmChannelId: primaryId } as any);
-          const updatedDms = currentDmChannels.map(dm =>
-            dm.id === primaryId ? { ...dm, lastMessage: event.message } : dm,
-          );
-          const { unreadChannels: u1, currentChannelId: c1 } = useChatStore.getState();
-          setDms(sortDmChannels(updatedDms, u1, c1));
-          {
-            const { currentChannelId: u1cc, markChannelUnread: u1mu } = useChatStore.getState();
-            const myId = isHome ? useAuthStore.getState().user?.id : getMyUserIdForOrigin(origin);
-            if (primaryId !== u1cc && event.message.userId !== myId) {
-              u1mu(primaryId);
-            }
-          }
-          break;
-        }
-
-        // Legacy 2-member-identity fallback: covers DMs without a federatedId
-        // (pre-federation or never-federated 1-on-1 DMs).
-        const msgUser = event.message.user;
-        const msgHomeUserId = msgUser?.homeUserId || msgUser?.id;
-        if (msgHomeUserId) {
-          const existingDm = currentDmChannels.find(dm =>
-            dm.members.length === 2 &&
-            dm.members.some(m => (m.homeUserId || m.id) === msgHomeUserId),
-          );
-          if (existingDm) {
-            // Route message to the existing channel instead of creating a duplicate
-            addRealtimeMessage(existingDm.id, { ...event.message, dmChannelId: existingDm.id } as any);
-            const updatedDms = currentDmChannels.map(dm =>
-              dm.id === existingDm.id ? { ...dm, lastMessage: event.message } : dm,
-            );
-            const { unreadChannels, currentChannelId } = useChatStore.getState();
-            setDms(sortDmChannels(updatedDms, unreadChannels, currentChannelId));
-            break;
-          }
-        }
-      }
-
-      addRealtimeMessage(event.message.dmChannelId, event.message as any);
-      if (!knownDm) {
-        addDmCh({
-          id: event.message.dmChannelId,
-          createdAt: event.message.createdAt,
-          members: event.message.user ? [event.message.user] : [],
-          lastMessage: event.message,
-        }, origin);
-      } else {
-        const updatedDms = currentDmChannels.map(dm =>
-          dm.id === event.message.dmChannelId
-            ? { ...dm, lastMessage: event.message }
-            : dm
-        );
-        const { unreadChannels: unread, currentChannelId: curCh } = useChatStore.getState();
-        setDms(sortDmChannels(updatedDms, unread, curCh));
-      }
-      {
-        const { currentChannelId, markChannelUnread } = useChatStore.getState();
-        const myId = isHome ? useAuthStore.getState().user?.id : getMyUserIdForOrigin(origin);
-        if (event.message.dmChannelId !== currentChannelId && event.message.userId !== myId) {
-          markChannelUnread(event.message.dmChannelId);
-        }
-      }
+      void applyIncomingDmMessage(origin, event.message);
       break;
     }
 
@@ -1121,13 +1139,7 @@ function handleEvent(origin: string, event: ServerEvent): void {
       for (const m of event.dmChannel.members) {
         upsertUserView(m, origin);
       }
-      // Dedup: skip if a channel with the same federatedId already exists
-      const fid = event.dmChannel.federatedId;
-      if (fid) {
-        const existing = useSpaceStore.getState().dmChannels.find(dm => dm.federatedId === fid);
-        if (existing) break;
-      }
-      addDmChannel(event.dmChannel, origin);
+      applyIncomingDmChannel(origin, event.dmChannel);
       break;
     }
 
@@ -1232,10 +1244,12 @@ function handleEvent(origin: string, event: ServerEvent): void {
       // Clean up voice users for the deleted channel
       {
         const vs = useVoiceStore.getState();
-        if (vs.voiceUsers.has(event.channelId)) {
+        if (vs.voiceUsers.has(event.channelId) || vs.voiceChannelElapsedSeconds.has(event.channelId)) {
           const newVoiceUsers = new Map(vs.voiceUsers);
+          const voiceChannelElapsedSeconds = new Map(vs.voiceChannelElapsedSeconds);
           newVoiceUsers.delete(event.channelId);
-          useVoiceStore.setState({ voiceUsers: newVoiceUsers });
+          voiceChannelElapsedSeconds.delete(event.channelId);
+          useVoiceStore.setState({ voiceUsers: newVoiceUsers, voiceChannelElapsedSeconds });
         }
       }
       break;
@@ -1377,7 +1391,7 @@ function connectToOrigin(origin: string, token: string): void {
 
   ws.onopen = () => {
     conn.reconnectAttempts = 0;
-    ws.send(JSON.stringify({ type: 'auth', token: conn.token }));
+    ws.send(JSON.stringify({ type: 'auth', token: conn.token, client: detectClientKind() }));
     startHeartbeat(conn);
   };
 
@@ -1392,7 +1406,7 @@ function connectToOrigin(origin: string, token: string): void {
     try {
       handleEvent(origin, event);
     } catch (err) {
-      console.error(`Error handling WS event "${event.type}" (${origin || 'home'}):`, err);
+      console.error('Error handling WS event "%s" (%s):', event.type, origin || 'home', err);
     }
   };
 

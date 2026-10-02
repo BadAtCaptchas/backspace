@@ -15,6 +15,22 @@ type TestDb = ReturnType<typeof drizzle<typeof schema>>;
 let sqlite: Database.Database;
 let testDb: TestDb;
 
+// The peer-origin gate resolves an asserted origin before this instance will
+// send anything to it. These cases use non-resolving .example hosts and are
+// about peering state, not address policy (see federationFetch.test.ts for
+// that), so the resolver answers with a public address — except for the one
+// host the last case uses to drive the gate itself.
+const LOOPBACK_HOST = 'lan-only.example';
+vi.mock('dns', () => ({
+  default: {
+    promises: {
+      lookup: async (host: string) => (host === LOOPBACK_HOST
+        ? { address: '127.0.0.1', family: 4 }
+        : { address: '93.184.216.34', family: 4 }),
+    },
+  },
+}));
+
 vi.mock('../db/index.js', () => ({
   getDb: () => testDb,
   schema,
@@ -246,9 +262,10 @@ describe('ensurePeered — outbound gate behavior across (autoAccept × peer-row
   });
 
   // ─── Test 5 ─────────────────────────────────────────────────────────────
-  // autoAccept=0 + existing pending peer row + user_action → gate skipped
-  // (existing path handles); existing dedup/inflight logic runs.
-  it('autoAccept=0 + existing pending peer row + user_action → gate skipped; reaches handshake (dedup path)', async () => {
+  // autoAccept=0 + existing ADMIN-initiated pending peer row + user_action →
+  // gate skipped (the admin already answered its question); existing
+  // dedup/inflight logic runs.
+  it('autoAccept=0 + existing admin-initiated pending peer row + user_action → gate skipped; reaches handshake (dedup path)', async () => {
     seedInstanceSettings(0);
     seedUser('user1', 'alice');
 
@@ -257,6 +274,7 @@ describe('ensurePeered — outbound gate behavior across (autoAccept × peer-row
       origin: 'https://orbit.example',
       hmacSecret: 'old-secret',
       status: 'pending',
+      initiatedBy: 'admin',
       createdAt: Date.now(),
     }).run();
 
@@ -290,6 +308,76 @@ describe('ensurePeered — outbound gate behavior across (autoAccept × peer-row
     const peers = testDb.select().from(schema.federationPeers).all();
     expect(peers).toHaveLength(1);
     expect(peers[0]!.id).toBe('peer-pending');
+  });
+
+  // ─── Test 5b ────────────────────────────────────────────────────────────
+  // autoAccept=0 + existing NON-admin pending peer row → the gate still fires.
+  // Such a row records local traffic, not an admin decision, so resolving it
+  // would hand our secret to that origin behind the admin's back. Test 5 above
+  // is the positive control: identical setup, admin provenance, reaches fetch.
+  it('autoAccept=0 + existing non-admin pending peer row + user_action → gate fires; placeholder discarded; queued for admin', async () => {
+    seedInstanceSettings(0);
+    seedUser('user1', 'alice');
+
+    testDb.insert(schema.federationPeers).values({
+      id: 'peer-placeholder',
+      origin: 'https://orbit.example',
+      hmacSecret: 'old-secret',
+      status: 'pending',
+      initiatedBy: 'auto',
+      createdAt: Date.now(),
+    }).run();
+
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+
+    const { ensurePeered } = await import('./federationPeering.js');
+    const result = await ensurePeered('https://orbit.example', {
+      kind: 'user_action',
+      userId: 'user1',
+      reason: 'friend_add',
+      target: 'bob@orbit.example',
+    });
+
+    expect(result.status).toBe('admin_required');
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    // Placeholder discarded so the admin's later approval can insert cleanly.
+    expect(testDb.select().from(schema.federationPeers).all()).toHaveLength(0);
+
+    // Queued for the admin, with the requesting user subscribed.
+    const parents = testDb.select().from(schema.peerApprovalRequests).all();
+    expect(parents).toHaveLength(1);
+    expect(parents[0]!.direction).toBe('outbound');
+    const subs = testDb.select().from(schema.peerApprovalSubscribers).all();
+    expect(subs).toHaveLength(1);
+  });
+
+  // ─── Test 5c ────────────────────────────────────────────────────────────
+  // The worker's path: resolvePendingPeers() calls ensurePeered with a system
+  // intent for every pending row that still has outbox entries. A non-admin
+  // row must not escalate into a handshake there either, and system intent
+  // never queues an approval request (there is no user to notify).
+  it('autoAccept=0 + existing non-admin pending peer row + system intent → gate fires; no handshake, no queue', async () => {
+    seedInstanceSettings(0);
+
+    testDb.insert(schema.federationPeers).values({
+      id: 'peer-placeholder',
+      origin: 'https://orbit.example',
+      hmacSecret: 'old-secret',
+      status: 'pending',
+      initiatedBy: 'auto',
+      createdAt: Date.now(),
+    }).run();
+
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+
+    const { ensurePeered } = await import('./federationPeering.js');
+    const result = await ensurePeered('https://orbit.example', { kind: 'system' });
+
+    expect(result.status).toBe('admin_required');
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(testDb.select().from(schema.federationPeers).all()).toHaveLength(0);
+    expect(testDb.select().from(schema.peerApprovalRequests).all()).toHaveLength(0);
   });
 
   // ─── Test 6 ─────────────────────────────────────────────────────────────
@@ -452,5 +540,35 @@ describe('ensurePeered — outbound gate behavior across (autoAccept × peer-row
     expect(parents).toHaveLength(1);
     expect(parents[0]!.direction).toBe('outbound');
     expect(parents[0]!.origin).toBe('https://orbit.example');
+  });
+
+  // ─── Gate placement ─────────────────────────────────────────────────────
+  // Not a restatement of federationFetch.test.ts. That suite proves the gate
+  // decides correctly; this one proves performHandshake actually goes through
+  // it, which no assertion about the gate module can show. Against the code
+  // before the gate existed, fetch is called and the status is 'failed' for a
+  // transport reason, so both assertions below flip.
+  it('refuses to send the handshake to an origin that resolves onto the local network', async () => {
+    seedInstanceSettings(1);
+    seedUser('user1', 'alice');
+
+    const fetchSpy = vi.fn(async () => new Response('{}', { status: 200 }));
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const { ensurePeered } = await import('./federationPeering.js');
+    const result = await ensurePeered(`https://${LOOPBACK_HOST}`, {
+      kind: 'user_action',
+      userId: 'user1',
+      reason: 'friend_add',
+      target: `bob@${LOOPBACK_HOST}`,
+    });
+
+    expect(result.status).toBe('failed');
+    expect(result.status === 'failed' && result.error).toMatch(/not reachable on the public internet/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    // The placeholder row performHandshake creates is rolled back the same way
+    // a transport failure rolls it back, so a refused origin leaves no trace.
+    expect(testDb.select().from(schema.federationPeers).all()).toHaveLength(0);
   });
 });

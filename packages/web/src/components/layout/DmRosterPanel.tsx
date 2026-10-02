@@ -1,4 +1,5 @@
 import React, { useMemo, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import type { User } from '@backspace/shared';
 import { useChatStore } from '../../stores/chatStore';
 import { useSpaceStore } from '../../stores/spaceStore';
@@ -9,6 +10,8 @@ import { isSelf, parseFederatedUsername } from '../../utils/identity';
 import { api } from '../../api/client';
 import { ConfirmDialog } from '../ui/ConfirmDialog';
 import { DmMemberRow, type DmMemberRowAction } from './DmMemberRow';
+import { visualPixels } from '../../platform/interfaceScale';
+import { pointAnchor } from '../../hooks/useFloatingPosition';
 
 /**
  * Right-side roster for group DMs. Mirrors `MemberSidebar`'s layout language
@@ -20,6 +23,7 @@ import { DmMemberRow, type DmMemberRowAction } from './DmMemberRow';
  * separate boolean and explicitly carries the user's global toggle preference.
  */
 export function DmRosterPanel() {
+  const { t } = useTranslation(['dm', 'common']);
   const memberListOpen = useUIStore((s) => s.memberListOpen);
   const openUserProfile = useUIStore((s) => s.openUserProfile);
   const addToast = useUIStore((s) => s.addToast);
@@ -93,7 +97,7 @@ export function DmRosterPanel() {
       // MemberSidebar pattern). This branch only fires on the unlikely
       // fallback path where the row couldn't compute its bounding rect —
       // in that case, anchor to the top-left of the roster column.
-      openUserProfile(member, { top: 100, left: 100 });
+      openUserProfile(member, pointAnchor(visualPixels(100), visualPixels(100)));
       return;
     }
     if (action === 'kick') {
@@ -109,7 +113,7 @@ export function DmRosterPanel() {
         await removeFriendStore(member.id);
       } catch (err) {
         addToast(
-          err instanceof Error ? err.message : 'Failed to remove friend',
+          err instanceof Error ? err.message : t('dm:removeFriend.failed'),
           'warning',
           3000,
         );
@@ -133,14 +137,14 @@ export function DmRosterPanel() {
         : undefined;
       await api.dm.kickMember(dmChannel.id, pendingKick.id, federated);
       addToast(
-        `Removed ${pendingKick.displayName ?? parseFederatedUsername(pendingKick.username).baseName} from the group`,
+        t('dm:kick.success', { name: pendingKick.displayName ?? parseFederatedUsername(pendingKick.username).baseName }),
         'success',
         3000,
       );
       setPendingKick(null);
     } catch (err) {
       addToast(
-        err instanceof Error ? err.message : 'Failed to remove member',
+        err instanceof Error ? err.message : t('dm:kick.failed'),
         'warning',
         3000,
       );
@@ -159,14 +163,14 @@ export function DmRosterPanel() {
         : undefined;
       await api.dm.transferOwnership(dmChannel.id, pendingTransfer.id, federated);
       addToast(
-        `Ownership transferred to ${pendingTransfer.displayName ?? parseFederatedUsername(pendingTransfer.username).baseName}`,
+        t('dm:transfer.success', { name: pendingTransfer.displayName ?? parseFederatedUsername(pendingTransfer.username).baseName }),
         'success',
         3000,
       );
       setPendingTransfer(null);
     } catch (err) {
       addToast(
-        err instanceof Error ? err.message : 'Failed to transfer ownership',
+        err instanceof Error ? err.message : t('dm:transfer.failed'),
         'warning',
         3000,
       );
@@ -183,20 +187,20 @@ export function DmRosterPanel() {
   return (
     <div
       data-dm-roster-panel
-      className="w-60 bg-surface-members flex-shrink-0 overflow-y-auto select-none no-scrollbar hidden md:block border-l border-border-hard"
+      className="w-60 bg-surface-members flex-shrink-0 overflow-y-auto select-none no-scrollbar hidden desktop:block border-l border-border-hard"
     >
       <div className="p-3">
         <h3
           data-dm-roster-header
           className="text-[10.5px] font-bold text-txt-tertiary uppercase tracking-[0.06em] px-2 mb-2"
         >
-          Members — {totalCount}
+          {t('dm:roster.sectionCount', { label: t('common:labels.members'), total: totalCount })}
         </h3>
 
         {ownerMember && (
           <div data-dm-roster-section="owner" className="mb-4">
             <h4 className="text-[10.5px] font-bold text-txt-tertiary uppercase tracking-[0.06em] px-2 mb-1">
-              OWNER
+              {t('dm:roster.owner')}
             </h4>
             <DmMemberRow
               member={ownerMember}
@@ -213,7 +217,7 @@ export function DmRosterPanel() {
         {onlineMembers.length > 0 && (
           <div data-dm-roster-section="online" className="mb-4">
             <h4 className="text-[10.5px] font-bold text-txt-tertiary uppercase tracking-[0.06em] px-2 mb-1">
-              ONLINE — {onlineMembers.length}
+              {t('dm:roster.sectionCount', { label: t('common:states.online'), total: onlineMembers.length })}
             </h4>
             {onlineMembers.map((m) => (
               <DmMemberRow
@@ -233,7 +237,7 @@ export function DmRosterPanel() {
         {offlineMembers.length > 0 && (
           <div data-dm-roster-section="offline" className="opacity-60">
             <h4 className="text-[10.5px] font-bold text-txt-tertiary uppercase tracking-[0.06em] px-2 mb-1">
-              OFFLINE — {offlineMembers.length}
+              {t('dm:roster.sectionCount', { label: t('common:states.offline'), total: offlineMembers.length })}
             </h4>
             {offlineMembers.map((m) => (
               <DmMemberRow
@@ -255,13 +259,13 @@ export function DmRosterPanel() {
         isOpen={!!pendingKick}
         onClose={() => { if (!submitting) setPendingKick(null); }}
         onConfirm={confirmKick}
-        title="Remove from Group"
+        title={t('dm:kick.title')}
         description={
           pendingKick
-            ? `Remove ${pendingKick.displayName ?? parseFederatedUsername(pendingKick.username).baseName} from this group? They won't be able to see new messages.`
+            ? t('dm:kick.description', { name: pendingKick.displayName ?? parseFederatedUsername(pendingKick.username).baseName })
             : ''
         }
-        confirmLabel="Remove"
+        confirmLabel={t('common:actions.remove')}
         variant="danger"
         loading={submitting}
       />
@@ -270,13 +274,13 @@ export function DmRosterPanel() {
         isOpen={!!pendingTransfer}
         onClose={() => { if (!submitting) setPendingTransfer(null); }}
         onConfirm={confirmTransfer}
-        title="Transfer Ownership"
+        title={t('dm:transfer.title')}
         description={
           pendingTransfer
-            ? `Transfer ownership to ${pendingTransfer.displayName ?? parseFederatedUsername(pendingTransfer.username).baseName}? You'll lose owner privileges.`
+            ? t('dm:transfer.description', { name: pendingTransfer.displayName ?? parseFederatedUsername(pendingTransfer.username).baseName })
             : ''
         }
-        confirmLabel="Transfer"
+        confirmLabel={t('dm:transfer.confirm')}
         variant="warning"
         loading={submitting}
       />

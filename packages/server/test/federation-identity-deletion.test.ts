@@ -1,8 +1,16 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import { bootTwoInstances, bootHomePlusRemotes, type TwoInstanceHarness, type MultiRemoteHarness, type SpawnedInstance } from './helpers/twoInstanceHarness.js';
 import { peerInstances } from './helpers/seedPeer.js';
 import type { TestUser } from './helpers/testUsers.js';
 import { connectWs } from './helpers/wsListener.js';
+
+// Every test here boots real federated instances and drives S2S over HTTP, and
+// several deliberately wait on log matchers (e.g. logMatched(..., 1_000) per
+// remote). The 5s default per-test timeout is meant for unit tests and is too
+// tight for this — under CI load the multi-remote fan-out tests intermittently
+// timed out. Give the whole file a realistic ceiling; a genuine hang still trips
+// it well before then. Hooks keep their own explicit timeouts (beforeAll 90s).
+vi.setConfig({ testTimeout: 30_000 });
 
 let harness: TwoInstanceHarness;
 let sharedHmacSecret: string;
@@ -254,7 +262,7 @@ describe('Federation identity deletion — server suite', () => {
     });
     expect(res.status).toBe(400);
     const body = await res.json();
-    expect(String(body.error)).toMatch(/Invalid mode/);
+    expect(body).toMatchObject({ code: 'validation_failed', details: { field: 'mode' } });
   });
 
   it('#12 returns 400 for empty origins', async () => {
@@ -267,7 +275,7 @@ describe('Federation identity deletion — server suite', () => {
     });
     expect(res.status).toBe(400);
     const body = await res.json();
-    expect(String(body.error)).toMatch(/origins/);
+    expect(body).toMatchObject({ code: 'validation_failed', details: { field: 'origins' } });
   });
 
   it('#1 leave mode: home registry cleaned, remote untouched, no S2S request hits the remote', async () => {

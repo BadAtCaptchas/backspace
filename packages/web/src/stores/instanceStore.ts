@@ -1,6 +1,13 @@
 import { create } from 'zustand';
-import type { User, InstanceInfoResponse, ReplicatedInstance, AuthResponse, FederationRegistryEntry } from '@backspace/shared';
-import { BackspaceApiClient, createApiClient, api } from '../api/client';
+import type {
+  User,
+  InstanceInfoResponse,
+  ReplicatedInstance,
+  AuthResponse,
+  FederationRegistryEntry,
+  FederationRegistryStatus,
+} from '@backspace/shared';
+import { BackspaceApiClient, HttpError, createApiClient, api } from '../api/client';
 import { useAuthStore } from './authStore';
 import {
   setApiForOriginResolver,
@@ -10,15 +17,14 @@ import {
 } from '../utils/crossStoreResolvers';
 import { useSpaceStore } from './spaceStore';
 import { connectInstance, disconnectInstance as disconnectWs, disconnectAllRemote } from '../hooks/useWebSocket';
-// Circular dependency: federationOps imports useInstanceStore, instanceStore imports this.
-// Safe because both modules access each other lazily (at call time, not import time).
-// clearPasswordSyncTimers itself does not reference useInstanceStore.
-import { clearPasswordSyncTimers } from '../utils/federationOps';
 // dmOriginFailover lazily reads useInstanceStore/useSpaceStore/useChatStore at call time,
 // so a static import here does not create an import-time cycle.
-import { failoverDmOriginsFromDisconnected } from '../utils/dmOriginFailover';
 import { useUIStore } from './uiStore';
-import { parseFederatedUsername } from '../utils/identity';
+import { homeHostOf, parseFederatedUsername } from '../utils/identity';
+// The registry's `errorMessage` carries one of these codes, never a sentence:
+// the Connections row is what turns it into words, in the user's language.
+import { registryReason } from '../i18n/registryErrors';
+import i18n from '../i18n';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -37,7 +43,6 @@ interface CachedInstanceToken {
   token: string;
   label: string;
   username: string;
-  pendingPasswordSync?: boolean;
 }
 
 const STORAGE_KEY_PREFIX = 'backspace_instances';
@@ -72,10 +77,8 @@ function loadCachedTokens(userId: string): Record<string, CachedInstanceToken> {
   }
 }
 
-function saveCachedTokens(instances: ConnectedInstance[], userId: string, pendingSyncFlags?: Record<string, boolean>): void {
+function saveCachedTokens(instances: ConnectedInstance[], userId: string): void {
   const cache: Record<string, CachedInstanceToken> = {};
-  // Load existing cache to preserve pendingPasswordSync flags
-  const existing = loadCachedTokens(userId);
   for (const inst of instances) {
     // Skip tokenless placeholders — writing an empty token would cause
     // autoConnectAll to find a truthy cached entry with an empty bearer token
@@ -84,7 +87,6 @@ function saveCachedTokens(instances: ConnectedInstance[], userId: string, pendin
       token: inst.token,
       label: inst.label,
       username: inst.username,
-      pendingPasswordSync: pendingSyncFlags?.[inst.origin] ?? existing[inst.origin]?.pendingPasswordSync,
     };
   }
   localStorage.setItem(storageKey(userId), JSON.stringify(cache));
@@ -100,17 +102,75 @@ function isNetworkError(err: unknown): boolean {
 
 // ─── Error types ────────────────────────────────────────────────────────────
 
-/** Thrown when the remote instance already has an account for this user with a different password. */
-export class DifferentPasswordError extends Error {
-  constructor(public remoteUsername: string) {
-    super('Account exists with a different password on this instance');
-    this.name = 'DifferentPasswordError';
+/**
+ * Why an instance has to be signed into with an account's own credentials
+ * instead of the credential the home instance issued for it.
+ *
+ * - `credential-refused`: the instance said the account exists (registration
+ *   answered `username_taken`) and the account refused the issued credential.
+ *   It predates per-remote credentials, or was made by hand there.
+ * - `registration-closed`: the instance does not accept accounts from other
+ *   instances, and signing in with the issued credential failed. Whether an
+ *   account exists there is unknown: the closed gate answers before any
+ *   username check, and a refused login says `invalid_credentials` either way.
+ *   Nothing may tell the user they have an account in this case.
+ */
+export type RemoteLoginReason = 'credential-refused' | 'registration-closed';
+
+/**
+ * Thrown when a session on another instance can only be had with the
+ * account's own credentials on it; `reason` says why. The way out is the
+ * explicit per-instance login, so every surface that can offer it catches
+ * this class by name and words its notice from `reason`.
+ *
+ * It is an `HttpError` carrying a registered code, minted by the client
+ * rather than by a route, so `describeError` says it in the user's language
+ * wherever it does escape to a message: `federation_different_password` for
+ * a refused credential, `federated_registration_closed` for a closed
+ * instance. The English text stays as the log line and the last-resort
+ * fallback, never as what a Russian or German user reads.
+ */
+export class RemoteLoginRequiredError extends HttpError {
+  constructor(public remoteUsername: string, public reason: RemoteLoginReason) {
+    const code = reason === 'credential-refused' ? 'federation_different_password' : 'federated_registration_closed';
+    const status = reason === 'credential-refused' ? 409 : 403;
+    super(
+      status,
+      reason === 'credential-refused'
+        ? 'Account exists with a different password on this instance'
+        : 'Instance is closed to accounts from other instances and refused the issued credential',
+      { error: code, code, statusCode: status },
+      code,
+    );
+    this.name = 'RemoteLoginRequiredError';
   }
+}
+
+/**
+ * Why a federated registration on another instance was refused, when it is
+ * a refusal a login can still get past; null for every other failure, which
+ * the caller rethrows. The status is what decides, so a remote on a version
+ * that sends no code, or a different one, is still read: a federated
+ * registration answers 409 only for a taken username, and 403 only for a
+ * gate (`federated_registration_closed` today; `registration_closed` or
+ * `invite_required` on a remote that does not yet tell federated
+ * registration from local).
+ */
+function registrationRefusal(err: unknown): RemoteLoginReason | null {
+  if (!(err instanceof HttpError)) return null;
+  if (err.status === 409) return 'credential-refused';
+  if (err.status === 403) return 'registration-closed';
+  return null;
 }
 
 // ─── URL normalization ───────────────────────────────────────────────────────
 
-function normalizeOrigin(url: string): string {
+/**
+ * Canonical origin of a user-typed or stored instance value: scheme added
+ * when missing, host lowercased, path and trailing slash dropped. Throws
+ * `Invalid URL` when the value does not parse.
+ */
+export function normalizeOrigin(url: string): string {
   let normalized = url.trim();
 
   // Add https:// if no protocol
@@ -135,6 +195,126 @@ export function isSelfOrigin(origin: string): boolean {
   }
 }
 
+// ─── Home-session resolution ─────────────────────────────────────────────────
+
+/**
+ * The authenticated API client for a given home domain, or null when this
+ * client holds no session there: the primary connection when we are browsing
+ * that domain natively, else a connected secondary instance.
+ *
+ * Shared by `maybeAutoReattach` (proof minting) and `resolveCredentialHomeApi`
+ * (per-remote credential issuance) so both agree on what "a session on the home
+ * instance" means.
+ */
+export function resolveSessionApiForHome(homeDomain: string): { api: BackspaceApiClient; username: string } | null {
+  const primaryUser = useAuthStore.getState().user;
+  if (primaryUser && !primaryUser.homeInstance && window.location.hostname.toLowerCase() === homeDomain) {
+    return { api, username: primaryUser.username };
+  }
+  const conn = useInstanceStore.getState().instances.find(
+    (i) => i.status === 'connected' && new URL(i.origin).hostname.toLowerCase() === homeDomain,
+  );
+  return conn ? { api: conn.api, username: conn.username } : null;
+}
+
+/**
+ * The API client of the instance that ISSUES this account's per-remote
+ * federation credentials — always the account's true home.
+ *
+ * Credentials must be minted in exactly one place. If each browsing instance
+ * issued its own, the same remote account would be handed two different secrets
+ * and the user would be locked out of it from every device but one. A detached
+ * account (`federationHomeOrphaned`) has no home left to ask, so it is sovereign
+ * here and issues its own — the same rule the server applies (users.ts).
+ */
+function resolveCredentialHomeApi(): BackspaceApiClient | null {
+  const currentUser = useAuthStore.getState().user;
+  if (!currentUser) return null;
+  if (!currentUser.homeInstance || currentUser.federationHomeOrphaned) return api;
+  return resolveSessionApiForHome(homeHostOf(currentUser.homeInstance))?.api ?? null;
+}
+
+/**
+ * Make the remote account for THIS user on `instance` authenticate with the
+ * home-issued per-remote secret rather than whatever it was provisioned with.
+ *
+ * This is the single place that reconciles a remote account's credential, so
+ * every path that establishes a remote session routes through it: fresh
+ * connect, explicit login, and token reconnect. Connections made before
+ * per-remote secrets existed still carry `bcrypt(home password)`; the home
+ * instance's `provisioned` flag marks which ones have been migrated, so the
+ * rotation happens exactly once per account instead of on every launch (each
+ * rotation bumps the remote's `passwordChangedAt` and revokes this user's other
+ * sessions there).
+ *
+ * `force` skips the flag — used after an explicit login, which is the one
+ * signal that the remote hash is something other than the issued secret.
+ *
+ * Never touches an account that is not this user's federated identity on that
+ * instance: `homeInstance` and `homeUserId` must both match, so a native
+ * account someone logged into on the remote is left alone.
+ */
+export async function ensureRemoteCredential(
+  instance: ConnectedInstance,
+  opts: { force?: boolean } = {},
+): Promise<void> {
+  const currentUser = useAuthStore.getState().user;
+  if (!currentUser) return;
+
+  const trueHomeHost = homeHostOf(currentUser.homeInstance ?? window.location.host);
+  if (homeHostOf(instance.origin) === trueHomeHost) return; // home keeps the real password
+
+  const remote = instance.user;
+  if (!remote.homeInstance || !remote.homeUserId) return;
+  if (homeHostOf(remote.homeInstance) !== trueHomeHost) return;
+  if (remote.homeUserId !== (currentUser.homeUserId ?? currentUser.id)) return;
+
+  const homeApi = resolveCredentialHomeApi();
+  if (!homeApi) return;
+
+  const credential = await homeApi.users.federationCredential({ origin: instance.origin });
+  if (credential.provisioned && !opts.force) return;
+
+  const rotated = await instance.api.users.changePassword({ newPassword: credential.secret });
+  useInstanceStore.getState().updateInstanceToken(instance.origin, rotated.token);
+  await homeApi.users.federationCredential({ origin: instance.origin, markProvisioned: true });
+}
+
+// ─── Home-instance peering for a remote session ──────────────────────────────
+
+/**
+ * Ask the home instance to peer with `origin`. DMs the user writes on a remote
+ * reach home through that S2S peering, and the home instance only starts one
+ * when asked, so every path that opens a session on a remote calls this once
+ * the session is live: a connect, an explicit per-instance login (which the
+ * directory's join also falls back to), a token resume, and each connection
+ * `autoConnectAll` resumes at app start. A session opened without it works,
+ * and its DMs silently stay on the remote.
+ *
+ * The server answers an existing peering from its peer row without charging
+ * the per-user rate limit, so asking on every session is cheap.
+ *
+ * `announceAs` is the instance label for a session the user just opened by
+ * hand, who is told when relay will not work yet. A background resume passes
+ * null and stays quiet. Never throws: the session is usable without peering.
+ */
+async function peerHomeWithRemote(origin: string, announceAs: string | null): Promise<void> {
+  try {
+    // `instance_connect` is what the home admin's approval queue shows when
+    // auto-accept is off there, so it must say this is a connection.
+    const { peeringStatus } = await api.federation.ensurePeered({ remoteOrigin: origin, reason: 'instance_connect' });
+    if (announceAs === null) return;
+    const { addToast } = useUIStore.getState();
+    if (peeringStatus === 'rejected') {
+      addToast(i18n.t('federation:connections.peering.unavailable', { name: announceAs }), 'warning', 10000);
+    } else if (peeringStatus === 'pending') {
+      addToast(i18n.t('federation:connections.peering.inProgress', { name: announceAs }), 'info');
+    }
+  } catch (err) {
+    console.warn(`[federation] Peering with ${origin} could not be requested (non-fatal):`, err);
+  }
+}
+
 // ─── Automatic re-attach (re-attach spec §3.4) ────────────────────────────────
 
 /**
@@ -152,22 +332,9 @@ export async function maybeAutoReattach(instance: ConnectedInstance): Promise<vo
 
   // An authenticated session on the account's home domain: the primary
   // connection when we're browsing it, else a connected secondary instance.
-  const primaryUser = useAuthStore.getState().user;
-  let homeApi: BackspaceApiClient | null = null;
-  let homeUsername: string | null = null;
-  if (primaryUser && !primaryUser.homeInstance && window.location.hostname.toLowerCase() === homeDomain) {
-    homeApi = api;
-    homeUsername = primaryUser.username;
-  } else {
-    const conn = useInstanceStore.getState().instances.find(
-      (i) => i.status === 'connected' && new URL(i.origin).hostname.toLowerCase() === homeDomain,
-    );
-    if (conn) {
-      homeApi = conn.api;
-      homeUsername = conn.username;
-    }
-  }
-  if (!homeApi || !homeUsername) return;
+  const homeSession = resolveSessionApiForHome(homeDomain);
+  if (!homeSession) return;
+  const { api: homeApi, username: homeUsername } = homeSession;
 
   // Unambiguous case only: same username base on both sides (spec §2/§3.4).
   const detachedBase = parseFederatedUsername(remoteUser.username).baseName.toLowerCase();
@@ -181,25 +348,22 @@ export async function maybeAutoReattach(instance: ConnectedInstance): Promise<vo
     const targetHost = new URL(instance.origin).hostname;
     const { token } = await homeApi.auth.attachProof(targetHost);
     const res = await instance.api.users.reattach({ token });
-    useInstanceStore.setState((state) => ({
-      instances: state.instances.map((i) =>
-        i.origin === instance.origin ? { ...i, user: res.user, username: res.user.username } : i,
-      ),
-    }));
-    // Registry mirrors the connection's identity — keep the re-bound username in sync.
-    const registry = upsertRegistryEntry(useInstanceStore.getState().registry, instance.origin, {
-      origin: instance.origin,
-      username: res.user.username,
-      remoteUserId: res.user.id,
+    // Not a transition: the session stands, only the identity it is bound to
+    // has changed. The registry mirrors the connection's identity, so both
+    // halves take the re-bound username in the same write.
+    writeConnectionState(instance.origin, null, {
+      live: { user: res.user, username: res.user.username },
+      registry: { username: res.user.username, remoteUserId: res.user.id },
     });
-    useInstanceStore.setState({ registry, registryUpdatedAt: Date.now() });
     useUIStore.getState().addToast(`Account re-linked with ${homeDomain}`, 'success');
     useInstanceStore.getState().syncRegistry().catch(() => {});
     // Re-attach reconciled this connection's 1-on-1 DM federatedIds (merge/re-key
     // on the server); refetch the DM list so the split conversation collapses
     // without a reload. Belt-and-suspenders for the connection that triggered it
     // — the server's dm_channel_closed/created events cover the live sidebar too.
-    try { await useSpaceStore.getState().reloadDmsForOrigin(instance.origin); } catch { /* non-fatal */ }
+    try {
+      await useSpaceStore.getState().reloadDmsForOrigin(instance.origin);
+    } catch { /* non-fatal */ }
   } catch (err) {
     // Non-fatal: the connection works either way; the explicit re-attach
     // action in AccountPanel remains available.
@@ -207,14 +371,58 @@ export async function maybeAutoReattach(instance: ConnectedInstance): Promise<vo
   }
 }
 
-// ─── API client resolution ───────────────────────────────────────────────────
+// ─── Auto-connect gate ───────────────────────────────────────────────────────
 
-// ─── Registry helpers ────────────────────────────────────────────────────────
+/**
+ * Resolve once `autoConnectAll` has finished, so a fan-out over connected
+ * instances does not run against an incomplete or empty list on page reload.
+ * Resolves at once when it already has. The flag is re-read after subscribing
+ * because it can flip between the first check and the subscription.
+ */
+export function waitForAutoConnect(): Promise<void> {
+  if (useInstanceStore.getState()._autoConnectDone) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    const unsub = useInstanceStore.subscribe((state) => {
+      if (state._autoConnectDone) {
+        unsub();
+        resolve();
+      }
+    });
+    if (useInstanceStore.getState()._autoConnectDone) {
+      unsub();
+      resolve();
+    }
+  });
+}
 
+// ─── Connection state: the one writer ────────────────────────────────────────
+
+/**
+ * A connection is held in two projections at once, and both carry a status:
+ * the live `ConnectedInstance` in `instances` (token, api client, the status
+ * the socket layer mirrors) and the persisted `FederationRegistryEntry` in
+ * `registry` (what the Connections panel, the Explore chips and Outer Space
+ * render). They are not derived from one another — components read both — so
+ * they can only stay in step if one piece of code moves them together.
+ *
+ * `writeConnectionState` below is that piece of code. Every status change goes
+ * through it, naming a phase from the table; nothing else in this file writes
+ * a status to either projection, apart from `autoConnectAll` seeding a row from
+ * the server registry or from localStorage, which creates the persisted record
+ * for an origin that has no live half yet rather than moving one. `innerOrigins`
+ * (`utils/directory.ts`) reads across the pair, so halves that disagree put an
+ * instance's spaces in the wrong half of the Explore page.
+ */
+
+/**
+ * The registry entry for `origin`, created from the defaults when it has none.
+ * A status is required because a row is only ever created by a phase, which
+ * names one: there is no default status that some phase did not choose.
+ */
 function upsertRegistryEntry(
   registry: Map<string, FederationRegistryEntry>,
   origin: string,
-  updates: Partial<FederationRegistryEntry> & { origin: string },
+  updates: Partial<FederationRegistryEntry> & { origin: string; status: FederationRegistryStatus },
 ): Map<string, FederationRegistryEntry> {
   const next = new Map(registry);
   const existing = next.get(origin);
@@ -225,7 +433,6 @@ function upsertRegistryEntry(
       label: '',
       username: '',
       remoteUserId: '',
-      status: 'connected',
       addedAt: Date.now(),
       lastConnectedAt: null,
       disconnectedAt: null,
@@ -236,6 +443,187 @@ function upsertRegistryEntry(
   return next;
 }
 
+/** One phase: what it means on the live entry and what it records in the registry. */
+interface PhaseSpec {
+  /** The status the live entry takes. */
+  live: ConnectedInstance['status'];
+  /** The live `error` string, English, for the console. A phase without one clears it. */
+  error?: string;
+  /**
+   * The registry half, called at write time so its timestamps are the write's.
+   * Null marks a phase that is not a registry event: the entry keeps what it
+   * last recorded, and a call site cannot write registry fields through it.
+   */
+  registry: (() => Partial<FederationRegistryEntry> & { status: FederationRegistryStatus }) | null;
+}
+
+/**
+ * Every way a connection's state moves, with both halves named once.
+ *
+ * The `live-*` phases move the live entry alone. Socket liveness is not a
+ * registry event: the registry records what the account's session with an
+ * instance is worth, and a websocket that drops for thirty seconds must not
+ * leave a row saying the user disconnected (which suppresses auto-connect on
+ * the next launch) or that the token expired. `live-connecting` is the same
+ * rule for an attempt in flight, which the registry has no status for at all.
+ */
+const CONNECTION_PHASES = {
+  /** A session was established: a fresh connect, an explicit login, or a token reconnect. */
+  connected: {
+    live: 'connected',
+    registry: () => ({
+      status: 'connected' as const,
+      lastConnectedAt: Date.now(),
+      disconnectedAt: null,
+      errorMessage: null,
+    }),
+  },
+  /** The user disconnected this instance by hand. The row stays; it is what stops the next auto-connect. */
+  disconnected: {
+    live: 'disconnected',
+    registry: () => ({
+      status: 'disconnected' as const,
+      disconnectedAt: Date.now(),
+      errorMessage: null,
+    }),
+  },
+  /** The instance did not answer. The token may well still be good, so the socket keeps retrying. */
+  unreachable: {
+    live: 'disconnected',
+    error: 'Instance unreachable, retrying in background',
+    registry: () => ({ status: 'unreachable' as const, errorMessage: registryReason('unreachable') }),
+  },
+  /** A session that existed was refused: only a password gets back in. */
+  'token-expired': {
+    live: 'error',
+    error: 'Token expired, re-authenticate to reconnect',
+    registry: () => ({ status: 'auth_expired' as const, errorMessage: registryReason('session_expired') }),
+  },
+  /** A known connection with no cached token at all: nothing to try, so it starts where a refused token ends. */
+  'no-session': {
+    live: 'error',
+    error: 'Session expired, re-authenticate to reconnect',
+    registry: () => ({ status: 'auth_expired' as const, errorMessage: registryReason('session_expired') }),
+  },
+  /** The socket came up. */
+  'live-connected': { live: 'connected', registry: null },
+  /** An attempt is in flight, or a cached-token placeholder is waiting for one. */
+  'live-connecting': { live: 'connecting', registry: null },
+  /** The socket dropped, or a placeholder stands for a row that already says disconnected. */
+  'live-disconnected': { live: 'disconnected', registry: null },
+  /** The socket layer reports a failure of its own. */
+  'live-error': { live: 'error', registry: null },
+} satisfies Record<string, PhaseSpec>;
+
+/** A phase name, as `writeConnectionState` takes it. */
+type ConnectionPhase = keyof typeof CONNECTION_PHASES;
+
+/** Live fields a write can refresh; the status and the error are the phase's. */
+type LivePatch = Partial<Omit<ConnectedInstance, 'origin' | 'status' | 'error'>>;
+
+/** Registry fields a write can record; the status and the reason are the phase's. */
+type RegistryPatch = Partial<Omit<FederationRegistryEntry, 'origin' | 'status'>>;
+
+interface ConnectionWrite {
+  /** Replaces the phase's live error string. The socket layer carries its own wording. */
+  error?: string;
+  /** Live fields this transition also refreshes (user, label, username). */
+  live?: LivePatch;
+  /** Registry fields this transition also records. Ignored by a phase with no registry half. */
+  registry?: RegistryPatch;
+  /**
+   * The live entry for an origin the list does not hold yet: a fresh session,
+   * or the cached-token placeholder `reconnectInstance` restores. It replaces
+   * any entry the origin already has and goes to the end of the list, so the
+   * origin is never absent between the two (client-federation.md §6, "a
+   * placeholder is replaced, never removed first"). Without it, an origin with
+   * no live entry moves its registry half only.
+   */
+  insert?: Omit<ConnectedInstance, 'status' | 'error'>;
+  /**
+   * The store-wide loading flag, settled in the same `set` as the entry. The
+   * two connect flows are its only callers: the flag guards the form that
+   * produced the connection, so it belongs to the moment the entry appears
+   * rather than to a `set` after it.
+   */
+  isLoading?: boolean;
+}
+
+/**
+ * Move a connection to `phase`, writing both projections in one `set`.
+ *
+ * This is the only code that writes a status to `instances` or to `registry`,
+ * and the only code that stamps `registryUpdatedAt` for a state change, so the
+ * two halves cannot drift the way ten hand-written pairs could. A `phase` of
+ * null writes the named fields on both halves without moving either status:
+ * re-attach rebinding the account's identity is such a write, not a transition.
+ *
+ * Returns the live entry as it now stands, or undefined when the origin has no
+ * live entry and the write did not bring one.
+ */
+function writeConnectionState(
+  origin: string,
+  phase: ConnectionPhase,
+  write: ConnectionWrite & { insert: Omit<ConnectedInstance, 'status' | 'error'> },
+): ConnectedInstance;
+function writeConnectionState(
+  origin: string,
+  phase: ConnectionPhase | null,
+  write?: ConnectionWrite,
+): ConnectedInstance | undefined;
+function writeConnectionState(
+  origin: string,
+  phase: ConnectionPhase | null,
+  write: ConnectionWrite = {},
+): ConnectedInstance | undefined {
+  const spec: PhaseSpec | null = phase ? CONNECTION_PHASES[phase] : null;
+  const error = spec ? (write.error ?? spec.error) : undefined;
+  // A phase's registry half is the only thing that may create a row, because it
+  // is the only one that names a status. A null-phase write carries fields
+  // alone, so for an origin with no row there is no status it could honestly be
+  // given and the write stays on the live half.
+  const registryPhase: (RegistryPatch & { status: FederationRegistryStatus }) | null =
+    spec && spec.registry ? { ...write.registry, ...spec.registry() } : null;
+  const registryFields: RegistryPatch | null = spec ? null : (write.registry ?? null);
+
+  let written: ConnectedInstance | undefined;
+
+  useInstanceStore.setState((state) => {
+    let instances: ConnectedInstance[];
+    if (spec && write.insert) {
+      // A new live entry, which only a phase can give a status to.
+      instances = [
+        ...state.instances.filter((i) => i.origin !== origin),
+        { ...write.insert, ...write.live, status: spec.live, error },
+      ];
+    } else {
+      instances = state.instances.map((i) => {
+        if (i.origin !== origin) return i;
+        return spec ? { ...i, ...write.live, status: spec.live, error } : { ...i, ...write.live };
+      });
+    }
+
+    written = instances.find((i) => i.origin === origin);
+
+    const patch: Partial<InstanceState> = { instances };
+    if (write.isLoading !== undefined) patch.isLoading = write.isLoading;
+
+    if (registryPhase) {
+      patch.registry = upsertRegistryEntry(state.registry, origin, { ...registryPhase, origin });
+      patch.registryUpdatedAt = Date.now();
+    } else if (registryFields) {
+      const entry = state.registry.get(origin);
+      if (entry) {
+        patch.registry = new Map(state.registry).set(origin, { ...entry, ...registryFields });
+        patch.registryUpdatedAt = Date.now();
+      }
+    }
+    return patch;
+  });
+
+  return written;
+}
+
 // ─── Store ───────────────────────────────────────────────────────────────────
 
 interface InstanceState {
@@ -243,7 +631,6 @@ interface InstanceState {
   isLoading: boolean;
   error: string | null;
   _autoConnectDone: boolean;
-  pendingSyncOrigins: string[];
   registry: Map<string, FederationRegistryEntry>;
   registryUpdatedAt: number;
   // True once we've successfully fetched the authoritative registry from the
@@ -262,8 +649,6 @@ interface InstanceState {
   reconnectInstance: (origin: string) => Promise<void>;
   reauthenticateInstance: (origin: string, password: string) => Promise<void>;
   updateInstanceToken: (origin: string, newToken: string) => void;
-  setPendingPasswordSync: (origin: string, pending: boolean) => void;
-  hasPendingPasswordSync: (origin: string) => boolean;
   syncInstanceList: () => Promise<void>;
   autoConnectAll: () => Promise<void>;
   reset: () => void;
@@ -274,7 +659,6 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
   isLoading: false,
   error: null,
   _autoConnectDone: false,
-  pendingSyncOrigins: [],
   registry: new Map(),
   registryUpdatedAt: 0,
   _registrySyncReady: false,
@@ -308,15 +692,9 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
     set({ isLoading: true, error: null });
 
     try {
-      // Step 1: Verify password against the instance we're currently browsing
-      const { valid } = await api.users.verifyPassword(password);
-      if (!valid) {
-        throw new Error('Incorrect password');
-      }
-
-      // Step 2: Compute the user's true home identity
-      // If we're a federated user (e.g. erin@nova browsing orbit),
-      // homeInstance points to the real home, not window.location.host.
+      // Compute the user's true home identity. If we're a federated user
+      // (e.g. erin@nova browsing orbit), homeInstance points at the real home,
+      // not window.location.host.
       const trueHomeHost = currentUser.homeInstance ?? window.location.host;
       const bareUsername = currentUser.username.includes('@')
         ? currentUser.username.split('@')[0]!
@@ -329,10 +707,13 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
 
       let response: AuthResponse | null = null;
       let finalUsername: string;
+      let credentialOrigin: string | null = null;
+      let homeApi: BackspaceApiClient | null = null;
 
       if (targetIsHome) {
-        // Target IS the user's home instance — they already have a native account.
-        // Just login with bare username, no registration or homeInstance params.
+        // Target IS the user's home instance — they already have a native
+        // account there, and the entered password is that account's password.
+        // The login itself is the verification, so there is nothing to pre-check.
         finalUsername = bareUsername;
         try {
           response = await tempClient.auth.login({
@@ -340,48 +721,59 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
             password,
           });
         } catch {
-          throw new DifferentPasswordError(bareUsername);
+          throw new RemoteLoginRequiredError(bareUsername, 'credential-refused');
         }
       } else {
-        // Target is a remote/third-party instance — register as user@homeHost
+        // Target is a remote/third-party instance. The entered password is
+        // checked by the account's OWN home instance and never travels to the
+        // target; the target is given a per-remote secret the home issues.
+        homeApi = resolveCredentialHomeApi();
+        if (!homeApi) {
+          throw new Error(
+            `Connect to your home instance (${trueHomeHost}) first — it issues the credential for ${targetHost}`,
+          );
+        }
+
+        const { valid } = await homeApi.users.verifyPassword(password);
+        if (!valid) {
+          throw new Error('Incorrect password');
+        }
+
+        const credential = await homeApi.users.federationCredential({ origin });
+        credentialOrigin = credential.origin;
         finalUsername = `${bareUsername}@${trueHomeHost}`;
 
         // 2a: Attempt registration with namespaced username
+        let refusal: RemoteLoginReason | null = null;
         try {
           response = await tempClient.auth.register({
             username: finalUsername,
-            password,
+            password: credential.secret,
             displayName: displayName || currentUser.displayName || undefined,
             homeInstance: trueHomeHost,
             homeUserId: trueHomeUserId,
           });
         } catch (err) {
-          const message = (err as Error).message;
-          if (message.includes('already taken') || message.includes('409') ||
-              message.includes('Registration is currently closed') || message.includes('403')) {
-            // Already registered or registration closed — fall through to login
-          } else {
+          // Already registered, or registration closed: fall through to login,
+          // remembering which, because only the first says an account exists.
+          refusal = registrationRefusal(err);
+          if (!refusal) {
             throw err;
           }
         }
 
-        // 2b: If registration didn't work, try login
+        // 2b: If registration didn't work, try login with the issued secret.
+        // There is deliberately no retry with the entered password: an account
+        // that does not accept the issued secret is reached through the explicit
+        // per-instance login form, where the user chooses what to send.
         if (!response) {
           try {
             response = await tempClient.auth.login({
               username: finalUsername,
-              password,
+              password: credential.secret,
             });
           } catch {
-            // Namespaced login failed — try legacy plain username as fallback
-            try {
-              response = await tempClient.auth.login({
-                username: bareUsername,
-                password,
-              });
-            } catch {
-              throw new DifferentPasswordError(bareUsername);
-            }
+            throw new RemoteLoginRequiredError(finalUsername, refusal ?? 'credential-refused');
           }
         }
       }
@@ -390,40 +782,40 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
         throw new Error('Failed to authenticate with remote instance');
       }
 
+      // The remote account now authenticates with the issued secret — record it
+      // so no later launch tries to migrate an already-migrated account.
+      if (homeApi && credentialOrigin) {
+        await homeApi.users
+          .federationCredential({ origin: credentialOrigin, markProvisioned: true })
+          .catch((err) => console.warn('[federation] Could not record credential state:', err));
+      }
+
       // Step 3: Complete connection
       const info = await tempClient.instance.info();
       const authenticatedClient = createApiClient(origin, () => response.token);
 
-      const instance: ConnectedInstance = {
-        origin,
-        label: info.name,
-        token: response.token,
-        user: response.user,
-        username: finalUsername,
-        status: 'connected',
-        api: authenticatedClient,
-      };
-
-      set((state) => {
-        const updated = [...state.instances, instance];
-        saveCachedTokens(updated, currentUser.id);
-        return { instances: updated, isLoading: false };
+      // Replace by origin, never append: a re-authentication runs this over
+      // the placeholder in `error` or `disconnected`, which stays in the list
+      // until the new session takes its place, so the origin is never absent
+      // (Outer Space dedupes against this list at render).
+      const instance = writeConnectionState(origin, 'connected', {
+        insert: {
+          origin,
+          label: info.name,
+          token: response.token,
+          user: response.user,
+          username: finalUsername,
+          api: authenticatedClient,
+        },
+        registry: {
+          label: info.name,
+          username: finalUsername,
+          remoteUserId: response.user.id,
+          addedAt: get().registry.get(origin)?.addedAt ?? Date.now(),
+        },
+        isLoading: false,
       });
-
-      // Upsert registry entry for the new connection
-      const registry = upsertRegistryEntry(get().registry, origin, {
-        origin,
-        label: instance.label,
-        username: instance.username,
-        remoteUserId: instance.user.id,
-        status: 'connected',
-        addedAt: get().registry.get(origin)?.addedAt ?? Date.now(),
-        lastConnectedAt: Date.now(),
-        disconnectedAt: null,
-        errorMessage: null,
-      });
-      const registryUpdatedAt = Date.now();
-      set({ registry, registryUpdatedAt });
+      saveCachedTokens(get().instances, currentUser.id);
 
       // Open WebSocket connection to the remote instance
       connectInstance(origin, response.token);
@@ -431,26 +823,7 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
       // Automatic re-attach for detached accounts (re-attach spec §3.4).
       maybeAutoReattach(instance).catch(() => {});
 
-      // Ensure server-to-server peering for DM relay (non-fatal)
-      try {
-        const peerResult = await api.federation.ensurePeered({ remoteOrigin: origin });
-        if (peerResult.peeringStatus === 'rejected') {
-          const { addToast } = useUIStore.getState();
-          addToast(
-            `Cross-instance messaging unavailable — ${instance.label} requires manual peering approval`,
-            'warning',
-            10000,
-          );
-        } else if (peerResult.peeringStatus === 'pending') {
-          const { addToast } = useUIStore.getState();
-          addToast(
-            `Peering with ${instance.label} in progress — cross-instance messaging will be available shortly`,
-            'info',
-          );
-        }
-      } catch (err) {
-        console.warn('[federation] Peering attempt failed (non-fatal):', err);
-      }
+      await peerHomeWithRemote(origin, instance.label);
 
       // Sync instance list to all instances (fire-and-forget)
       get().syncInstanceList().catch(() => {});
@@ -473,43 +846,42 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
 
       const authenticatedClient = createApiClient(origin, () => response.token);
 
-      const instance: ConnectedInstance = {
-        origin,
-        label: info.name,
-        token: response.token,
-        user: response.user,
-        username: response.user.username,
-        status: 'connected',
-        api: authenticatedClient,
-      };
-
-      set((state) => {
-        const updated = [...state.instances, instance];
-        const userId = useAuthStore.getState().user?.id;
-        if (userId) saveCachedTokens(updated, userId);
-        return { instances: updated, isLoading: false };
+      // Replace by origin, as connectToRemote does: the explicit login is the
+      // fallback for an origin whose placeholder may still be in the list.
+      const instance = writeConnectionState(origin, 'connected', {
+        insert: {
+          origin,
+          label: info.name,
+          token: response.token,
+          user: response.user,
+          username: response.user.username,
+          api: authenticatedClient,
+        },
+        registry: {
+          label: info.name,
+          username: response.user.username,
+          remoteUserId: response.user.id,
+          addedAt: get().registry.get(origin)?.addedAt ?? Date.now(),
+        },
+        isLoading: false,
       });
-
-      // Upsert registry entry for the login connection
-      const registry = upsertRegistryEntry(get().registry, origin, {
-        origin,
-        label: instance.label,
-        username: instance.username,
-        remoteUserId: instance.user.id,
-        status: 'connected',
-        addedAt: get().registry.get(origin)?.addedAt ?? Date.now(),
-        lastConnectedAt: Date.now(),
-        disconnectedAt: null,
-        errorMessage: null,
-      });
-      const registryUpdatedAt = Date.now();
-      set({ registry, registryUpdatedAt });
+      const userId = useAuthStore.getState().user?.id;
+      if (userId) saveCachedTokens(get().instances, userId);
 
       // Open WebSocket connection to the remote instance
       connectInstance(origin, response.token);
 
       // Automatic re-attach for detached accounts (re-attach spec §3.4).
       maybeAutoReattach(instance).catch(() => {});
+
+      // The user just authenticated with a password of their own choosing, so
+      // the remote hash is whatever they typed. Force it back onto the
+      // home-issued secret (no-op unless this is our own federated identity).
+      ensureRemoteCredential(instance, { force: true }).catch((err) =>
+        console.warn('[federation] Could not reconcile remote credential:', err),
+      );
+
+      await peerHomeWithRemote(origin, instance.label);
 
       // Sync instance list to all instances (fire-and-forget)
       get().syncInstanceList().catch(() => {});
@@ -522,13 +894,13 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
 
   setInstanceStatus: (origin, status, error) => {
     const prev = get().instances.find(i => i.origin === origin)?.status;
-    set((state) => ({
-      instances: state.instances.map(i =>
-        i.origin === origin ? { ...i, status, error } : i
-      ),
-    }));
+    // The socket layer's mirror of its own liveness, which is not a registry
+    // event: see the `live-*` phases.
+    writeConnectionState(origin, `live-${status}`, { error });
     if (prev === 'connected' && (status === 'disconnected' || status === 'error')) {
-      failoverDmOriginsFromDisconnected(origin);
+      // DMs pinned to this origin fail over to a reachable copy (pin rule in
+      // stores/dmConversations.ts). Its next `ready` makes it reachable again.
+      useSpaceStore.getState().setDmOriginAvailable(origin, false);
     }
   },
 
@@ -536,30 +908,14 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
     // Tear down WebSocket connection (stops auto-reconnect)
     disconnectWs(origin);
 
-    // Update registry entry to disconnected
-    const registry = upsertRegistryEntry(get().registry, origin, {
-      origin,
-      status: 'disconnected',
-      disconnectedAt: Date.now(),
-      errorMessage: null,
-    });
-    const registryUpdatedAt = Date.now();
-
     // Keep the instance in the array with status 'disconnected' — preserves
     // the token and API client so reconnect is instant (no re-auth needed).
-    set((state) => {
-      const updated = state.instances.map(i =>
-        i.origin === origin ? { ...i, status: 'disconnected' as const, error: undefined } : i
-      );
-      const userId = useAuthStore.getState().user?.id;
-      if (userId) saveCachedTokens(updated, userId);
-      return { instances: updated, registry, registryUpdatedAt };
-    });
+    writeConnectionState(origin, 'disconnected');
+    const userId = useAuthStore.getState().user?.id;
+    if (userId) saveCachedTokens(get().instances, userId);
 
-    // Failover DMs to a connected sibling BEFORE removeInstanceSpaces wipes
-    // this origin's pins. DMs with a connected alternative survive via rekey;
-    // DMs without one are removed alongside the rest of the instance's content.
-    failoverDmOriginsFromDisconnected(origin);
+    // Drops this origin's content. A DM with a copy on another instance moves
+    // to that copy (the pin rule); a DM without one is removed.
     useSpaceStore.getState().removeInstanceSpaces(origin);
 
     // Sync updated lists to remaining instances (fire-and-forget)
@@ -569,6 +925,14 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
 
   reconnectInstance: async (origin: string) => {
     let inst = get().instances.find(i => i.origin === origin);
+
+    // A live session, or an attempt already in flight, needs no second one.
+    // Asked of the entry the store already held, never of the placeholder the
+    // restore below inserts: that placeholder stands for this very attempt and
+    // is therefore `connecting`, so asking after it returned here with the
+    // cached token unverified and no socket opened, and left the origin in
+    // `connecting` for the next caller to read as a session.
+    if (inst && (inst.status === 'connected' || inst.status === 'connecting')) return;
 
     // If the instance was disconnected (removed from active instances array) but
     // has a cached token in localStorage, restore it so reconnect can proceed.
@@ -583,34 +947,23 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
       if (!currentUser) return;
 
       const client = createApiClient(origin, () => entry.token);
-      const restoredInstance: ConnectedInstance = {
-        origin,
-        label: entry.label || new URL(origin).host,
-        token: entry.token,
-        user: currentUser,
-        username: entry.username || '',
-        status: 'connecting' as const,
-        api: client,
-      };
-
-      set((state) => ({
-        instances: [...state.instances, restoredInstance],
-      }));
-
-      inst = restoredInstance;
+      inst = writeConnectionState(origin, 'live-connecting', {
+        insert: {
+          origin,
+          label: entry.label || new URL(origin).host,
+          token: entry.token,
+          user: currentUser,
+          username: entry.username || '',
+          api: client,
+        },
+      });
     }
-
-    if (inst.status === 'connected' || inst.status === 'connecting') return;
 
     // Tokenless placeholders can't reconnect — they need full re-authentication
     if (!inst.token) return;
 
     // Set to connecting
-    set((state) => ({
-      instances: state.instances.map(i =>
-        i.origin === origin ? { ...i, status: 'connecting' as const, error: undefined } : i
-      ),
-    }));
+    writeConnectionState(origin, 'live-connecting');
 
     try {
       const user = await inst.api.users.me();
@@ -624,88 +977,45 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
         // Keep whatever label the instance already had.
       }
 
-      set((state) => ({
-        instances: state.instances.map(i =>
-          i.origin === origin
-            ? {
-                ...i,
-                status: 'connected' as const,
-                user,
-                error: undefined,
-                ...(info
-                  ? {
-                      label: info.name,
-                    }
-                  : {}),
-              }
-            : i
-        ),
-      }));
-
-      // Update registry entry on successful reconnect
-      const registry = upsertRegistryEntry(get().registry, origin, {
-        origin,
-        status: 'connected',
-        lastConnectedAt: Date.now(),
-        disconnectedAt: null,
-        errorMessage: null,
+      writeConnectionState(origin, 'connected', {
+        live: { user, ...(info ? { label: info.name } : {}) },
       });
-      const registryUpdatedAt = Date.now();
-      set({ registry, registryUpdatedAt });
       get().syncRegistry().catch(() => {});
 
       connectInstance(origin, inst.token);
+
+      // Same reconciliation as autoConnectAll: a still-valid token is the one
+      // chance to migrate a connection made before per-remote secrets existed
+      // without asking for a password. No-op once marked provisioned.
+      const reconnected = get().instances.find(i => i.origin === origin);
+      if (reconnected) {
+        ensureRemoteCredential(reconnected).catch((err2) =>
+          console.warn(`[federation] Credential migration deferred for ${origin}:`, err2),
+        );
+      }
+
+      void peerHomeWithRemote(origin, null);
     } catch (err) {
       if (isNetworkError(err)) {
-        set((state) => ({
-          instances: state.instances.map(i =>
-            i.origin === origin
-              ? { ...i, status: 'disconnected' as const, error: 'Instance unreachable — retrying in background' }
-              : i
-          ),
-        }));
-
-        // Update registry on network error
-        const errRegistry = upsertRegistryEntry(get().registry, origin, {
-          origin,
-          status: 'unreachable',
-          errorMessage: 'Instance unreachable',
-        });
-        set({ registry: errRegistry, registryUpdatedAt: Date.now() });
-
+        writeConnectionState(origin, 'unreachable');
+        // The socket's own backoff is what recovers this one.
         connectInstance(origin, inst.token);
       } else {
-        set((state) => ({
-          instances: state.instances.map(i =>
-            i.origin === origin
-              ? { ...i, status: 'error' as const, error: 'Token expired — re-authenticate to reconnect' }
-              : i
-          ),
-        }));
-
-        // Update registry on auth error
-        const errRegistry = upsertRegistryEntry(get().registry, origin, {
-          origin,
-          status: 'auth_expired',
-          errorMessage: 'Token expired',
-        });
-        set({ registry: errRegistry, registryUpdatedAt: Date.now() });
+        writeConnectionState(origin, 'token-expired');
       }
     }
   },
 
   reauthenticateInstance: async (origin: string, password: string) => {
-    const inst = get().instances.find(i => i.origin === origin);
-
-    // Clean up existing instance if present (stale placeholder or disconnected entry)
-    if (inst) {
-      set((state) => ({
-        instances: state.instances.filter(i => i.origin !== origin),
-      }));
+    // The stale placeholder (error or disconnected) stays in `instances`
+    // until connectToRemote replaces it by origin on success. Removing it up
+    // front left the origin absent for the request's duration, and for good
+    // on a wrong password, so its spaces surfaced in Outer Space under a chip
+    // saying the session had expired. Its spaces and socket do go now: the
+    // new session's ready payload brings them back.
+    if (get().instances.some((i) => i.origin === origin)) {
       useSpaceStore.getState().removeInstanceSpaces(origin);
     }
-
-    // Disconnect any lingering WS
     disconnectWs(origin);
 
     // Re-connect through the standard flow (handles register/login)
@@ -717,10 +1027,6 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
       password,
       currentUser.displayName || undefined,
     );
-
-    // Clear pending password sync — connectToRemote uses the current password
-    // which updates the remote's stored hash through register/login
-    get().setPendingPasswordSync(origin, false);
   },
 
   updateInstanceToken: (origin: string, newToken: string) => {
@@ -739,28 +1045,6 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
     // Reconnect WebSocket with new token
     disconnectWs(origin);
     connectInstance(origin, newToken);
-  },
-
-  setPendingPasswordSync: (origin: string, pending: boolean) => {
-    const userId = useAuthStore.getState().user?.id;
-    if (!userId) return;
-
-    // Update Zustand state (triggers React re-renders)
-    set((state) => ({
-      pendingSyncOrigins: pending
-        ? state.pendingSyncOrigins.includes(origin)
-          ? state.pendingSyncOrigins
-          : [...state.pendingSyncOrigins, origin]
-        : state.pendingSyncOrigins.filter(o => o !== origin),
-    }));
-
-    // Also persist to localStorage
-    const flags: Record<string, boolean> = { [origin]: pending };
-    saveCachedTokens(get().instances, userId, flags);
-  },
-
-  hasPendingPasswordSync: (origin: string) => {
-    return get().pendingSyncOrigins.includes(origin);
   },
 
   syncInstanceList: async () => {
@@ -862,7 +1146,8 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
     // Tear down WebSocket if connected
     disconnectWs(origin);
 
-    // Remove from registry
+    // A removal is not a phase: there is no status left to agree on, and both
+    // halves go in the one `set` below.
     const registry = new Map(get().registry);
     registry.delete(origin);
     const registryUpdatedAt = Date.now();
@@ -875,8 +1160,7 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
       return { instances: updated, registry, registryUpdatedAt };
     });
 
-    // Same rationale as disconnectInstance — preserve DMs with connected alts.
-    failoverDmOriginsFromDisconnected(origin);
+    // Same as disconnectInstance: DMs with a copy elsewhere move to it.
     useSpaceStore.getState().removeInstanceSpaces(origin);
 
     get().syncRegistry().catch(() => {});
@@ -929,11 +1213,18 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
         addedAt: Date.now(),
         lastConnectedAt: null,
         disconnectedAt: null,
-        errorMessage: 'Re-authenticate to connect',
+        errorMessage: registryReason('reauthenticate'),
       });
     }
 
-    // Migration: promote localStorage-only entries to registry
+    // Migration: promote localStorage-only entries to registry. The seed says
+    // `auth_expired`, the same status a known connection with no proven session
+    // gets above, because a cached token is not a session: an origin that is
+    // absent from `replicatedInstances` is never in the connect phase below, so
+    // it gets no live entry at all and a row saying `connected` would stand for
+    // a session that nothing is holding. An origin the connect phase does reach
+    // (the home instance of a federated account) moves off this status in the
+    // same run, and only `disconnected` would have kept it from being tried.
     for (const [origin] of Object.entries(cached)) {
       if (origin === window.location.origin) continue;
       if (!registry.has(origin)) {
@@ -942,11 +1233,11 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
           label: cached[origin]?.label || new URL(origin).host,
           username: cached[origin]?.username || '',
           remoteUserId: '',
-          status: 'connected',
+          status: 'auth_expired',
           addedAt: Date.now(),
-          lastConnectedAt: Date.now(),
+          lastConnectedAt: null,
           disconnectedAt: null,
-          errorMessage: null,
+          errorMessage: registryReason('reauthenticate'),
         });
       }
     }
@@ -988,7 +1279,7 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
             addedAt: Date.now(),
             lastConnectedAt: null,
             disconnectedAt: null,
-            errorMessage: 'Authenticate to connect to your home instance',
+            errorMessage: registryReason('authenticate_home'),
           });
         }
       }
@@ -999,6 +1290,14 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
       set({ _autoConnectDone: true });
       return;
     }
+
+    // Publish the reconciled registry before the connect phase starts. What the
+    // seeding above built is the last state the server and localStorage knew;
+    // everything from here is a live connection changing state, so it goes
+    // through `writeConnectionState` and lands on the store's Map rather than on
+    // a local copy this function would have to remember to publish. Nothing is
+    // pushed yet: `syncRegistry` is a no-op until `_autoConnectDone`.
+    set({ registry });
 
     // Split server-known instances into three groups:
     // - withToken: have a cached token and should auto-connect
@@ -1014,7 +1313,7 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
       if (isSelfOrigin(origin)) continue;
       if (get().instances.some(i => i.origin === origin)) continue; // already loaded
       const cachedEntry = cached[origin];
-      const regEntry = registry.get(origin);
+      const regEntry = get().registry.get(origin);
       if (cachedEntry) {
         // Respect user's explicit disconnect — don't auto-reconnect
         if (regEntry?.status === 'disconnected') {
@@ -1028,46 +1327,36 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
     }
 
     // Add user-disconnected instances as disconnected placeholders (token preserved
-    // so reconnect is instant, but no WebSocket or API calls until user clicks reconnect)
-    if (userDisconnected.length > 0) {
-      set((state) => {
-        const placeholders: ConnectedInstance[] = userDisconnected.map(({ origin, entry: cachedEntry }) => ({
+    // so reconnect is instant, but no WebSocket or API calls until user clicks reconnect).
+    // The registry already says `disconnected` — that is how they were sorted into
+    // this group — so the placeholder is a live-only write and the row keeps the
+    // time the user actually disconnected.
+    for (const { origin, entry: cachedEntry } of userDisconnected) {
+      writeConnectionState(origin, 'live-disconnected', {
+        insert: {
           origin,
           label: cachedEntry.label || new URL(origin).host,
           token: cachedEntry.token,
           user: currentUser,
           username: cachedEntry.username || '',
-          status: 'disconnected' as const,
           api: createApiClient(origin, () => cachedEntry.token),
-        }));
-        return { instances: [...state.instances, ...placeholders] };
+        },
       });
     }
 
     // Immediately add tokenless placeholders so they're visible in Zustand
     // (and therefore won't be erased by syncInstanceList)
-    if (withoutToken.length > 0) {
-      set((state) => {
-        const placeholders: ConnectedInstance[] = withoutToken.map(({ origin, ri }) => ({
+    for (const { origin, ri } of withoutToken) {
+      writeConnectionState(origin, 'no-session', {
+        insert: {
           origin,
           label: new URL(origin).host,
           token: '',
           user: currentUser, // placeholder
           username: ri.username,
-          status: 'error' as const,
-          error: 'Session expired — re-authenticate to reconnect',
           api: createApiClient(origin, () => null),
-        }));
-        return { instances: [...state.instances, ...placeholders] };
+        },
       });
-    }
-
-    // Update registry for tokenless placeholders
-    for (const { origin } of withoutToken) {
-      const entry = registry.get(origin);
-      if (entry) {
-        registry.set(origin, { ...entry, status: 'auth_expired', errorMessage: 'Session expired — re-authenticate to reconnect' });
-      }
     }
 
     // Connect instances with cached tokens in parallel
@@ -1078,19 +1367,16 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
           const client = createApiClient(origin, () => cachedEntry.token);
 
           // Set as connecting
-          const connectingInstance: ConnectedInstance = {
-            origin,
-            label: cachedEntry.label || new URL(origin).host,
-            token: cachedEntry.token,
-            user: currentUser, // Placeholder until we verify
-            username: cachedEntry.username || ri.username,
-            status: 'connecting',
-            api: client,
-          };
-
-          set((state) => ({
-            instances: [...state.instances.filter(i => i.origin !== origin), connectingInstance],
-          }));
+          writeConnectionState(origin, 'live-connecting', {
+            insert: {
+              origin,
+              label: cachedEntry.label || new URL(origin).host,
+              token: cachedEntry.token,
+              user: currentUser, // Placeholder until we verify
+              username: cachedEntry.username || ri.username,
+              api: client,
+            },
+          });
 
           try {
             // Verify the token is still valid
@@ -1120,66 +1406,35 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
               cachedEntry.username = user.username;
             }
 
-            const connectedInstance: ConnectedInstance = {
-              origin,
-              label,
-              token: cachedEntry.token,
-              user,
-              username: user.username,
-              status: 'connected',
-              api: client,
-            };
-
-            set((state) => ({
-              instances: state.instances.map(i => i.origin === origin ? connectedInstance : i),
-            }));
-
-            // Update registry entry on successful reconnect
-            const entry = registry.get(origin);
-            if (entry) {
-              registry.set(origin, { ...entry, status: 'connected', lastConnectedAt: Date.now(), disconnectedAt: null, errorMessage: null, remoteUserId: user.id, label });
-            }
+            const connectedInstance = writeConnectionState(origin, 'connected', {
+              live: { label, user, username: user.username },
+              registry: { label, remoteUserId: user.id },
+            });
 
             // Open WebSocket connection now that we've verified the token
             connectInstance(origin, cachedEntry.token);
 
-            // Initiate server-to-server peering for DM relay (non-fatal, idempotent)
-            api.federation.ensurePeered({ remoteOrigin: origin }).catch(() => {});
+            // Migrate connections provisioned before per-remote secrets existed,
+            // while this still-valid token makes it possible without a password.
+            // No-op once the home instance has the account marked provisioned.
+            if (connectedInstance) {
+              ensureRemoteCredential(connectedInstance).catch((err) =>
+                console.warn(`[federation] Credential migration deferred for ${origin}:`, err),
+              );
+            }
+
+            void peerHomeWithRemote(origin, null);
           } catch (err) {
             if (isNetworkError(err)) {
               // Instance unreachable (NAT hairpinning, DNS, server down) — token may still be valid
-              set((state) => ({
-                instances: state.instances.map(i =>
-                  i.origin === origin
-                    ? { ...i, status: 'disconnected' as const, error: 'Instance unreachable — retrying in background' }
-                    : i
-                ),
-              }));
-
-              // Update registry entry on network error
-              const entry = registry.get(origin);
-              if (entry) {
-                registry.set(origin, { ...entry, status: 'unreachable', errorMessage: 'Instance unreachable' });
-              }
+              writeConnectionState(origin, 'unreachable');
 
               // Start WebSocket — its built-in exponential backoff retry will auto-recover
               // when the network path becomes available (e.g. user switches networks)
               connectInstance(origin, cachedEntry.token);
             } else {
               // Auth failure (401, invalid token, etc.)
-              set((state) => ({
-                instances: state.instances.map(i =>
-                  i.origin === origin
-                    ? { ...i, status: 'error' as const, error: 'Token expired — re-authenticate to reconnect' }
-                    : i
-                ),
-              }));
-
-              // Update registry entry on auth error
-              const entry = registry.get(origin);
-              if (entry) {
-                registry.set(origin, { ...entry, status: 'auth_expired', errorMessage: 'Token expired' });
-              }
+              writeConnectionState(origin, 'token-expired');
             }
           }
         })
@@ -1196,19 +1451,14 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
     // so tokens are preserved for instant reconnect (registry controls auto-connect behavior)
     saveCachedTokens(get().instances, currentUser.id);
 
-    // Hydrate pendingSyncOrigins from localStorage cache and mark auto-connect done
-    const freshCached = loadCachedTokens(currentUser.id);
-    const pendingOrigins = Object.entries(freshCached)
-      .filter(([, v]) => v.pendingPasswordSync)
-      .map(([origin]) => origin);
-
-    // Persist reconciled registry. _registrySyncReady gates outbound PUTs:
-    // only flip true when we've authoritatively read from the home server.
+    // Stamp the reconciled registry the connect phase left on the store. The
+    // stamp is the LWW clock the home server compares against, not a record
+    // that a status moved, which is why it is written here and not by
+    // `writeConnectionState`. _registrySyncReady gates outbound PUTs: only flip
+    // true when we've authoritatively read from the home server.
     const registryUpdatedAt = serverRegistryUpdatedAt > 0 ? Math.max(serverRegistryUpdatedAt, Date.now()) : Date.now();
     set({
       _autoConnectDone: true,
-      pendingSyncOrigins: pendingOrigins,
-      registry,
       registryUpdatedAt,
       _registrySyncReady: serverRegistryFetched,
     });
@@ -1229,12 +1479,120 @@ export const useInstanceStore = create<InstanceState>((set, get) => ({
     // Tear down all remote WebSocket connections
     disconnectAllRemote();
 
-    clearPasswordSyncTimers();
 
-    set({ instances: [], isLoading: false, error: null, _autoConnectDone: false, pendingSyncOrigins: [], registry: new Map(), registryUpdatedAt: 0, _registrySyncReady: false });
+    set({ instances: [], isLoading: false, error: null, _autoConnectDone: false, registry: new Map(), registryUpdatedAt: 0, _registrySyncReady: false });
     // Token cache preserved — scoped per user, survives logout for seamless reconnect
   },
 }));
+
+// ─── Shared connect path ─────────────────────────────────────────────────────
+
+export type ConnectOutcome =
+  | { kind: 'connected'; how: 'new' | 'reconnect' | 'already' | 'resumed' }
+  /** No password was typed and no cached session could be resumed: ask for one. */
+  | { kind: 'needs-password' }
+  /** The instance needs the account's own credentials; `reason` words the notice the login form carries. */
+  | { kind: 'needs-remote-password'; remoteUsername: string; reason: RemoteLoginReason };
+
+/**
+ * The origin, as the store spells it, that a cached token could still carry
+ * back: a live instance the user disconnected or whose session errored, as
+ * long as it kept its token, or (with no live instance) a registry entry the
+ * user disconnected, whose token `reconnectInstance` restores from
+ * `localStorage`. Null when there is nothing to resume.
+ *
+ * The registry side lists `disconnected` only. `unreachable` has a chip that
+ * retries it already, and `auth_expired` is what a refused token becomes, so
+ * neither is worth a second attempt from a card. The live side does include
+ * `error`, that status's live counterpart, because a live instance can hold
+ * a token the registry has not judged yet; such an origin is inner anyway,
+ * so no card opens the dialog for it.
+ */
+export function resumableOrigin(state: InstanceState, canonical: string): string | null {
+  const live = state.instances.find((i) => normalizeOrigin(i.origin) === canonical);
+  if (live) {
+    const stale = live.status === 'disconnected' || live.status === 'error';
+    return stale && live.token !== '' ? live.origin : null;
+  }
+  for (const entry of state.registry.values()) {
+    if (normalizeOrigin(entry.origin) === canonical && entry.status === 'disconnected') return entry.origin;
+  }
+  return null;
+}
+
+/** The registry status for an origin after a reconnect attempt, however the store spells it. */
+function registryStatusFor(state: InstanceState, canonical: string): FederationRegistryEntry['status'] | undefined {
+  for (const entry of state.registry.values()) {
+    if (normalizeOrigin(entry.origin) === canonical) return entry.status;
+  }
+  return undefined;
+}
+
+/**
+ * The one way to establish a session on another instance from a user-typed
+ * password: the Connections panel and the directory's connect-then-join flow
+ * both go through it. The branch is by the status the store holds for the
+ * origin: `error` or `disconnected` is re-authenticated in place;
+ * `connected` or `connecting` is usable already and short-circuits without
+ * touching the store (`connectToRemote` has no duplicate check of its own
+ * and would append a second entry); an unknown origin connects. An instance
+ * that can only be signed into with the account's own credentials
+ * (`RemoteLoginRequiredError`) is reported as `needs-remote-password` with
+ * its reason, so the caller can offer the explicit per-instance login form
+ * under the right notice; every other failure is thrown as is.
+ *
+ * Called with an empty password it asks nothing of the user yet: an origin
+ * a cached token could carry back is resumed through `reconnectInstance`
+ * (the same token reconnect the Connections row and the Explore chips use),
+ * and the caller learns `resumed`, or `needs-password` when there was no
+ * session to resume or the token was refused. An instance that turned out
+ * unreachable is reported as `peer_unreachable` rather than as a password
+ * the user could fix. This is what lets a card for an instance the user
+ * disconnected join without a prompt they gain nothing from.
+ *
+ * This does not validate a typed URL: a caller that wants the self and
+ * duplicate checks for user input still runs `probeInstance` first, as the
+ * Connections flow does.
+ */
+export async function connectToInstance(
+  origin: string,
+  password: string,
+  displayName?: string,
+): Promise<ConnectOutcome> {
+  const store = useInstanceStore.getState();
+  const canonical = normalizeOrigin(origin);
+  const existing = store.instances.find((i) => normalizeOrigin(i.origin) === canonical);
+  if (existing && (existing.status === 'connected' || existing.status === 'connecting')) {
+    return { kind: 'connected', how: 'already' };
+  }
+
+  if (password === '') {
+    const resumable = resumableOrigin(store, canonical);
+    if (!resumable) return { kind: 'needs-password' };
+    await store.reconnectInstance(resumable);
+    const after = useInstanceStore.getState();
+    const live = after.instances.find((i) => normalizeOrigin(i.origin) === canonical);
+    if (live?.status === 'connected') return { kind: 'connected', how: 'resumed' };
+    if (registryStatusFor(after, canonical) === 'unreachable') {
+      throw new HttpError(503, 'peer_unreachable', { error: 'peer_unreachable', code: 'peer_unreachable', statusCode: 503 }, 'peer_unreachable');
+    }
+    return { kind: 'needs-password' };
+  }
+
+  try {
+    if (existing) {
+      await store.reauthenticateInstance(existing.origin, password);
+      return { kind: 'connected', how: 'reconnect' };
+    }
+    await store.connectToRemote(canonical, password, displayName);
+    return { kind: 'connected', how: 'new' };
+  } catch (err) {
+    if (err instanceof RemoteLoginRequiredError) {
+      return { kind: 'needs-remote-password', remoteUsername: err.remoteUsername, reason: err.reason };
+    }
+    throw err;
+  }
+}
 
 // ─── API client resolution ───────────────────────────────────────────────────
 // Register the resolver with spaceStore so getApiForOrigin() works everywhere.

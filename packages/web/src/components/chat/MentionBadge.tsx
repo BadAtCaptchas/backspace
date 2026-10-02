@@ -1,62 +1,65 @@
 import React from 'react';
-import type { User } from '@backspace/shared';
-import { useSpaceStore } from '../../stores/spaceStore';
+import { useTranslation } from 'react-i18next';
 import { useUIStore } from '../../stores/uiStore';
-import { useCanonicalUserView } from '../../utils/userViewLookup';
+import { useChannelUser } from '../../utils/channelUser';
+import { userDisplayName } from '../../utils/identity';
+
+/** Resolved mention without a role colour (a DM, or a member with no role). */
+const ACCENT_COLOR = '#7c6cf6';
+/** A mention this client cannot place in the channel. */
+const UNRESOLVED_COLOR = '#a0a0aa';
 
 interface MentionBadgeProps {
   userId: string;
+  /**
+   * The channel the mention was written in. A `<@id>` token carries an id on
+   * that channel's origin and names one of that channel's people, so it is
+   * resolved there (`utils/channelUser`). Null outside a channel: the badge
+   * cannot resolve and shows the unknown-user label.
+   */
+  channelId: string | null;
+  /**
+   * False inside another control (a reply preview is a jump button): the badge
+   * keeps its look but is plain text, so it neither opens a profile nor nests
+   * interactive content in that control.
+   */
+  interactive?: boolean;
 }
 
-export const MentionBadge = React.memo(function MentionBadge({ userId }: MentionBadgeProps) {
-  const members = useSpaceStore((s) => s.members);
-  const spaces = useSpaceStore((s) => s.spaces);
-  const currentSpaceId = useSpaceStore((s) => s.currentSpaceId);
+export const MentionBadge = React.memo(function MentionBadge({ userId, channelId, interactive = true }: MentionBadgeProps) {
+  const { t } = useTranslation('chat');
   const openUserProfile = useUIStore((s) => s.openUserProfile);
+  const resolved = useChannelUser(channelId, userId);
 
-  const member = members.find((m) => m.userId === userId);
-  const space = spaces.find((s) => s.id === currentSpaceId);
-  const ownerId = space?.ownerId;
-
-  const _FALLBACK_USER = { id: '', username: '', createdAt: 0, isAdmin: false, replicatedInstances: [] } as unknown as User;
-  const canonicalMemberUser = useCanonicalUserView(member?.user ?? _FALLBACK_USER);
-  const memberUser = member ? canonicalMemberUser : null;
-
-  let displayName: string;
-  let color: string;
-
-  if (member && memberUser) {
-    displayName = memberUser.displayName ?? memberUser.username;
-    if (member.roles && member.roles.length > 0) {
-      const sorted = [...member.roles].sort((a, b) => b.position - a.position);
-      color = sorted[0]!.color;
-    } else if (ownerId && userId === ownerId) {
-      color = '#fda4af';
-    } else {
-      color = '#7c6cf6'; // accent-primary default
-    }
-  } else {
-    displayName = 'Unknown User';
-    color = '#a0a0aa'; // text-secondary fallback
-  }
+  const displayName = resolved ? userDisplayName(resolved.user) : t('message.mention.unknownUser');
+  // Role colour and owner rose exist only in space channels (nameColor is null in a DM).
+  const color = resolved ? resolved.nameColor ?? ACCENT_COLOR : UNRESOLVED_COLOR;
 
   const handleClick = (e: React.MouseEvent) => {
-    if (!member || !memberUser) return;
+    if (!resolved) return;
     e.stopPropagation();
-    const rect = e.currentTarget.getBoundingClientRect();
-    openUserProfile(memberUser, {
-      top: Math.min(rect.top, window.innerHeight - 450),
-      left: rect.right + 8,
-    });
+    const memberContext = resolved.member
+      ? { spaceId: resolved.member.spaceId, userId: resolved.member.userId }
+      : undefined;
+    openUserProfile(resolved.user, e.currentTarget.getBoundingClientRect(), undefined, memberContext);
   };
 
   // Build inline styles: role-colored text with tinted background
   const bgColor = color + '1a'; // ~10% opacity hex
+  const baseClass = 'inline-flex items-center rounded-[3px] px-[2px] font-medium';
+
+  if (!interactive) {
+    return (
+      <span className={baseClass} style={{ color, backgroundColor: bgColor }}>
+        @{displayName}
+      </span>
+    );
+  }
 
   return (
     <span
       onClick={handleClick}
-      className="inline-flex items-center rounded-[3px] px-[2px] font-medium cursor-pointer transition-colors hover:brightness-125"
+      className={`${baseClass} cursor-pointer transition-colors hover:brightness-125`}
       style={{ color, backgroundColor: bgColor }}
     >
       @{displayName}

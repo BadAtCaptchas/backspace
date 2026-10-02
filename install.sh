@@ -23,6 +23,9 @@
 #     APP_PORT=8080 \                 # proxy/tunnel only; auto-picked if unset
 #     ENABLE_VOICE=true \
 #     INSTANCE_NAME="My Chat" \
+#     TELEMETRY=on|off \              # the optional daily usage ping; leave it
+#                                     # unset and the admin panel asks after the
+#                                     # first login
 #     ./install.sh
 #
 #   BACKSPACE_BUILD=true ./install.sh  Force a local from-source build instead of
@@ -335,33 +338,60 @@ if [[ -z "${DOMAIN:-}" ]]; then
   exit 1
 fi
 
+if [[ "$DOMAIN" == *://* || "$DOMAIN" == */* ]]; then
+  error "DOMAIN is a hostname, not a URL: use chat.example.com, not ${DOMAIN}."
+  exit 1
+fi
+
+# A public port other than 443 belongs in DOMAIN itself (chat.example.com:1443):
+# it is the host clients type, and every URL the instance advertises is built
+# from it. Only proxy mode can honour one. The bundled Caddy owns 80/443 and
+# needs them for certificate issuance, and a tunnel always answers on 443 at
+# the provider's edge.
+DOMAIN_HOST="${DOMAIN%%:*}"
+DOMAIN_PORT=""
+if [[ "$DOMAIN" == *:* ]]; then
+  DOMAIN_PORT="${DOMAIN##*:}"
+  if ! [[ "$DOMAIN_PORT" =~ ^[0-9]+$ ]] || (( 10#$DOMAIN_PORT < 1 || 10#$DOMAIN_PORT > 65535 )); then
+    error "DOMAIN='${DOMAIN}' is not a hostname or hostname:port."
+    exit 1
+  fi
+  if [[ "$DEPLOY_MODE" != "proxy" ]]; then
+    error "A custom public port (DOMAIN=${DOMAIN}) only works in proxy mode."
+    error "All-in-One needs 80/443 for Caddy and its certificates; a tunnel serves on 443 at its edge."
+    error "Re-run with DEPLOY_MODE=proxy, or drop the port from DOMAIN."
+    exit 1
+  fi
+  info "Public port ${DOMAIN_PORT}: your reverse proxy listens there and must pass the Host header through unchanged (the snippets below do)."
+fi
+
 # DNS verification is meaningful for All-in-One (Caddy must reach this host to
 # issue a certificate). In proxy/tunnel mode the DNS record points at your proxy
 # or tunnel edge — often NOT this host's IP (that's the whole point) — so we only
 # note what it resolves to, without warning about a mismatch.
-info "Checking DNS for ${DOMAIN}..."
+info "Checking DNS for ${DOMAIN_HOST}..."
 resolved_ip=""
 if command -v dig &>/dev/null; then
-  resolved_ip=$(dig +short "$DOMAIN" A 2>/dev/null | tail -1 || true)
+  resolved_ip=$(dig +short "$DOMAIN_HOST" A 2>/dev/null | tail -1 || true)
 elif command -v getent &>/dev/null; then
-  resolved_ip=$(getent hosts "$DOMAIN" 2>/dev/null | awk '{print $1}' | head -1 || true)
+  resolved_ip=$(getent hosts "$DOMAIN_HOST" 2>/dev/null | awk '{print $1}' | head -1 || true)
 fi
 
 if [[ "$DEPLOY_MODE" == "allinone" ]]; then
   my_ip=$(curl -s4 --connect-timeout 5 ifconfig.me 2>/dev/null || curl -s4 --connect-timeout 5 icanhazip.com 2>/dev/null || echo "")
   if [[ -z "$resolved_ip" ]]; then
-    warn "Could not resolve ${DOMAIN}. Ensure DNS is configured before Caddy can issue certificates."
+    warn "Could not resolve ${DOMAIN_HOST}. Ensure DNS is configured before Caddy can issue certificates."
   elif [[ -n "$my_ip" && "$resolved_ip" != "$my_ip" ]]; then
-    warn "${DOMAIN} resolves to ${resolved_ip}, but this server appears to be ${my_ip}"
+    warn "${DOMAIN_HOST} resolves to ${resolved_ip}, but this server appears to be ${my_ip}"
     warn "Let's Encrypt certificate issuance may fail if DNS doesn't point here."
   else
-    success "${DOMAIN} resolves to ${resolved_ip:-verified}"
+    success "${DOMAIN_HOST} resolves to ${resolved_ip:-verified}"
   fi
 else
   if [[ -n "$resolved_ip" ]]; then
-    info "${DOMAIN} currently resolves to ${resolved_ip} (should point at your proxy/tunnel edge)."
+    info "${DOMAIN_HOST} currently resolves to ${resolved_ip} (should point at your proxy/tunnel edge)."
   else
-    info "${DOMAIN} does not resolve yet — point it at your proxy/tunnel edge when ready."
+    info "${DOMAIN_HOST} does not resolve yet — point it at your proxy/tunnel edge when ready."
   fi
 fi
 
@@ -450,6 +480,18 @@ else
   MAX_UPLOAD_SIZE=104857600  # 100 MB
 fi
 
+# ── Trusted proxy hops ──────────────────────────────────────
+# The number of proxies in front of the app that may be trusted to have written
+# X-Forwarded-For. Every rate limit keys on the address it produces. All three
+# deployment modes are one hop, which is the app's default, so this is written
+# commented-out and only becomes a live line when an operator (or a previous
+# run) set one: 0 for an app exposed with nothing in front, 2 for a CDN ahead
+# of an appending reverse proxy. An explicit env value or an existing .env
+# value always wins; neither is second-guessed here, because only the operator
+# knows their topology.
+existing_hops=$(env_val TRUSTED_PROXY_HOPS)
+TRUSTED_PROXY_HOPS="${TRUSTED_PROXY_HOPS:-${existing_hops}}"
+
 # ── Phase 3: Generate Secrets ───────────────────────────────
 
 step "Generating configuration"
@@ -506,6 +548,35 @@ EOF
 # files automatically — no -f flags needed.
 COMPOSE_FILE=docker-compose.yml:docker-compose.proxy.yml
 APP_PORT=${APP_PORT_FINAL}
+EOF
+  fi
+
+  if [[ -n "$TRUSTED_PROXY_HOPS" ]]; then
+    cat << EOF
+
+# Proxies in front of this app that may be trusted to have written
+# X-Forwarded-For. Preserved from your previous configuration or from the
+# environment; see .env.example for what each value means.
+TRUSTED_PROXY_HOPS=${TRUSTED_PROXY_HOPS}
+EOF
+  else
+    cat << 'EOF'
+
+# How many proxies sit in front of this app and may be trusted to have written
+# X-Forwarded-For. It is the address every rate limit counts a request against.
+# The default of 1 is right for all three deployment modes above: the bundled
+# Caddy, your own reverse proxy and a tunnel daemon are each one hop. Change it
+# only if your topology differs:
+#   0  nothing in front at all (the app exposed directly). Leaving such an
+#      instance at 1 lets a client send its own X-Forwarded-For and choose the
+#      address its rate limits are counted against.
+#   2  a CDN in front of your own reverse proxy, when that proxy APPENDS to
+#      X-Forwarded-For. Behind the bundled Caddy the number alone does nothing
+#      until Caddy's trusted_proxies names the CDN.
+# Any value that is not a non-negative integer, or is above 4, stops the server
+# at boot with a message instead of quietly running a number you did not pick.
+# Leaving the line blank is not a value: it reads as unset and you get 1.
+# TRUSTED_PROXY_HOPS=1
 EOF
   fi
 
@@ -646,24 +717,58 @@ build_from_source() {
 # hosts the ~1.6GB local build that OOMs small boxes). Fall back to a from-source
 # build if the image can't be pulled (not published yet, private, or offline), or
 # if the operator forces a build (BACKSPACE_BUILD=true — e.g. running a fork).
+# Records which path this install actually took, so ./update.sh knows whether to
+# pull an image or rebuild, and the admin Updates panel can say which it is.
+# Written *after* the decision resolves rather than alongside the rest of .env,
+# so a fallback-to-build is recorded truthfully instead of as the pull that was
+# attempted first.
+record_install_channel() {
+  local channel="$1"
+  local tmp
+  if [[ -f .env ]] && grep -q '^BACKSPACE_INSTALL_CHANNEL=' .env; then
+    # Rewritten through a temp file rather than with sed -i: GNU and BSD sed
+    # disagree about -i, and this script is also read on macOS.
+    tmp="$(mktemp)"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      if [[ "$line" == BACKSPACE_INSTALL_CHANNEL=* ]]; then
+        printf '%s\n' "BACKSPACE_INSTALL_CHANNEL=${channel}"
+      else
+        printf '%s\n' "$line"
+      fi
+    done < .env > "$tmp"
+    mv "$tmp" .env
+  else
+    cat >> .env << EOF
+
+# How this instance gets its image: prebuilt | source
+# Written by install.sh after the pull-or-build decision. ./update.sh reads it.
+BACKSPACE_INSTALL_CHANNEL=${channel}
+EOF
+  fi
+}
+
 if [[ "${BACKSPACE_BUILD:-false}" == "true" ]]; then
   info "BACKSPACE_BUILD=true — building from source (skipping the prebuilt image)."
   build_from_source
+  record_install_channel source
 else
   image_ref="${BACKSPACE_IMAGE:-ghcr.io/thezwiss/backspace}:${BACKSPACE_IMAGE_TAG:-latest}"
   info "Fetching prebuilt image ${image_ref} ..."
   if $COMPOSE pull backspace; then
     success "Pulled prebuilt image"
+    record_install_channel prebuilt
   elif $DOCKER image inspect "$image_ref" >/dev/null 2>&1; then
     # Pull failed (offline / registry hiccup / private) but a usable copy is
     # already on this host (a prior run, an air-gapped `docker load`, or a
     # previous from-source build tagged under this ref) — use it instead of
     # forcing a needless multi-hundred-MB rebuild.
     warn "Could not pull ${image_ref} — using the copy already present on this host."
+    record_install_channel prebuilt
   else
     warn "Prebuilt image unavailable (not published yet, private, or offline)."
     warn "Falling back to a from-source build — slower, and heavy on low-RAM/ARM hosts."
     build_from_source
+    record_install_channel source
   fi
 fi
 
@@ -701,6 +806,50 @@ if [[ "$healthy" == true && -n "$INSTANCE_NAME" && "$INSTANCE_NAME" != "Backspac
     db.close();
     if (changes === 0) { console.error("No rows updated"); process.exit(1); }
   ' 2>/dev/null && success "Instance name set to: ${INSTANCE_NAME}" || warn "Could not set instance name (set it manually in admin settings)"
+fi
+
+# ── Phase 7b: Optional usage ping (TELEMETRY=on|off) ────────
+# For unattended installs only. Interactive runs are never asked here: the admin
+# panel asks once after the first login, with the full explanation. Leaving
+# TELEMETRY unset writes nothing to the database and leaves that ask intact.
+#
+# The transition mirrors setTelemetryEnabled() in
+# packages/server/src/telemetry/state.ts: turning on mints an id if the
+# instance never had one, turning on an instance that is already on changes
+# nothing, and turning off keeps the id for a later re-enable and stamps the
+# running version as the declined one, so the admin panel stays quiet about it
+# until the next minor release rather than asking at the first login. Neither
+# branch touches telemetry_last_day: that column is the reporter's record of
+# what it sent, and writing it here would cost the instance a day's ping.
+# Nothing here can fail the install.
+if [[ -n "${TELEMETRY:-}" ]]; then
+  if [[ "$TELEMETRY" != "on" && "$TELEMETRY" != "off" ]]; then
+    error "TELEMETRY must be 'on' or 'off' (got '${TELEMETRY}'). Leaving the usage ping unset."
+  elif [[ "$healthy" != true ]]; then
+    warn "Skipped the usage ping setting: the container isn't healthy yet (set it in admin settings)"
+  else
+    # Pass the value through the container environment rather than interpolating
+    # it into the JS source, the same way the instance name is passed above.
+    telemetry_result=$($DOCKER exec -e BS_TELEMETRY="$TELEMETRY" -w /app/packages/server backspace node -e '
+      const Database = require("better-sqlite3");
+      const crypto = require("crypto");
+      const db = new Database("/app/data/backspace.db");
+      const row = db.prepare("SELECT telemetry_enabled FROM instance_settings WHERE id = 1").get();
+      if (!row) { db.close(); console.error("No instance_settings row"); process.exit(1); }
+      const now = Date.now();
+      let result;
+      if (process.env.BS_TELEMETRY === "on") {
+        const changes = db.prepare("UPDATE instance_settings SET telemetry_enabled = 1, telemetry_id = COALESCE(telemetry_id, ?), telemetry_last_error = NULL, updated_at = ? WHERE id = 1 AND (telemetry_enabled IS NULL OR telemetry_enabled = 0)").run(crypto.randomUUID(), now).changes;
+        result = changes === 1 ? "on, the first ping goes out at the next slot" : "already on, left as it is";
+      } else {
+        const version = require("./package.json").version;
+        db.prepare("UPDATE instance_settings SET telemetry_enabled = 0, telemetry_declined_version = ?, telemetry_last_error = NULL, updated_at = ? WHERE id = 1").run(version, now);
+        result = "off, nothing is sent";
+      }
+      db.close();
+      console.log(result);
+    ' 2>/dev/null) && success "Usage ping: ${telemetry_result}" || warn "Could not set the usage ping (set it in admin settings)"
+  fi
 fi
 
 # ── Phase 7.5: Post-deploy reachability check ──────────────
@@ -778,12 +927,12 @@ map \$http_upgrade \$connection_upgrade {
 }
 
 server {
-    listen 443 ssl;
-    server_name ${DOMAIN};
+    listen ${DOMAIN_PORT:-443} ssl;
+    server_name ${DOMAIN_HOST};
 
     # Your TLS certs (certbot, your proxy manager, etc.):
-    # ssl_certificate     /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
-    # ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
+    # ssl_certificate     /etc/letsencrypt/live/${DOMAIN_HOST}/fullchain.pem;
+    # ssl_certificate_key /etc/letsencrypt/live/${DOMAIN_HOST}/privkey.pem;
 
     client_max_body_size ${max_mb}m;   # match MAX_UPLOAD_SIZE (${MAX_UPLOAD_SIZE} bytes)
 EOF
@@ -794,7 +943,7 @@ EOF
     location /livekit/ {
         proxy_pass http://127.0.0.1:7880/;
         proxy_http_version 1.1;
-        proxy_set_header Host              \$host;
+        proxy_set_header Host              \$http_host;
         proxy_set_header Upgrade           \$http_upgrade;
         proxy_set_header Connection        \$connection_upgrade;
         proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
@@ -807,11 +956,13 @@ EOF
     location / {
         proxy_pass http://127.0.0.1:${APP_PORT_FINAL};
         proxy_http_version 1.1;
-        proxy_set_header Host              \$host;
+        # \$http_host, not \$host: \$host drops the port, and the app must see
+        # the host clients actually use when the public port is not 443.
+        proxy_set_header Host              \$http_host;
         proxy_set_header X-Real-IP         \$remote_addr;
         proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_set_header X-Forwarded-Host  \$host;
+        proxy_set_header X-Forwarded-Host  \$http_host;
         # WebSocket upgrade (chat, live events, voice signaling):
         proxy_set_header Upgrade    \$http_upgrade;
         proxy_set_header Connection \$connection_upgrade;
@@ -859,7 +1010,7 @@ print_traefik_snippet() {
 http:
   routers:
     backspace:
-      rule: "Host(\`${DOMAIN}\`)"
+      rule: "Host(\`${DOMAIN_HOST}\`)"
       entryPoints: [websecure]
       service: backspace
       tls:
@@ -868,7 +1019,7 @@ EOF
   if [[ "$ENABLE_VOICE" == true ]]; then
     cat << EOF
     backspace-livekit:
-      rule: "Host(\`${DOMAIN}\`) && PathPrefix(\`/livekit\`)"
+      rule: "Host(\`${DOMAIN_HOST}\`) && PathPrefix(\`/livekit\`)"
       entryPoints: [websecure]
       service: backspace-livekit
       priority: 100
@@ -1010,5 +1161,14 @@ echo -e "  ${BOLD}Commands${NC} (run from this directory):"
 echo "    docker compose logs -f          # Watch logs"
 echo "    docker compose restart          # Restart all services"
 echo "    docker compose down             # Stop everything"
-echo "    docker compose pull && docker compose up -d   # Update to the latest prebuilt image"
+echo "    ./update.sh                                   # Update (snapshots first, rolls back if it fails)"
+echo "    ./update.sh --check                           # Check for an update, changing nothing"
 echo ""
+
+# The teaser for the ask that waits in the app. Skipped when TELEMETRY already
+# answered it on the command line, since Phase 7b printed what it did.
+if [[ -z "${TELEMETRY:-}" ]]; then
+  echo -e "  One more thing waits after your first login: a small, optional usage ping,"
+  echo -e "  and a note from me about why. It is off until you say otherwise."
+  echo ""
+fi

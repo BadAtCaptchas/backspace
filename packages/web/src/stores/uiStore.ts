@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
 import type { User } from '@backspace/shared';
+import type { AnchorRect, Placement } from '../hooks/useFloatingPosition';
 
 type ModalType =
   | 'createSpace'
@@ -17,17 +18,36 @@ type ModalType =
   | 'addDmMember'
   | 'groupDmSettings'
   | 'userProfile'
+  | 'connectAndJoin'
+  | 'memberRoles'
   | null;
+
+/**
+ * The space member a profile was opened for: the space, and that member's user
+ * id on the space's instance (a federated member's local replicated id there,
+ * not their home id). Surfaces that know they are showing a space member pass
+ * it so the profile can show the member's roles; everywhere else leaves it out.
+ */
+export interface ProfileMemberContext {
+  spaceId: string;
+  userId: string;
+}
 
 interface MobileStackEntry {
   screen: string;
   params?: Record<string, string>;
 }
 
+export interface ToastAction {
+  label: string;
+  onClick: () => void;
+}
+
 interface Toast {
   id: string;
   message: string;
   type: 'info' | 'warning' | 'success';
+  action?: ToastAction;
 }
 
 interface UIState {
@@ -40,7 +60,12 @@ interface UIState {
   imagePreviewUrl: string | null;
   userProfilePopout: {
     user: User | null;
-    position: { top: number; left: number } | null;
+    /** Rect of the element the card was opened from. The card places itself off
+     *  this rect once it knows its own measured size — callers never compute
+     *  coordinates, so no surface can drift by re-anchoring to itself. */
+    anchor: AnchorRect | null;
+    placement: Placement;
+    member: ProfileMemberContext | null;
   };
   toasts: Toast[];
   toggleSidebar: () => void;
@@ -51,9 +76,9 @@ interface UIState {
   setShowDms: (show: boolean) => void;
   openImagePreview: (url: string) => void;
   closeImagePreview: () => void;
-  openUserProfile: (user: User, position: { top: number; left: number }) => void;
+  openUserProfile: (user: User, anchor: AnchorRect, placement?: Placement, member?: ProfileMemberContext) => void;
   closeUserProfile: () => void;
-  addToast: (message: string, type?: 'info' | 'warning' | 'success', duration?: number) => void;
+  addToast: (message: string, type?: 'info' | 'warning' | 'success', duration?: number, action?: ToastAction) => void;
   removeToast: (id: string) => void;
   lastChannelPerSpace: Record<string, string>;
   setLastChannel: (spaceId: string, channelId: string) => void;
@@ -93,7 +118,9 @@ export const useUIStore = create<UIState>()(
       imagePreviewUrl: null,
       userProfilePopout: {
         user: null,
-        position: null,
+        anchor: null,
+        placement: 'right',
+        member: null,
       },
       toasts: [],
 
@@ -120,27 +147,38 @@ export const useUIStore = create<UIState>()(
       openImagePreview: (url) => set({ activeModal: 'imagePreview', imagePreviewUrl: url }),
       closeImagePreview: () => set({ activeModal: null, imagePreviewUrl: null }),
 
-      openUserProfile: (user, position) => {
+      openUserProfile: (user, anchor, placement = 'right', member) => {
         if (get().isMobile) {
           // On mobile, push a full-screen user profile instead of a positioned popout
+          const params: Record<string, string> = { userId: user.id };
+          if (member) {
+            params.spaceId = member.spaceId;
+            params.memberUserId = member.userId;
+          }
           set((state) => ({
-            mobileStack: [...state.mobileStack, { screen: 'user-profile', params: { userId: user.id } }],
+            mobileStack: [...state.mobileStack, { screen: 'user-profile', params }],
           }));
           history.pushState({ mobileScreen: 'user-profile' }, '');
         } else {
-          set({ userProfilePopout: { user, position } });
+          set({ userProfilePopout: { user, anchor, placement, member: member ?? null } });
         }
       },
       closeUserProfile: () => set({
-        userProfilePopout: { user: null, position: null }
+        userProfilePopout: { user: null, anchor: null, placement: 'right', member: null }
       }),
 
-      addToast: (message, type = 'info', duration = 5000) => {
+      addToast: (message, type = 'info', duration = 5000, action) => {
         const id = Date.now().toString(36) + Math.random().toString(36).slice(2);
-        set((state) => ({ toasts: [...state.toasts, { id, message, type }] }));
-        setTimeout(() => {
-          set((state) => ({ toasts: state.toasts.filter(t => t.id !== id) }));
-        }, duration);
+        set((state) => ({ toasts: [...state.toasts, { id, message, type, action }] }));
+        // A duration of 0 means the toast stays until the viewer dismisses it.
+        // An actionable toast that vanishes on a timer is worse than none: the
+        // action is the whole point, and five seconds is not enough to notice a
+        // toast, read it, and decide to click it.
+        if (duration > 0) {
+          setTimeout(() => {
+            set((state) => ({ toasts: state.toasts.filter(t => t.id !== id) }));
+          }, duration);
+        }
       },
       removeToast: (id) => set((state) => ({ toasts: state.toasts.filter(t => t.id !== id) })),
 

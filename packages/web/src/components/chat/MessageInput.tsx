@@ -1,4 +1,6 @@
+import { layoutRect } from '../../platform/interfaceScale';
 import React, { useState, useRef, useCallback, useMemo, useEffect } from 'react';
+import { useTranslation } from 'react-i18next';
 import { useChatStore } from '../../stores/chatStore';
 import { isDmChannel, getChannelOrigin, useSpaceStore } from '../../stores/spaceStore';
 import { wsSend } from '../../hooks/useWebSocket';
@@ -7,7 +9,7 @@ import { TypingIndicator } from './TypingIndicator';
 import { InputPopover, type InputPopoverTab } from './InputPopover';
 import { AttachmentProgress } from './AttachmentProgress';
 import { hasPermissionBit, PermissionBits } from '../../utils/permissions';
-import { MAX_MESSAGE_LENGTH, type MemberWithUser } from '@backspace/shared';
+import { MAX_MESSAGE_LENGTH } from '@backspace/shared';
 import { useSettingsStore } from '../../stores/settingsStore';
 import { useUIStore } from '../../stores/uiStore';
 import { useComposerStore } from '../../stores/composerStore';
@@ -15,6 +17,13 @@ import { useTransferStore, type Transfer } from '../../stores/transferStore';
 import { usePendingMessageStore } from '../../stores/pendingMessageStore';
 import { putHandle, supportsFsHandles, supportsDnDHandles } from '../../utils/idbHandles';
 import { useVisualViewportInset } from '../../hooks/useVisualViewportInset';
+import { useAuthStore } from '../../stores/authStore';
+import { findLastOwnEditableMessage } from './messageEditing';
+import {
+  filterMentionCandidates,
+  useChannelMentionCandidates,
+  type ChannelUser,
+} from '../../utils/channelUser';
 
 interface MessageInputProps {
   channelId: string;
@@ -44,6 +53,7 @@ function makeFileHandleKey(): string {
 }
 
 export function MessageInput({ channelId, channelName, placeholder }: MessageInputProps) {
+  const { t } = useTranslation(['chat', 'common']);
   // Composer state lives in composerStore (per-channel, persisted)
   const composerState = useComposerStore((s) => s.states.get(channelId)) ?? {
     draftText: '',
@@ -86,7 +96,11 @@ export function MessageInput({ channelId, channelName, placeholder }: MessageInp
   const sendMessage = useChatStore((s) => s.sendMessage);
   const chatReplyTo = useChatStore((s) => s.replyTo);
   const chatSetReplyTo = useChatStore((s) => s.setReplyTo);
-  const members = useSpaceStore((s) => s.members);
+  const editingMessageId = useChatStore((s) => s.editingMessageId);
+  const setEditingMessage = useChatStore((s) => s.setEditingMessage);
+  const currentUser = useAuthStore((s) => s.user);
+  // Who can be mentioned here: this channel's people, with ids on its origin.
+  const mentionCandidates = useChannelMentionCandidates(channelId);
 
   const addToast = useUIStore((s) => s.addToast);
   const appendBubble = usePendingMessageStore((s) => s.append);
@@ -127,6 +141,11 @@ export function MessageInput({ channelId, channelName, placeholder }: MessageInp
       textareaRef.current?.focus();
     }
   }, [chatReplyTo]);
+
+  // Return focus to the composer after inline editing is saved or cancelled.
+  useEffect(() => {
+    if (!editingMessageId) textareaRef.current?.focus();
+  }, [editingMessageId]);
 
   // Close popover on channel change
   useEffect(() => {
@@ -173,27 +192,20 @@ export function MessageInput({ channelId, channelName, placeholder }: MessageInp
   // Surface permanent transfer failures as toasts (one toast per id, latched)
   const toastedFailuresRef = useRef<Set<string>>(new Set());
   useEffect(() => {
-    for (const t of stagedTransfers) {
-      if (t.state === 'failed' && !toastedFailuresRef.current.has(t.id)) {
-        toastedFailuresRef.current.add(t.id);
-        const msg = t.error?.message ?? 'Upload failed';
-        addToast(`Failed to upload ${t.file.name}: ${msg}`, 'warning');
+    for (const transfer of stagedTransfers) {
+      if (transfer.state === 'failed' && !toastedFailuresRef.current.has(transfer.id)) {
+        toastedFailuresRef.current.add(transfer.id);
+        const reason = transfer.error?.message ?? t('chat:composer.uploadFailedReason');
+        addToast(t('chat:composer.uploadFailed', { file: transfer.file.name, reason }), 'warning');
       }
     }
-  }, [stagedTransfers, addToast]);
+  }, [stagedTransfers, addToast, t]);
 
-  // Filter members for the mention popover (used for keyboard nav clamping)
-  const filteredMembers = useMemo(() => {
-    if (!mentionState) return [];
-    const q = mentionState.query.toLowerCase();
-    return members
-      .filter((m) => {
-        const name = (m.user.displayName ?? m.user.username).toLowerCase();
-        const username = m.user.username.toLowerCase();
-        return name.includes(q) || username.includes(q);
-      })
-      .slice(0, 8);
-  }, [members, mentionState]);
+  // The popover's rows; keyboard navigation indexes the same list.
+  const mentionMatches = useMemo(
+    () => (mentionState ? filterMentionCandidates(mentionCandidates, mentionState.query) : []),
+    [mentionCandidates, mentionState],
+  );
 
   const handleTyping = useCallback(() => {
     if (typingTimeoutRef.current) return;
@@ -251,11 +263,11 @@ export function MessageInput({ channelId, channelName, placeholder }: MessageInp
           }
         }
       } catch (err) {
-        const msg = err instanceof Error ? err.message : 'Upload failed';
-        addToast(`Failed to upload ${file.name}: ${msg}`, 'warning');
+        const reason = err instanceof Error ? err.message : t('chat:composer.uploadFailedReason');
+        addToast(t('chat:composer.uploadFailed', { file: file.name, reason }), 'warning');
       }
     },
-    [channelId, startUpload, attachToComposer, addToast],
+    [channelId, startUpload, attachToComposer, addToast, t],
   );
 
   const removeStagedTransfer = useCallback(
@@ -330,7 +342,7 @@ export function MessageInput({ channelId, channelName, placeholder }: MessageInp
           textareaRef.current.focus();
         }
       } catch (err) {
-        const msg = err instanceof Error ? err.message : 'Failed to send message';
+        const msg = err instanceof Error ? err.message : t('chat:composer.sendFailed');
         addToast(msg, 'warning');
       }
       return;
@@ -374,13 +386,13 @@ export function MessageInput({ channelId, channelName, placeholder }: MessageInp
   };
 
   const selectMention = useCallback(
-    (member: MemberWithUser) => {
+    (candidate: ChannelUser) => {
       if (!mentionState) return;
       const textarea = textareaRef.current;
       const cursorPos = textarea?.selectionStart ?? draftText.length;
       const before = draftText.slice(0, mentionState.startIndex);
       const after = draftText.slice(cursorPos);
-      const insertion = `<@${member.userId}> `;
+      const insertion = `<@${candidate.userId}> `;
       const newContent = before + insertion + after;
       setDraft(channelId, newContent);
       setMentionState(null);
@@ -400,11 +412,11 @@ export function MessageInput({ channelId, channelName, placeholder }: MessageInp
 
   const handleKeyDown = (e: React.KeyboardEvent): void => {
     // Mention popover keyboard navigation
-    if (mentionState && filteredMembers.length > 0) {
+    if (mentionState && mentionMatches.length > 0) {
       if (e.key === 'ArrowDown') {
         e.preventDefault();
         setMentionState((prev) =>
-          prev ? { ...prev, selectedIndex: Math.min(prev.selectedIndex + 1, filteredMembers.length - 1) } : null,
+          prev ? { ...prev, selectedIndex: Math.min(prev.selectedIndex + 1, mentionMatches.length - 1) } : null,
         );
         return;
       }
@@ -417,13 +429,37 @@ export function MessageInput({ channelId, channelName, placeholder }: MessageInp
       }
       if (e.key === 'Enter' || e.key === 'Tab') {
         e.preventDefault();
-        const selected = filteredMembers[mentionState.selectedIndex];
+        const selected = mentionMatches[mentionState.selectedIndex];
         if (selected) selectMention(selected);
         return;
       }
       if (e.key === 'Escape') {
         e.preventDefault();
         setMentionState(null);
+        return;
+      }
+    }
+
+    const isPlainArrowUp = e.key === 'ArrowUp'
+      && !e.altKey
+      && !e.ctrlKey
+      && !e.metaKey
+      && !e.shiftKey
+      && !e.nativeEvent.isComposing;
+    const composerIsEmpty = draftText.length === 0
+      && composerState.stagedTransferIds.length === 0
+      && !chatReplyTo
+      && !composerState.replyTo;
+
+    if (isPlainArrowUp && composerIsEmpty && !editingMessageId) {
+      // Read the list on demand: subscribing to it would re-render the composer
+      // on every incoming message, and the shortcut only needs it at keypress time.
+      const channelMessages = useChatStore.getState().messages.get(channelId) ?? [];
+      const message = findLastOwnEditableMessage(channelMessages, currentUser);
+      if (message) {
+        e.preventDefault();
+        setActivePopover(null);
+        setEditingMessage(message.id);
         return;
       }
     }
@@ -593,8 +629,8 @@ export function MessageInput({ channelId, channelName, placeholder }: MessageInp
   // top edge with a 12 px breathing gap regardless of bubble height.
   //
   // Vertical positioning differs only in the `bottom` value:
-  // - Desktop: `bottom: 12px` (the historical `md:bottom-3` constant).
-  // - Mobile, keyboard closed: `bottom: env(safe-area-inset-bottom) + 6px`
+  // - Desktop: `bottom: 12px` (the historical `desktop:bottom-3` constant).
+  // - Mobile, keyboard closed: `bottom: var(--safe-bottom) + 6px`
   //   so the bubble clears the iOS home indicator with a small breathing gap.
   // - Mobile, keyboard open: `bottom: 0`. `MobileShell` shrinks its container
   //   to `visualViewport.height` (see `MobileShell.tsx`), so the chat region's
@@ -610,7 +646,7 @@ export function MessageInput({ channelId, channelName, placeholder }: MessageInp
   //
   // The horizontal inset is symmetric: `left-2 right-2` on mobile (matches
   // `MobileVoiceMiniBar`'s `mx-2` and the `MobileBottomNav` spacing tier);
-  // `md:left-3 md:right-3` on desktop (the historical 12 px inset).
+  // `desktop:left-3 desktop:right-3` on desktop (the historical 12 px inset).
   //
   // `z-[110]` keeps the bubble above any in-chat overlays (mention popover,
   // staged-attachment tiles) but below modals (`z-[300]+`).
@@ -633,12 +669,12 @@ export function MessageInput({ channelId, channelName, placeholder }: MessageInp
           ? '0px'
           : textInputFocused
             ? '4px'
-            : 'calc(env(safe-area-inset-bottom) + 6px)',
+            : 'calc(var(--safe-bottom) + 6px)',
       }
     : undefined;
   const composerClass =
     'absolute left-2 right-2 z-[110] glass-bubble rounded-[14px]' +
-    ' md:left-3 md:right-3 md:bottom-3';
+    ' desktop:left-3 desktop:right-3 desktop:bottom-3';
 
   // Dynamic message-list bottom padding ("composer clearance"):
   //
@@ -685,10 +721,10 @@ export function MessageInput({ channelId, channelName, placeholder }: MessageInp
       // We measure the bubble's visual height (including replyTo banner +
       // staged-attachment tiles + textarea autosize) plus the distance from
       // the parent's bottom edge to the bubble's bottom edge (which folds
-      // in `env(safe-area-inset-bottom) + 6` on mobile or `12 px` on
+      // in `var(--safe-bottom) + 6` on mobile or `12 px` on
       // desktop, whichever the composer's `bottom` resolves to).
-      const composerRect = el.getBoundingClientRect();
-      const parentRect = target.getBoundingClientRect();
+      const composerRect = layoutRect(el.getBoundingClientRect());
+      const parentRect = layoutRect(target.getBoundingClientRect());
       const bottomOffset = Math.max(0, parentRect.bottom - composerRect.bottom);
       const clearance = Math.round(composerRect.height + bottomOffset + 12);
       target.style.setProperty('--composer-clearance', `${clearance}px`);
@@ -743,7 +779,7 @@ export function MessageInput({ channelId, channelName, placeholder }: MessageInp
       <div ref={setComposerRef} data-pip-obstacle="bottom" className={composerClass} style={composerStyle}>
         <div className="flex items-center justify-center py-[14px] px-4">
           <span className="text-txt-tertiary text-[14px]">
-            You do not have permission to send messages in this channel
+            {t('chat:composer.noPermission')}
           </span>
         </div>
       </div>
@@ -775,7 +811,7 @@ export function MessageInput({ channelId, channelName, placeholder }: MessageInp
       {chatReplyTo && (
         <div className="bg-interactive-hover rounded-t-lg px-4 py-2 flex items-center justify-between border-b border-white/[0.06]">
           <div className="flex items-center gap-1 text-[14px] text-txt-message truncate">
-            <span className="opacity-60">Replying to</span>
+            <span className="opacity-60">{t('chat:composer.replyingTo')}</span>
             <span className="font-bold">
               {chatReplyTo.user.displayName ?? chatReplyTo.user.username}
             </span>
@@ -783,7 +819,7 @@ export function MessageInput({ channelId, channelName, placeholder }: MessageInp
           <button
             onClick={() => chatSetReplyTo(null)}
             className="text-txt-tertiary hover:text-txt-primary transition-colors"
-            aria-label="Cancel reply"
+            aria-label={t('chat:composer.cancelReply')}
           >
             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
               <path d="M18.4 4L12 10.4L5.6 4L4 5.6L10.4 12L4 18.4L5.6 20L12 13.6L18.4 20L20 18.4L13.6 12L20 5.6L18.4 4Z" />
@@ -798,9 +834,9 @@ export function MessageInput({ channelId, channelName, placeholder }: MessageInp
         onDragOver={canAttachFiles ? handleDragOver : undefined}
       >
         {/* Mention autocomplete popover */}
-        {mentionState && filteredMembers.length > 0 && (
+        {mentionState && mentionMatches.length > 0 && (
           <MentionPopover
-            query={mentionState.query}
+            candidates={mentionMatches}
             selectedIndex={mentionState.selectedIndex}
             onSelect={selectMention}
             anchorRef={inputContainerRef}
@@ -810,14 +846,14 @@ export function MessageInput({ channelId, channelName, placeholder }: MessageInp
         {/* Staged transfer tiles */}
         {stagedTransfers.length > 0 && (
           <div className="p-4 flex flex-wrap gap-4 bg-surface-channel/30">
-            {stagedTransfers.map((t) => {
-              const isImage = t.file.mimetype.startsWith('image/');
-              const isFinal = t.state === 'completed';
-              const showOverlay = t.state !== 'completed';
-              const previewUrl = previewUrlsRef.current.get(t.id);
+            {stagedTransfers.map((transfer) => {
+              const isImage = transfer.file.mimetype.startsWith('image/');
+              const isFinal = transfer.state === 'completed';
+              const showOverlay = transfer.state !== 'completed';
+              const previewUrl = previewUrlsRef.current.get(transfer.id);
               return (
                 <div
-                  key={t.id}
+                  key={transfer.id}
                   className="relative group bg-surface-channel rounded-lg p-2 max-w-[200px] shadow-elevation-low border border-border-hard overflow-hidden"
                 >
                   {isImage ? (
@@ -825,7 +861,7 @@ export function MessageInput({ channelId, channelName, placeholder }: MessageInp
                       {previewUrl ? (
                         <img
                           src={previewUrl}
-                          alt={t.file.name}
+                          alt={transfer.file.name}
                           className="w-full h-full object-cover"
                         />
                       ) : (
@@ -844,30 +880,30 @@ export function MessageInput({ channelId, channelName, placeholder }: MessageInp
                           d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
                         />
                       </svg>
-                      <span className="truncate max-w-[120px] font-medium">{t.file.name}</span>
+                      <span className="truncate max-w-[120px] font-medium">{transfer.file.name}</span>
                     </div>
                   )}
 
                   {/* Overlay: progress / paused / failed indicator (driven by AttachmentProgress) */}
                   {showOverlay && (
                     <AttachmentProgress
-                      loaded={t.progress.loaded}
-                      total={t.progress.total}
-                      state={t.state}
-                      filename={t.file.name}
+                      loaded={transfer.progress.loaded}
+                      total={transfer.progress.total}
+                      state={transfer.state}
+                      filename={transfer.file.name}
                       size="tile"
-                      onPause={t.state === 'active' ? () => pauseUpload(t.id) : undefined}
-                      onResume={t.state === 'paused' ? () => void resumeUpload(t.id) : undefined}
-                      onAbort={() => removeStagedTransfer(t.id)}
+                      onPause={transfer.state === 'active' ? () => pauseUpload(transfer.id) : undefined}
+                      onResume={transfer.state === 'paused' ? () => void resumeUpload(transfer.id) : undefined}
+                      onAbort={() => removeStagedTransfer(transfer.id)}
                     />
                   )}
 
                   {/* Final-state remove button (top-right rose chip) — only when completed */}
                   {isFinal && (
                     <button
-                      onClick={() => removeStagedTransfer(t.id)}
+                      onClick={() => removeStagedTransfer(transfer.id)}
                       className="absolute -top-2 -right-2 w-7 h-7 bg-accent-rose hover:bg-accent-rose/80 shadow-elevation-high rounded-lg flex items-center justify-center text-white transition-colors z-10"
-                      aria-label="Remove attachment"
+                      aria-label={t('chat:composer.removeAttachment')}
                     >
                       <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
                         <path d="M5 2a1 1 0 011-1h4a1 1 0 011 1v1h3a1 1 0 110 2h-.08L13 14a2 2 0 01-2 2H5a2 2 0 01-2-2L2.08 5H2a1 1 0 110-2h3V2zm2 0v1h2V2H7z" />
@@ -880,14 +916,14 @@ export function MessageInput({ channelId, channelName, placeholder }: MessageInp
           </div>
         )}
 
-        <div className="flex items-center gap-1 md:gap-0 pl-2 md:pl-[10px] pr-2 md:pr-1">
+        <div className="flex items-center gap-1 desktop:gap-0 pl-2 desktop:pl-[10px] pr-2 desktop:pr-1">
           {/* File attach button */}
           {canAttachFiles && (
             <button
               onClick={() => fileInputRef.current?.click()}
-              className="w-10 h-10 md:w-[34px] md:h-[34px] flex items-center justify-center rounded-[6px] text-txt-tertiary hover:text-txt-secondary transition-colors flex-shrink-0"
-              title="Attach file"
-              aria-label="Attach file"
+              className="w-10 h-10 desktop:w-[34px] desktop:h-[34px] flex items-center justify-center rounded-[6px] text-txt-tertiary hover:text-txt-secondary transition-colors flex-shrink-0"
+              title={t('chat:composer.attachFile')}
+              aria-label={t('chat:composer.attachFile')}
             >
               <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
                 <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm5 11h-4v4h-2v-4H7v-2h4V7h2v4h4v2z" />
@@ -915,14 +951,19 @@ export function MessageInput({ channelId, channelName, placeholder }: MessageInp
             onChange={handleChange}
             onKeyDown={handleKeyDown}
             onPaste={canAttachFiles ? handlePaste : undefined}
-            placeholder={placeholder ?? `Message ${channelName.startsWith('@') ? channelName : `#${channelName}`}`}
-            className="input-embedded flex-1 py-[10px] px-1 resize-none text-[15px] leading-[1.375rem] max-h-[50vh] scrollbar-thin"
+            placeholder={
+              placeholder ??
+              (channelName.startsWith('@')
+                ? t('chat:composer.placeholder.dm', { name: channelName.slice(1) })
+                : t('chat:composer.placeholder.channel', { name: channelName }))
+            }
+            className="input-embedded flex-1 py-[10px] px-1 resize-none text-[15px] leading-[1.375rem] max-h-[calc(50*var(--app-vh))] scrollbar-thin"
             rows={1}
           />
 
           {/* Active-upload indicator */}
           {anyActiveOrQueued && (
-            <div className="p-3 text-txt-tertiary" title="Uploading…" aria-label="Uploading">
+            <div className="p-3 text-txt-tertiary" title={t('chat:composer.uploading')} aria-label={t('chat:composer.uploadingLabel')}>
               <svg className="w-5 h-5 animate-spin" viewBox="0 0 24 24" fill="none">
                 <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                 <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
@@ -934,9 +975,9 @@ export function MessageInput({ channelId, channelName, placeholder }: MessageInp
           {failedCount > 0 && (
             <span
               className="text-[12px] font-medium text-accent-rose px-1 flex-shrink-0"
-              title="Remove or retry the failed attachment to send"
+              title={t('chat:composer.failedHint')}
             >
-              {failedCount} failed
+              {t('chat:composer.failedCount', { count: failedCount })}
             </span>
           )}
 
@@ -953,11 +994,11 @@ export function MessageInput({ channelId, channelName, placeholder }: MessageInp
           {gifEnabled && (
             <button
               onClick={() => togglePopover('gif')}
-              className={`w-10 h-10 md:w-[34px] md:h-[34px] flex items-center justify-center rounded-[6px] transition-colors flex-shrink-0 ${
+              className={`w-10 h-10 desktop:w-[34px] desktop:h-[34px] flex items-center justify-center rounded-[6px] transition-colors flex-shrink-0 ${
                 activePopover === 'gif' ? 'text-accent-primary' : 'text-txt-tertiary hover:text-txt-secondary'
               }`}
-              title="GIF"
-              aria-label="GIF picker"
+              title={t('chat:composer.gif')}
+              aria-label={t('chat:composer.gifPicker')}
             >
               <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
                 <path d="M2 5.5A2.5 2.5 0 0 1 4.5 3h15A2.5 2.5 0 0 1 22 5.5v13a2.5 2.5 0 0 1-2.5 2.5h-15A2.5 2.5 0 0 1 2 18.5v-13ZM5.1 14V10h3.2v1.2H6.5v.6h1.6v1.1H6.5V14H5.1Zm4.5 0V10h1.4v4H9.6Zm2.5 0V10h3.2v1.2h-1.8v.5h1.6v1h-1.6V14h-1.4Z" />
@@ -968,11 +1009,11 @@ export function MessageInput({ channelId, channelName, placeholder }: MessageInp
           {/* Emoji button */}
           <button
             onClick={() => togglePopover('emoji')}
-            className={`w-10 h-10 md:w-[34px] md:h-[34px] flex items-center justify-center rounded-[6px] transition-colors flex-shrink-0 ${
+            className={`w-10 h-10 desktop:w-[34px] desktop:h-[34px] flex items-center justify-center rounded-[6px] transition-colors flex-shrink-0 ${
               activePopover === 'emoji' ? 'text-accent-primary' : 'text-txt-tertiary hover:text-txt-secondary'
             }`}
-            title="Emoji"
-            aria-label="Emoji picker"
+            title={t('chat:composer.emoji')}
+            aria-label={t('chat:composer.emojiPicker')}
           >
             <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
               <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8zm3.5-9c.83 0 1.5-.67 1.5-1.5S16.33 8 15.5 8 14 8.67 14 9.5s.67 1.5 1.5 1.5zm-7 0c.83 0 1.5-.67 1.5-1.5S9.33 8 8.5 8 7 8.67 7 9.5s.67 1.5 1.5 1.5zm3.5 6.5c2.33 0 4.31-1.46 5.11-3.5H6.89c.8 2.04 2.78 3.5 5.11 3.5z" />
@@ -984,9 +1025,9 @@ export function MessageInput({ channelId, channelName, placeholder }: MessageInp
             <button
               onClick={() => void handleSubmit()}
               disabled={anyUnshippable}
-              className="w-10 h-10 md:w-[34px] md:h-[34px] flex items-center justify-center rounded-[6px] bg-accent-primary hover:bg-accent-primary-hover text-white transition-all duration-150 flex-shrink-0 disabled:opacity-50"
-              aria-label="Send message"
-              title="Send"
+              className="w-10 h-10 desktop:w-[34px] desktop:h-[34px] flex items-center justify-center rounded-[6px] bg-accent-primary hover:bg-accent-primary-hover text-white transition-all duration-150 flex-shrink-0 disabled:opacity-50"
+              aria-label={t('chat:composer.sendMessage')}
+              title={t('chat:composer.send')}
             >
               <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
                 <path d="M3.4 20.4l17.45-7.48a1 1 0 000-1.84L3.4 3.6a.993.993 0 00-1.39.91L2 9.12c0 .5.37.93.87.99L17 12 2.87 13.88c-.5.07-.87.5-.87 1l.01 4.61c0 .71.73 1.2 1.39.91z" />

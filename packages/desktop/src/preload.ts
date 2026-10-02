@@ -3,7 +3,6 @@ import { contextBridge, ipcRenderer } from 'electron';
 contextBridge.exposeInMainWorld('backspace', {
   // Platform info
   platform: process.platform,
-
   // Window controls
   minimize: () => {
     ipcRenderer.send('minimize-window');
@@ -16,14 +15,25 @@ contextBridge.exposeInMainWorld('backspace', {
   },
 
   // Notifications & badge
-  showNotification: (title: string, body: string) => {
-    ipcRenderer.send('show-notification', { title, body });
+  showNotification: (title: string, body: string, options?: { channelId?: string; spaceId?: string; userId?: string }) => {
+    ipcRenderer.send('show-notification', { title, body, options });
+  },
+  onNotificationClick: (callback: (options: { channelId?: string; spaceId?: string; userId?: string }) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, options: { channelId?: string; spaceId?: string; userId?: string }) => callback(options);
+    ipcRenderer.on('notification-click', handler);
+    return () => { ipcRenderer.removeListener('notification-click', handler); };
   },
   setBadgeCount: (count: number) => {
     ipcRenderer.send('set-badge-count', count);
   },
 
-  // Auto-update
+  // Auto-update, legacy per-event channels.
+  //
+  // Superseded by getUpdateStatus/onUpdateStatusChanged below and unused by the
+  // current web client, but deliberately kept. The desktop app and the instance
+  // it connects to version independently: a newer app can be pointed at an older
+  // instance that still serves a client calling these. Removing them would make
+  // that client throw inside a useEffect and take the whole renderer down.
   onUpdateAvailable: (callback: (info: { version: string }) => void) => {
     ipcRenderer.on('update-available', (_event, info) => callback(info));
   },
@@ -40,6 +50,25 @@ contextBridge.exposeInMainWorld('backspace', {
     ipcRenderer.send('check-for-updates');
   },
   getVersion: () => ipcRenderer.invoke('get-app-version'),
+
+  // Auto-update, current surface. One snapshot carrying the capability of this
+  // build, the version the user has already waved away, and the current status.
+  getUpdateStatus: (): Promise<unknown> => ipcRenderer.invoke('get-update-status'),
+  isSandboxed: (): Promise<boolean> => ipcRenderer.invoke('is-sandboxed'),
+
+  onUpdateStatusChanged: (callback: (snapshot: unknown) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, snapshot: unknown) => callback(snapshot);
+    ipcRenderer.on('update-status-changed', handler);
+    return () => { ipcRenderer.removeListener('update-status-changed', handler); };
+  },
+
+  dismissUpdate: (version: string): void => {
+    ipcRenderer.send('dismiss-update', { version });
+  },
+
+  openReleasePage: (): void => {
+    ipcRenderer.send('open-release-page');
+  },
 
   // Window focus
   onWindowFocusChange: (callback: (focused: boolean) => void) => {
@@ -68,11 +97,23 @@ contextBridge.exposeInMainWorld('backspace', {
   selectScreenSource: (sourceId: string | null, shareAudio?: boolean) => {
     ipcRenderer.send('screen-share-selected', sourceId, shareAudio ?? true);
   },
+  getScreenSources: () => ipcRenderer.invoke('get-screen-sources'),
+  // invoke, not send: the renderer must know the preselection has landed in the
+  // main process before it calls getDisplayMedia(), or the two race.
+  preselectScreenSource: (sourceId: string, shareAudio?: boolean) =>
+    ipcRenderer.invoke('screen-share-preselect', sourceId, shareAudio ?? true),
+  getScreenSharePickerMode: () => ipcRenderer.invoke('get-screen-share-picker-mode'),
+  setScreenShareAudioPreference: (shareAudio: boolean) => {
+    ipcRenderer.send('screen-share-audio-preference', shareAudio);
+  },
 
   // Instance URL management
   getInstanceUrl: () => ipcRenderer.invoke('get-instance-url'),
   setInstanceUrl: (url: string) => ipcRenderer.invoke('set-instance-url', url),
   clearInstanceUrl: () => ipcRenderer.invoke('clear-instance-url'),
+
+  // Language: the renderer owns the choice; main relabels its tray and menus.
+  setLanguage: (language: string) => ipcRenderer.send('set-language', language),
 
   // Auto-launch settings
   getAutoLaunchSettings: () => ipcRenderer.invoke('get-auto-launch-settings'),
@@ -88,8 +129,15 @@ contextBridge.exposeInMainWorld('backspace', {
   getCurrentActivity: () => ipcRenderer.invoke('get-current-activity'),
 
   // Keybind support
+  getKeybindPortalStatus: () => ipcRenderer.invoke('keybind-portal-status'),
+  retryKeybindPortal: () => ipcRenderer.send('keybind-portal-retry'),
+  onKeybindPortalStatus: (callback: (status: import('./portalShortcut').PortalKeybindStatus) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, status: import('./portalShortcut').PortalKeybindStatus) => callback(status);
+    ipcRenderer.on('keybind-portal-status', handler);
+    return () => { ipcRenderer.removeListener('keybind-portal-status', handler); };
+  },
   syncKeybinds: (keybinds: Array<{ actionId: string; keys: number[]; mouseButton?: number }>) => {
-    ipcRenderer.send('keybinds-sync', keybinds);
+    return ipcRenderer.invoke('keybinds-sync', keybinds);
   },
   onKeybindAction: (callback: (action: { actionId: string; pressed: boolean }) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, action: { actionId: string; pressed: boolean }) => callback(action);

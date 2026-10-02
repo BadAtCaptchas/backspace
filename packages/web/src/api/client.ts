@@ -1,5 +1,7 @@
+import { isErrorCode, type ErrorCode, type ErrorDetails } from '@backspace/shared/src/errors';
 import type {
   AuthResponse,
+  PeerEnsureRequest,
   RegisterRequest,
   LoginRequest,
   User,
@@ -28,6 +30,7 @@ import type {
   CreateDmMessageRequest,
   Friend,
   FriendRequest,
+  SendFriendRequest,
   DiscoverUser,
   InstanceStreamingLimits,
   InstanceAdminSettings,
@@ -35,6 +38,8 @@ import type {
   VerifyPasswordResponse,
   ChangePasswordRequest,
   ChangePasswordResponse,
+  FederationCredentialRequest,
+  FederationCredentialResponse,
   DeleteAccountRequest,
   StorageStats,
   OrphanedFile,
@@ -42,8 +47,10 @@ import type {
   AdminUserListResponse,
   AdminUser,
   AdminResetPasswordResponse,
+  InstanceUpdateStatus,
   ExploreSpace,
   JoinRequest,
+  DirectoryFeed,
   Role,
   SpaceLayoutItem,
   SpaceFolder,
@@ -71,28 +78,82 @@ import type {
   AttachProofResponse,
   ReattachRequest,
   ReattachResponse,
+  TelemetryPayload,
+  TelemetryStatus,
 } from '@backspace/shared';
 import { getApiForOrigin, getOwnerInstanceForDm } from '../utils/crossStoreResolvers';
 
 export type { FederationPeer, FederationOrphanedAccount, FederationResetEvent, FederationResetEventsResponse, ApprovalRequest, PeeringSubscription, PeeringNotification };
 
-export class RateLimitError extends Error {
-  readonly retryAfter: number;
-  constructor(retryAfter: number) {
-    super('Rate limit exceeded');
-    this.name = 'RateLimitError';
-    this.retryAfter = retryAfter;
-  }
+/**
+ * Reply of the username availability check. `reason` is the server's
+ * English text; `code` and `details` let the client say it in the user's
+ * language.
+ */
+export interface CheckUsernameResponse {
+  available: boolean;
+  reason?: string;
+  code?: ErrorCode;
+  details?: ErrorDetails;
+}
+
+/** The parts of an error body the client reads; see HttpError.fromBody for the vintages. */
+function readErrorBody(body: unknown): { errorText?: string; code?: ErrorCode; details?: ErrorDetails } {
+  const record = typeof body === 'object' && body !== null ? (body as Record<string, unknown>) : {};
+  const errorText = typeof record.error === 'string' && record.error.length > 0 ? record.error : undefined;
+  const code = isErrorCode(record.code) ? record.code : isErrorCode(record.error) ? record.error : undefined;
+  const details = typeof record.details === 'object' && record.details !== null
+    ? (record.details as ErrorDetails)
+    : undefined;
+  return { errorText, code, details };
 }
 
 export class HttpError extends Error {
   readonly status: number;
   readonly body?: unknown;
-  constructor(status: number, message: string, body?: unknown) {
+  /** Stable server error code, when the route sends one; see packages/shared/src/errors.ts. */
+  readonly code?: ErrorCode;
+  /** Interpolation values for the localized message, e.g. `{ max: 32 }`. */
+  readonly details?: ErrorDetails;
+
+  constructor(status: number, message: string, body?: unknown, code?: ErrorCode, details?: ErrorDetails) {
     super(message);
     this.name = 'HttpError';
     this.status = status;
     this.body = body;
+    this.code = code;
+    this.details = details;
+  }
+
+  /**
+   * Build from a failed response body of any vintage.
+   *
+   * Current routes send `{ error, code, statusCode, details? }`. Routes not
+   * yet converted, and peers on older versions, send `{ error }` alone, and
+   * some of those put the code in `error` itself. Only codes the shared list
+   * knows are accepted, so a peer cannot inject arbitrary catalog keys.
+   */
+  static fromBody(status: number, body: unknown): HttpError {
+    const { errorText, code, details } = readErrorBody(body);
+    return new HttpError(status, errorText ?? `HTTP ${status}`, body, code, details);
+  }
+}
+
+/**
+ * A 429 from any route. An HttpError with the body's own code when the
+ * route sends one (`lookup_rate_limited`, say) and `rate_limited` otherwise,
+ * so `describeError` says it in the user's language, plus the seconds to
+ * wait for the surfaces that count down (the auth pages).
+ */
+export class RateLimitError extends HttpError {
+  /** Seconds until the limiter admits the next request: the body's `retryAfter`, the Retry-After header, or 60. */
+  readonly retryAfter: number;
+
+  constructor(retryAfter: number, body?: unknown) {
+    const { errorText, code, details } = readErrorBody(body);
+    super(429, errorText ?? 'Rate limit exceeded', body, code ?? 'rate_limited', details);
+    this.name = 'RateLimitError';
+    this.retryAfter = retryAfter;
   }
 }
 
@@ -100,7 +161,7 @@ export class BackspaceApiClient {
   readonly auth: {
     register: (data: RegisterRequest) => Promise<AuthResponse>;
     login: (data: LoginRequest) => Promise<AuthResponse>;
-    checkUsername: (username: string) => Promise<{ available: boolean; reason?: string }>;
+    checkUsername: (username: string) => Promise<CheckUsernameResponse>;
     checkInvite: (token: string) => Promise<CheckInviteResponse>;
     attachProof: (targetDomain: string) => Promise<AttachProofResponse>;
   };
@@ -111,6 +172,7 @@ export class BackspaceApiClient {
     get: (id: string) => Promise<User>;
     verifyPassword: (password: string) => Promise<VerifyPasswordResponse>;
     changePassword: (data: ChangePasswordRequest) => Promise<ChangePasswordResponse>;
+    federationCredential: (data: FederationCredentialRequest) => Promise<FederationCredentialResponse>;
     deleteAccount: (data: DeleteAccountRequest) => Promise<{ success: boolean }>;
     getMutuals: (id: string, homeUserId?: string) => Promise<{ mutualFriends: User[]; mutualSpaces: { id: string; name: string; icon: string | null; avatarColor: string | null }[] }>;
     getFederationRegistry: () => Promise<{ registry: FederationRegistryEntry[]; updatedAt: number }>;
@@ -148,7 +210,7 @@ export class BackspaceApiClient {
     update: (id: string, data: UpdateChannelRequest) => Promise<Channel>;
     delete: (id: string) => Promise<{ success: boolean }>;
     messages: (id: string, before?: string, limit?: number) => Promise<MessageWithUser[]>;
-    messagesAround: (id: string, messageId: string) => Promise<MessageWithUser[]>;
+    messagesAround: (id: string, messageId: string, limit?: number) => Promise<MessageWithUser[]>;
     sendMessage: (channelId: string, data: CreateMessageRequest) => Promise<MessageWithUser>;
     getOverrides: (channelId: string) => Promise<{ channelId: string; targetType: string; targetId: string; allow: string; deny: string }[]>;
     putOverride: (channelId: string, data: { targetType: string; targetId: string; allow: string; deny: string }) => Promise<{ success: boolean }>;
@@ -180,7 +242,7 @@ export class BackspaceApiClient {
     createGroup: (data: CreateGroupDmRequest) => Promise<DmChannel>;
     close: (id: string) => Promise<{ success: boolean }>;
     messages: (id: string, before?: string, limit?: number) => Promise<DmMessageWithUser[]>;
-    messagesAround: (id: string, messageId: string) => Promise<DmMessageWithUser[]>;
+    messagesAround: (id: string, messageId: string, limit?: number) => Promise<DmMessageWithUser[]>;
     sendMessage: (id: string, data: CreateDmMessageRequest) => Promise<DmMessageWithUser>;
     updateMessage: (id: string, data: UpdateMessageRequest) => Promise<DmMessageWithUser>;
     deleteMessage: (id: string) => Promise<{ success: boolean }>;
@@ -231,7 +293,7 @@ export class BackspaceApiClient {
   readonly social: {
     friends: () => Promise<Friend[]>;
     requests: () => Promise<FriendRequest[]>;
-    sendRequest: (username: string) => Promise<{ success: boolean; requestId?: string }>;
+    sendRequest: (body: SendFriendRequest) => Promise<{ success: boolean; requestId?: string }>;
     updateRequest: (id: string, status: 'accepted' | 'declined') => Promise<{ success: boolean }>;
     removeFriend: (id: string) => Promise<{ success: boolean }>;
     cancelRequest: (id: string) => Promise<{ success: boolean }>;
@@ -275,6 +337,11 @@ export class BackspaceApiClient {
     myJoinRequests: (status?: string) => Promise<{ requests: JoinRequest[] }>;
   };
 
+  /** The public space directory, read through this instance's proxy (never the hub directly). */
+  readonly directory: {
+    list: (q?: string, limit?: number, offset?: number) => Promise<DirectoryFeed>;
+  };
+
   readonly gif: {
     trending: (limit?: number, pos?: string) => Promise<{ results: GifResult[]; next: string }>;
     search: (q: string, limit?: number, pos?: string) => Promise<{ results: GifResult[]; next: string }>;
@@ -283,7 +350,7 @@ export class BackspaceApiClient {
 
   readonly federation: {
     initiatePeering: (data: { remoteOrigin: string }) => Promise<{ peer: FederationPeer; verified?: boolean }>;
-    ensurePeered: (data: { remoteOrigin: string }) => Promise<{ peeringStatus: string; peerId?: string; error?: string }>;
+    ensurePeered: (data: PeerEnsureRequest) => Promise<{ peeringStatus: string; peerId?: string; error?: string }>;
     peers: () => Promise<{ peers: FederationPeer[] }>;
     resetEvents: () => Promise<FederationResetEventsResponse>;
     acknowledgeResetEvent: (origin: string) => Promise<{ success: boolean }>;
@@ -324,6 +391,12 @@ export class BackspaceApiClient {
     setUserRole: (userId: string, isAdmin: boolean) => Promise<AdminUser>;
     resetUserPassword: (userId: string) => Promise<AdminResetPasswordResponse>;
     deleteUser: (userId: string) => Promise<{ success: boolean }>;
+    updateStatus: (refresh?: boolean) => Promise<InstanceUpdateStatus>;
+    telemetry: {
+      get: () => Promise<TelemetryStatus>;
+      set: (enabled: boolean) => Promise<TelemetryStatus>;
+      preview: () => Promise<TelemetryPayload>;
+    };
   };
 
   constructor(baseUrl: string, getToken: () => string | null, onUnauthorized?: () => void) {
@@ -371,13 +444,12 @@ export class BackspaceApiClient {
           onUnauthorized();
         }
         if (response.status === 429) {
-          const body = await response.json().catch(() => ({}));
+          const body: unknown = await response.json().catch(() => ({}));
           const retryAfter = (body as { retryAfter?: number }).retryAfter
             ?? (parseInt(response.headers.get('retry-after') || '', 10) || 60);
-          throw new RateLimitError(retryAfter);
+          throw new RateLimitError(retryAfter, body);
         }
-        const error = await response.json().catch(() => ({ error: 'Request failed' }));
-        throw new HttpError(response.status, (error as { error?: string }).error || `HTTP ${response.status}`, error);
+        throw HttpError.fromBody(response.status, await response.json().catch(() => null));
       }
 
       return response.json() as Promise<T>;
@@ -389,7 +461,7 @@ export class BackspaceApiClient {
       login: (data: LoginRequest) =>
         request<AuthResponse>('POST', '/auth/login', data, false),
       checkUsername: (username: string) =>
-        request<{ available: boolean; reason?: string }>('GET', `/auth/check-username?username=${encodeURIComponent(username)}`, undefined, false),
+        request<CheckUsernameResponse>('GET', `/auth/check-username?username=${encodeURIComponent(username)}`, undefined, false),
       checkInvite: (token: string) =>
         request<CheckInviteResponse>('GET', `/auth/check-invite?token=${encodeURIComponent(token)}`, undefined, false),
       attachProof: (targetDomain: string) =>
@@ -404,6 +476,8 @@ export class BackspaceApiClient {
         request<VerifyPasswordResponse>('POST', '/users/@me/verify-password', { password }),
       changePassword: (data: ChangePasswordRequest) =>
         request<ChangePasswordResponse>('POST', '/users/@me/change-password', data),
+      federationCredential: (data: FederationCredentialRequest) =>
+        request<FederationCredentialResponse>('POST', '/users/@me/federation-credential', data),
       deleteAccount: (data: DeleteAccountRequest) =>
         request<{ success: boolean }>('DELETE', '/users/@me', data),
       getMutuals: (id: string, homeUserId?: string) => {
@@ -473,9 +547,10 @@ export class BackspaceApiClient {
         params.set('limit', String(limit));
         return request<MessageWithUser[]>('GET', `/channels/${id}/messages?${params}`);
       },
-      messagesAround: (id: string, messageId: string) => {
+      messagesAround: (id: string, messageId: string, limit = 50) => {
         const params = new URLSearchParams();
         params.set('messageId', messageId);
+        params.set('limit', String(limit));
         return request<MessageWithUser[]>('GET', `/channels/${id}/messages/around?${params}`);
       },
       sendMessage: (channelId: string, data: CreateMessageRequest) =>
@@ -529,9 +604,10 @@ export class BackspaceApiClient {
         params.set('limit', String(limit));
         return request<DmMessageWithUser[]>('GET', `/dm/${id}/messages?${params}`);
       },
-      messagesAround: (id: string, messageId: string) => {
+      messagesAround: (id: string, messageId: string, limit = 50) => {
         const params = new URLSearchParams();
         params.set('messageId', messageId);
+        params.set('limit', String(limit));
         return request<DmMessageWithUser[]>('GET', `/dm/${id}/messages/around?${params}`);
       },
       sendMessage: (id: string, data: CreateDmMessageRequest) =>
@@ -591,7 +667,7 @@ export class BackspaceApiClient {
     this.social = {
       friends: () => request<Friend[]>('GET', '/social/friends'),
       requests: () => request<FriendRequest[]>('GET', '/social/requests'),
-      sendRequest: (username: string) => request<{ success: boolean; requestId?: string }>('POST', '/social/requests', { username }),
+      sendRequest: (body: SendFriendRequest) => request<{ success: boolean; requestId?: string }>('POST', '/social/requests', body),
       updateRequest: (id: string, status: 'accepted' | 'declined') =>
         request<{ success: boolean }>('PATCH', `/social/requests/${id}`, { status }),
       removeFriend: (id: string) => request<{ success: boolean }>('DELETE', `/social/friends/${id}`),
@@ -688,6 +764,16 @@ export class BackspaceApiClient {
       },
     };
 
+    this.directory = {
+      list: (q?: string, limit = 50, offset = 0) => {
+        const params = new URLSearchParams();
+        if (q) params.set('q', q);
+        params.set('limit', String(limit));
+        params.set('offset', String(offset));
+        return request<DirectoryFeed>('GET', `/directory?${params}`);
+      },
+    };
+
     this.gif = {
       trending: (limit = 30, pos?: string) => {
         const params = new URLSearchParams();
@@ -710,7 +796,7 @@ export class BackspaceApiClient {
         request<{ peer: FederationPeer; verified?: boolean }>(
           'POST', '/federation/peer/initiate', data
         ),
-      ensurePeered: (data: { remoteOrigin: string }) =>
+      ensurePeered: (data: PeerEnsureRequest) =>
         request<{ peeringStatus: string; peerId?: string; error?: string }>(
           'POST', '/federation/peer/ensure', data
         ),
@@ -814,6 +900,18 @@ export class BackspaceApiClient {
         request<AdminResetPasswordResponse>('POST', `/admin/users/${userId}/reset-password`),
       deleteUser: (userId) =>
         request<{ success: boolean }>('DELETE', `/admin/users/${userId}`),
+      // `refresh` bypasses the server's six-hour cache for an explicit
+      // "Check again" click. It cannot bypass BACKSPACE_UPDATE_CHECK.
+      updateStatus: (refresh = false) =>
+        request<InstanceUpdateStatus>(
+          'GET',
+          `/admin/instance/update-status${refresh ? '?refresh=true' : ''}`,
+        ),
+      telemetry: {
+        get: () => request<TelemetryStatus>('GET', '/admin/telemetry'),
+        set: (enabled) => request<TelemetryStatus>('PUT', '/admin/telemetry', { enabled }),
+        preview: () => request<TelemetryPayload>('GET', '/admin/telemetry/preview'),
+      },
     };
   }
 }

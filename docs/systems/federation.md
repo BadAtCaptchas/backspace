@@ -3,12 +3,24 @@
 > **Companion spec:** This document covers **S2S (server-to-server)** federation — the relay protocol, HMAC auth, identity resolution, and background workers. For the **client-side** multi-instance architecture (how the web/desktop app connects to multiple instances, federated account creation, origin-aware routing), see [`client-federation.md`](client-federation.md). Both systems work together.
 
 Source files:
-- `packages/server/src/routes/federation.ts` -- API endpoints (peer handshake, relay, sync) + all inbound event processors + identity resolution functions
+- `packages/server/src/routes/federation.ts` -- **Barrel** for the federation route subsystem. Re-exports the public API (identity resolution, event processors, reconciliation, `validateOrigin`) so `from '.../routes/federation.js'` imports resolve unchanged, and composes the HTTP registrars into `federationRoutes()`. The implementation lives in `routes/federation/` (split out of the former single 7.6k-line file; see `docs/superpowers/specs/2026-07-10-federation-ts-split-design.md`):
+  - `routes/federation/rateLimits.ts` -- In-memory sliding-window rate limiters (accept/relay/lookup/ensure) + replay-nonce store + eviction timers
+  - `routes/federation/origin.ts` -- `validateOrigin`, `resolveLocalOrigin`, `sanitizePeer` (+ `SanitizedPeer` shape)
+  - `routes/federation/identity.ts` -- Federated identity resolution: `extractDomain`, `getOurIdentityDomain`, `attributionRefusal`, `localUserStandingOnPeer`, `resolveRelayActor`, `resolveLocalUser`, `findFederatedUser`, `resolveOrCreateReplicatedUser`, `backfillHomeUserId`
+  - `routes/federation/dmChannels.ts` -- DM message payload builder, `resolveLocalDmMessage`, `isUrlFromPeer` (1-on-1 find-or-create is `findOrCreateOneOnOne` in `utils/dmConversation.ts`)
+  - `routes/federation/profile.ts` -- Replicated-profile hydration + asset download, `processProfileUpdateEvent`, `backfillReplicatedProfileAssets`
+  - `routes/federation/reconciliation.ts` -- DM federated-id reconciliation + dead-incarnation artifact sweeps (worker-facing maintenance)
+  - `routes/federation/events/*.ts` -- Inbound relay event processors, grouped by domain: `dmMessages`, `membership`, `friends`, `calls`, `dmState` (presence/read-state/close/reopen/file-rejected), and `dispatch` (`processRelayEvents`, the fan-out entry point shared by the HTTP relay handler and the initial-sync worker)
+  - `routes/federation/handlers/*.ts` -- Fastify route registrars, grouped by endpoint concern: `peerHandshake` (initiate/accept/ensure/rotate/denied), `peerAdmin` (peer list/CRUD/reset/recheck/rotate), `approvals` (approval queue + peering subscriptions/notifications + approve/deny helpers), `relay` (identity delete, relay, epoch, sync), `lookup` (user lookups), `attach` (verify-attach-proof, `/api/users/@me/reattach`)
+    - `routes/federation/handlers/s2sAuth.ts` -- `authenticateS2SPeer(request, reply, opts?)`: the shared inbound S2S-HMAC auth preamble (parse headers → resolve active peer → optional per-peer rate limit **before** signature → verify HMAC signature → nonce replay). Adopted by the six endpoints whose preamble is byte-identical: `DELETE /identity`, `POST /relay`, `POST /sync` (`relay.ts`), `POST /users/lookup`, `POST /users/by-home-id` (`lookup.ts`), and `POST /verify-attach-proof` (`attach.ts`). Returns `{ ok: true, peer, nonce }` or, having already sent the rejection reply, `{ ok: false }` (caller must `return`). **Intentional non-adopters** (each keeps a load-bearing gate the helper would flatten, documented in its own docstring/comment): `POST /epoch` (revoked-only gate for peer recovery, 400 on missing headers, no nonce check), `POST /peer/rotate` (active-only, no nonce check), `POST /peer/denied` (`awaiting_approval` gate, synthetic no-grace secret verify).
 - `packages/server/src/utils/federationAuth.ts` -- HMAC signing, verification, header parsing, `getOurOrigin()`
+- `packages/server/src/utils/federationFetch.ts` -- The outbound path for peer-addressed requests: origin trust levels (`approved` / `asserted`), origin format checks, no redirect following. See §1b.
 - `packages/server/src/utils/federationOutbox.ts` -- Event queuing, coalescing, relay payload construction, mutation log, participant/target resolution
-- `packages/server/src/utils/federationLookup.ts` -- HMAC-signed remote-user lookups: `lookupRemoteUser` (by username) and `lookupRemoteUserByHomeId` (reverse lookup, used by stub backfill)
+- `packages/server/src/utils/federationLookup.ts` -- HMAC-signed remote-user lookups: `lookupRemoteUser` (by username) and `lookupRemoteUserByHomeId` (reverse lookup, used by the stub backfill and `resolveRemoteIdentityForClient`)
 - `packages/server/src/utils/federationPresence.ts` -- S2S presence relay: `queuePresenceRelay`, `snapshotPresenceForPeer` (relationship-scoped), `markPeerStubsOffline`
-- `packages/server/src/utils/federationStubBackfill.ts` -- Heals legacy snowflake-named replicated-user stubs by reverse-looking-up the canonical username via the peer
+- `packages/server/src/utils/federationStubBackfill.ts` -- Renames replicated stubs that still carry a placeholder name by reverse-looking-up the canonical username via the peer
+- `packages/server/src/utils/federationClientIdentity.ts` -- `resolveRemoteIdentityForClient`: resolves a `homeUserId` + `homeInstance` pair a local client names in a DM route, asking the home for the username on first contact
+- `packages/server/src/routes/federation/stubName.ts` -- `isPlaceholderNamedStub` / `renamePlaceholderNamedStub` / `applyPlaceholderRename` / `announceUserUpdated`: the one-time rename of a placeholder-named stub, used by identity resolution, hydration and the backfill; `firstFreeUsername`, the suffix rule creation and rename share
 - `packages/server/src/utils/federationWorker.ts` -- Background workers: outbox delivery, file download, health check, janitor, initial sync
 - `packages/server/src/utils/storageJanitor.ts` -- Federation GC: outbox expiry, mutation log retention, file queue cleanup, DM channel purge
 - `packages/server/src/routes/social.ts` -- Friend request/accept/cancel/remove endpoints that queue federation events
@@ -107,7 +119,7 @@ Both instances store the **same** HMAC secret. The initiating instance generates
       │  active    rejected   rejected     │
       │                                    │ health check OK
       │  auto-peer rejected                ▼
-      │  (403 PEERING_REQUIRES_APPROVAL) active
+      │  (403 approval-required/revoked) active
       └──────────────────────────── rejected
                                       │ admin revoke (active)
                                       ▼
@@ -117,7 +129,7 @@ Both instances store the **same** HMAC secret. The initiating instance generates
 | Status | Outbox delivery | Health check | Relay accepts | Re-initiation | Admin clear |
 |--------|----------------|--------------|---------------|---------------|-------------|
 | `active` | Yes | No | Yes | No (returns existing) | N/A |
-| `pending` | No | No | No | No (returns 409) | N/A |
+| `pending` | No (handshake retried on the recovery backoff while entries are queued) | No | No | `'auto'` row: taken over by `/peer/initiate`; `'admin'`/`'remote'` row or a handshake in flight: 409 | `'auto'` row with nothing but presence queued: janitor removes it after 1h |
 | `awaiting_approval` | No | No | No | Returns pending; no re-handshake | Yes (admin deletes) |
 | `unreachable` | No (entries wait) | Yes — demand-driven probe (backoff while mail queued; 15-min backstop when silent) | Yes (resets to active) | No | N/A |
 | `needs_attention` | No (entries bounded by TTL) | No | Yes (200 no-update, same as active) | No (admin must Reset first) | Yes (admin Reset deletes record) |
@@ -143,16 +155,20 @@ When due, it calls `probePeerReachable(origin)` (`utils/federationRecovery.ts`) 
 When the server needs to relay events to an instance it has not yet peered with, `ensurePeered()` in `federationPeering.ts` automatically initiates the handshake. This removes the requirement for an admin to manually initiate every peering relationship.
 
 **Integration points:**
-- **Outbox worker** (`federationWorker.ts`) — after delivering active peers, calls `ensurePeered()` for any pending-placeholder entries whose peer has not yet been activated.
+- **Outbox worker** (`federationWorker.ts:resolvePendingPeers`) — at the start of each outbox tick, starts an `ensurePeered()` handshake for every `pending` peer that has queued outbox entries and whose next attempt is due. The placeholders themselves are created by `createAutoPlaceholderPeer`, subject to the outbound gate — see [Peer-row provenance](#peer-row-provenance). See **Pending-peer handshake pacing** below.
 - **Connection flow** (`POST /api/federation/peer/ensure`) — called by the client when establishing a cross-instance connection, ensuring the two instances are peered before any relay traffic is sent.
 
-**`rejected` status** — Added to the peer lifecycle. Set when a remote instance explicitly rejects auto-peering with `403 PEERING_REQUIRES_APPROVAL`. This status is sticky: no automatic retry occurs. An admin can clear it by deleting the peer record (then re-initiating), or by manually initiating via `peer/initiate`. An incoming `peer/accept` from a remote admin can also override `rejected` → `active` (treated the same as a `pending` record).
+**Pending-peer handshake pacing.** The worker's handshake attempts for `pending` rows run detached from the outbox tick: the tick does not wait for them, so an origin that never answers (10-second handshake timeout) does not hold up delivery to active peers or the next tick. `pendingPeerHandshakes` (origin → attempt) keeps a second attempt for the same origin from starting while one is outstanding, and an origin whose handshake `ensurePeered` already has in flight for another caller (`isHandshakeInFlight`) is skipped without counting as an attempt. Attempts are paced by the same mechanism as [unreachable-peer recovery](#peer_unreachable_threshold): `isPeerAttemptDue` over `RECOVERY_BACKOFF_MS` and the row's `last_probe_at` / `probe_attempts`. The first attempt is immediate (`last_probe_at IS NULL`); a `failed` result sets `last_probe_at` to the attempt's start and increments `probe_attempts`, so with the shared indexing the retries follow 1m, 5m, then every 15m. `active`, `rejected`, `pending` (now `awaiting_approval`) and `admin_required` (row removed by the outbound gate) leave nothing to pace. Before this, every pending row with entries was retried on every tick with each handshake awaited in turn, so one unreachable origin cost every tick up to 10 seconds.
 
-**`autoAcceptPeering` instance setting** — Controls whether `POST /api/federation/peer/accept` accepts unsolicited peering requests. Default: `true`. When `false`, the endpoint returns `403 PEERING_REQUIRES_APPROVAL` for requests where no local `pending` record exists (i.e., a request the local admin did not initiate). The determination is made by checking the local peer table — not a client-provided flag.
+**Transient handshake failure.** `performHandshake` inserts its `pending` row (`initiatedBy: 'auto'`) before the request goes out, so traffic queued while the request is in flight lands on that row. In the DM send path this is the usual order: the typing-stop relay's warm-up (`sendCallRelay` with `peeringTimeoutMs: 0`) starts the handshake, then `queueDmRelay` queues the message against the row it finds. On a network error, timeout or non-2xx answer other than the remote's two `403` refusals (see `rejected` below) the row is removed only when it is still `pending` and no `federation_outbox` entry references it (`discardCreatedPendingPeer`, one `DELETE ... WHERE status = 'pending' AND NOT EXISTS`). The status term matters because the remote's own `/peer/accept` can promote the same row to `active` while our request is in flight; a failure of our request afterwards must not delete that peering. A row with entries stays `pending`, the same shape `createAutoPlaceholderPeer` produces, and `resolvePendingPeers` retries it on the pending-peer handshake pacing above. Before this, the delete cascaded the queued messages away and nothing retried the peering until some later event.
+
+**`rejected` status** — Added to the peer lifecycle. Set when a remote instance refuses auto-peering with one of the two `403` answers a Backspace `/peer/accept` sends: `code: 'PEERING_REQUIRES_APPROVAL'` (its admin denied us) or `error: 'Peering with this instance has been revoked'` with no code (its row for us is `revoked`; matched by the exact string, `REMOTE_REVOKED_ERROR` in `federationPeering.ts`). Both are permanent answers, so neither is retried. Any other `403` (HTML or foreign-shaped JSON from a WAF, an IP block, a proxy deny rule or a default vhost) is not the remote's answer and goes to the transient branch. A revoked remote recovers the peering by re-initiating, which our `/peer/accept` turns from `rejected` into `active`. If the remote instead deletes its revoked row without re-initiating, nothing reaches us: our admin must initiate to recover. The update is conditional on the row still being `pending`: if the remote's own `/peer/accept` promoted the row to `active` while our request was in flight, that row stands and `ensurePeered` answers `active`. This status is sticky: no automatic retry occurs. An admin can clear it by deleting the peer record (then re-initiating), or by manually initiating via `peer/initiate`. An incoming `peer/accept` from a remote admin can also override `rejected` → `active` (treated the same as a `pending` record).
+
+**`autoAcceptPeering` instance setting** — Controls whether `POST /api/federation/peer/accept` accepts unsolicited peering requests. Default: `true`. When `false`, a request with no matching **admin-initiated** local `pending`/`awaiting_approval` record is queued for review and answered `202` (see [Peer Approval Queue](#peer-approval-queue)); `403 PEERING_REQUIRES_APPROVAL` is reserved for an origin the admin previously denied (a `rejected` row). The determination is made from the local peer table — the row's status *and* its `initiated_by` provenance — never from a client-provided flag.
 
 ### Peer Approval Queue
 
-When `autoAcceptPeering` is `false` and an instance calls `POST /api/federation/peer/accept` without a matching local `pending` record, the endpoint returns `202 Accepted` and creates a row in `peer_approval_requests` instead of immediately peering. The requesting instance receives `202` (not an error), so it enters `awaiting_approval` status rather than `rejected`.
+When `autoAcceptPeering` is `false` and an instance calls `POST /api/federation/peer/accept` without a matching admin-initiated local `pending` record, the endpoint returns `202 Accepted` and creates a row in `peer_approval_requests` instead of immediately peering. The requesting instance receives `202` (not an error), so it enters `awaiting_approval` status rather than `rejected`.
 
 **`peer_approval_requests` table** — Holds incoming peering requests pending admin review:
 - `id` — Snowflake PK
@@ -221,12 +237,12 @@ The receiver-side trust class is closed by the approval-token mechanism above. T
 
 Spec: `docs/superpowers/specs/2026-04-26-outbound-peering-gate-design.md`.
 
-**Gate location.** `ensurePeered` (`utils/federationPeering.ts`) is the single chokepoint every outbound new-peer attempt funnels through (friend-add, `/peer/ensure`, `sendCallRelay`'s no-active-peer branch, future callers). The gate runs ONLY when **no `federation_peers` row exists for the origin**. If any peer row exists in any status (`active`, `pending`, `awaiting_approval`, `rejected`, `revoked`, `unreachable`, `needs_attention`), the gate is a no-op — the existing branches in `ensurePeered` handle the row as today. This matches the threat model: the worry is automated paths creating *new* peerings without admin consent.
+**Gate location.** `ensurePeered` (`utils/federationPeering.ts`) is the single chokepoint every outbound new-peer attempt funnels through (friend-add, `/peer/ensure`, `sendCallRelay`'s no-active-peer branch, future callers). The gate runs when **no `federation_peers` row exists for the origin**, and also for a `pending` row that carries no admin provenance (`initiated_by != 'admin'` — see [Peer-row provenance](#peer-row-provenance)). Every settled status (`active`, `awaiting_approval`, `rejected`, `revoked`, `unreachable`, `needs_attention`) returns from the branch switch above the gate and never reaches it, so the gate can never retroactively break an established peering. `pending` is the one status meaning "no handshake has ever completed": there is nothing yet to preserve, and the gate's question is still unanswered. When the gate fires on such a row it **deletes it first** — the row can no longer become a peering (both peering gates refuse it) and leaving it would collide with the fresh row `handleOutboundApprove` inserts on approval. Its `federation_outbox` entries cascade away; the conversation itself survives in `federation_mutation_log` and replays on activation, exactly as for a rejected peer.
 
 **Required caller intent.** Every call site MUST pass an explicit `EnsurePeeredCallerIntent` (declared in `packages/shared/src/types.ts`). The argument is required at the type level so a future caller cannot silently fall through to system behavior:
 
 ```ts
-export type PeeringTriggerReason = 'friend_add' | 'space_join' | 'direct_message';
+export type PeeringTriggerReason = 'friend_add' | 'space_join' | 'direct_message' | 'instance_connect';
 
 export type EnsurePeeredCallerIntent =
   | { kind: 'user_action'; userId: string; reason: PeeringTriggerReason; target: string }
@@ -275,11 +291,36 @@ The other lifecycle exits write notifications and cascade-delete the parent at t
 | Site | Intent | On `'admin_required'` |
 |---|---|---|
 | `routes/social.ts` (friend-add) | `user_action` reason `friend_add` target `name@domain` | 409 `peer_pending_local_admin` |
-| `routes/federation.ts` (`/peer/ensure`) | `user_action` reason `friend_add` (default; client-supplied reason is ignored today) | response `peeringStatus: 'admin_required'` |
+| `handlers/peerHandshake.ts` (`/peer/ensure`) | `user_action` with the request's `reason` (one of `PEER_ENSURE_REASONS`, default `instance_connect`) and a target the server derives for it | response `peeringStatus: 'admin_required'` |
 | `utils/federationOutbox.ts` (`sendCallRelay` no-active-peer) | `system` | `CallRelayFailureReason.peer_admin_required` |
-| `utils/federationWorker.ts` (`resolvePendingPeers`) | n/a | operates only on already-existing pending rows; gate is unreachable from this path |
+| `utils/federationWorker.ts` (`resolvePendingPeers`) | `system` | operates on already-existing pending rows; reaches the gate only for a row with non-admin provenance, which it refuses |
 
 Admin-initiated paths (`/peer/initiate`, `/approve`) do NOT call `ensurePeered`. They issue their own `fetch` and run their own activation logic. The gate does not affect admin power; admins retain full ability to pre-peer or approve outbound regardless of the setting.
+
+**`/peer/initiate` and an existing `pending` row.** A row with `initiated_by = 'auto'` is taken over instead of refused: the route keeps the row, its `hmac_secret` and its queued outbox entries, sets `initiated_by = 'admin'` and runs its handshake with that secret. On `202` the row becomes the admin-initiated `awaiting_approval` row; on `200` it activates (or parks in `needs_attention` if `/epoch` does not verify) as a fresh row would. On a failure (network error, timeout, non-2xx, `409 PEER_EXISTS_RESET_REQUIRED`) the row is handed back unchanged apart from the attempt: `initiated_by = 'auto'`, `probe_attempts + 1`, `last_probe_at` = the attempt's start, so the outbox worker resumes its paced retries; a row the request created itself is still deleted. A `pending` row an admin or the remote created still answers `409`.
+
+**One handshake per origin.** `/peer/initiate` claims the origin with `claimAdminHandshake` (`utils/federationPeering.ts`) before it touches any row, and releases it when the request settles. The claim fails, and the route answers `409 "already in progress"`, while `ensurePeered` has a handshake with the origin in flight; while the claim is held, `ensurePeered` returns `failed` for the origin without sending anything, and the outbox worker and the janitor leave the row alone (`isHandshakeInFlight`). Without it, two `/peer/accept` requests for one origin raced on the remote, and the loser's `409 PEER_EXISTS_RESET_REQUIRED` made `/peer/initiate` delete the row the winner had just activated.
+
+### Peer-row provenance
+
+`federation_peers.initiated_by` records **who caused a peer row to exist**. It is the fact both peering gates consult when `autoAcceptPeering=0`, because a bare `pending` row is not evidence of anything on its own — several paths create one.
+
+| Value | Written by | Meaning |
+|-------|-----------|---------|
+| `'admin'` | `POST /peer/initiate` (a fresh row, or an `'auto'` pending row it takes over; a takeover whose handshake fails goes back to `'auto'`); the inbound, outbound, and deny handlers in `routes/federation/handlers/approvals.ts` | A local admin explicitly authorized (or refused) peering with this origin. |
+| `'auto'` | `createAutoPlaceholderPeer` (the outbox placeholder), `performHandshake` inside `ensurePeered` | Local traffic brought the origin up. No admin ruled on it. |
+| `'remote'` | the new-peer branch of `POST /peer/accept` | The remote instance introduced itself and we accepted (only reachable with `autoAcceptPeering=1`). |
+
+**Why it exists.** Relaying a DM to an unpeered origin used to insert a `pending` row directly from `queueOutboxEvent`. That row was indistinguishable from one `/peer/initiate` had created, so two separate gates read it as admin approval: the outbound worker resolved it into a real handshake (`ensurePeered` skips its gate once a row exists), and the remote's inbound `/peer/accept` matched it against the local-pending check below. Either way an origin a local user merely addressed could obtain the peering that `autoAcceptPeering=0` exists to withhold. Provenance separates "an admin decided" from "traffic happened".
+
+**Where it is enforced.** Both checks are positive tests for `'admin'`, never denylists of the other values, so adding a provenance value cannot silently reopen either gate:
+
+1. **Inbound** — the `autoAcceptPeering=0` branch of `POST /api/federation/peer/accept` matches a local `pending`/`awaiting_approval` row only when `initiated_by = 'admin'`. Anything else falls through to `queueApprovalRequest` (202) as if no row existed.
+2. **Outbound** — the [Outbound Peering Gate](#outbound-peering-gate) fires for a `pending` row with non-admin provenance and discards it.
+
+**Placeholder creation.** `queueOutboxEvent` no longer inserts peer rows itself; it calls `createAutoPlaceholderPeer` (`utils/federationPeering.ts`), which applies the same two guards `ensurePeered` applies — refuse while an inbound `peer_approval_requests` row for the origin is unresolved, and refuse when `autoAcceptPeering=0` — before inserting a `pending` row tagged `'auto'`. On refusal the origin is skipped and nothing is queued. That is not a lost message: `federation_mutation_log` is written independently of the outbox and replays through `onPeerActivated` if peering is approved later, the same mechanism that covers `awaiting_approval`, `needs_attention`, and `rejected` peers.
+
+**Upgrade behavior.** Migration `0012_absurd_shiver_man` adds the column with `DEFAULT 'auto'`, so every pre-existing row reads as non-admin — the gates fail closed. This is only observable on an `autoAcceptPeering=0` instance that had a handshake in flight at the moment of upgrade: the remote's callback re-queues as an approval request and the admin approves it once. `active` peers are untouched (they never reach either gate), and default-configuration instances (`autoAcceptPeering=1`) see no behavior change at all.
 
 ### Admin Endpoints
 
@@ -287,7 +328,7 @@ Admin-initiated paths (`/peer/initiate`, `/approve`) do NOT call `ensurePeered`.
 |----------|--------|------|---------|
 | `/api/federation/peer/initiate` | POST | JWT + admin | Start peering handshake |
 | `/api/federation/peer/accept` | POST | None (rate-limited) | Accept incoming handshake |
-| `/api/federation/peer/ensure` | POST | JWT (any user), rate-limited 3/15min/user | Trigger auto-peering to a remote instance |
+| `/api/federation/peer/ensure` | POST | JWT (any user), rate-limited 3/15min/user for calls that can start a handshake | Trigger auto-peering to a remote instance |
 | `/api/federation/peers` | GET | JWT + admin | List all peers (secret excluded) |
 | `/api/federation/peers/:id` | PATCH | JWT + admin | Update peer settings (auto-rotation interval) |
 | `/api/federation/peers/:id` | DELETE | JWT + admin | Revoke peer, purge outbox |
@@ -299,7 +340,13 @@ Admin-initiated paths (`/peer/initiate`, `/approve`) do NOT call `ensurePeered`.
 | `/api/federation/approval-requests/:id/approve` | POST | JWT + admin | Approve request — direction-branched (see Approval flow above) |
 | `/api/federation/approval-requests/:id/deny` | POST | JWT + admin | Deny request — direction-branched (see Denial flow above) |
 
-**`POST /api/federation/peer/ensure`** — Wraps `ensurePeered()`. Accepts `{ remoteOrigin: string }` in body. Returns `{ peeringStatus, peerId?, error? }` where `peeringStatus` is one of `active`, `pending`, `awaiting_approval`, `rejected`, `unreachable`, or `revoked`.
+**`POST /api/federation/peer/ensure`** — Wraps `ensurePeered()`. Body is `PeerEnsureRequest`: `{ remoteOrigin: string; reason?: PeerEnsureReason }`.
+
+`reason` is what the local admin's approval queue and the user's pending list show when the [outbound gate](#outbound-peering-gate) fires. It is checked against `PEER_ENSURE_REASONS` (`packages/shared/src/types.ts`), today `['instance_connect']`; anything else, including `friend_add`, is `400 validation_failed`. `friend_add` is excluded on purpose: friend-add peers server-side (`routes/social.ts`) with a target it has checked, so a client stating it could only queue a friend request the admin cannot verify. A missing `reason` reads as `instance_connect`, because clients that predate the field only called the endpoint when opening a session on a remote. The target is never read from the request: `peerEnsureTarget` derives it per reason (for `instance_connect`, the normalized remote origin), so the queue only shows what this instance can vouch for. Before this the handler recorded every call as `friend_add` with the origin as target, and a Connections click reached the admin as a friend add. Rows written that way are relabelled by migration `0018_peering_reason_instance_connect` (see [database.md](database.md#peer_approval_notifications)).
+
+The response is `{ peeringStatus, peerId?, error? }` where `peeringStatus` is one of `active`, `pending`, `awaiting_approval`, `rejected`, `unreachable`, `revoked`, or `admin_required`.
+
+The client calls it on every remote session it opens (see [client-federation.md](client-federation.md#home-instance-peering-on-every-session-peerhomewithremote)). The rate limit exists to bound the handshakes a user can make this instance start, so it is only charged when the call can start one: `settledPeeringResult(origin)` (`utils/federationPeering.ts`, the same settled-row switch `ensurePeered` uses) answers an `active`, `unreachable`, `awaiting_approval`, `rejected`, `revoked` or `needs_attention` row from the row alone, with no network and no writes, and such a call is not counted. A missing or `pending` row is counted.
 
 ### S2S Endpoints
 
@@ -326,6 +373,8 @@ The home-instance verifier for the detached-account re-attach flow (re-attach sp
 
 The owner-initiated exception to the detach invariant (re-attach spec §3.2), on peer R. **JWT-authenticated as the detached account, not S2S** — but registered in `routes/federation.ts` (not `users.ts`) because it consumes federation-internal machinery (`verifyAttachProofWithPeer`, `fetchHomeProfileByHomeId`, `downloadProfileAsset`, the peer HMAC channel). It re-binds the sovereign detached row back to the owner's new home identity, restoring live sync while keeping history. It links **only** when BOTH proofs hold: the session IS the detached account (local password authority, via `authenticate`) AND the one-time token verifies with the home peer over signed S2S (`verifyAttachProofWithPeer`). Identity is never guessed and never username-matched — the latter is exactly the tier-2 hijack the detach branch closed.
 
+**This is the only path that merges a `'!federation-replicated'` stub into a credentialed account.** Public registration never does: `POST /api/auth/register` carries no proof of control over the `homeInstance`/`homeUserId` it is handed, so it only ever INSERTs a new row (`auth.md` "Federated Registration Never Claims an Existing Row"). Any future flow that wants to hand a stub's history to a real account must go through this proof pair, not through a lookup.
+
 - **Body:** `{ token: string }` (64-char hex; else 400). **Response:** `{ success: true, user: User }` (sanitized self-view; `ReattachResponse`).
 - **Guards, in order:** (1) session user is a **live detached** federated account (`home_instance` set, `federation_home_orphaned = 1`, `is_deleted = 0`) → else 403; a missing/tombstoned row → 404 (a tombstoned session is already 401'd at `authenticate`, so the handler's 404 is defense-in-depth for a concurrent-delete race — detached tombstones are not re-attachable). (2) The home domain is an **active peer** → else 409 (the proof is only as trustworthy as the S2S channel it verifies over). (3) `verifyAttachProofWithPeer` returns `valid:true` → else 401 (fails closed). (4) If the verified new identity already has a live local row for that domain, it MUST be a replicated stub (`password_hash = '!federation-replicated'`) → a real account holding it is state corruption, aborted with **409 + a `console.error`** (impossible while the detached row holds the username).
 - **Effect (one `rawDb.transaction`):** merges any pre-existing stub for the new identity into the detached row (below), sets `home_user_id = <new homeUserId>`, `federation_home_orphaned = 0`, adopts the new home username base if it differs (existing collision-suffix `<base>_<n>@<domain>` scheme; base match keeps the current handle), and **nulls `profile_updated_at`** so the home's next `profile_update` (any version) tier-1 matches and applies. Group-DM authority the old identity held is migrated by `owner_home_user_id` (the S2S authority key, home-domain-normalized). After the transaction, a best-effort `fetchHomeProfileByHomeId` pull applies the current home profile (avatar/banner via `downloadProfileAsset`, fail-open); then `user_updated` is broadcast to friends/DM/space co-members + all self connections (`collectProfileBroadcastTargetIds`).
@@ -333,7 +382,7 @@ The owner-initiated exception to the detach invariant (re-attach spec §3.2), on
 
 **Stub merge (spec §3.3).** By the time the owner re-attaches, R may already hold a replicated stub for the new home identity (from ordinary DM/friend relay, e.g. `youruser_1@<domain>`). Two rows must not share `(homeUserId, homeInstance)`, so the stub is merged into the detached row inside the transaction: every `users.id` FK a replicated stub **can** populate is repointed, with collision rows deduped **before** repoint. Tables (audited against `schema.ts`): `dm_members` (dedupe on `dm_channel_id`), `dm_messages`, `messages`, `dm_reactions` (dedupe on `dm_message_id+emoji`), `reactions` (dedupe on `message_id+emoji`), `friends` (both columns + drop self-rows), `friend_requests` (both columns + drop self-rows), `read_states` (dedupe on `channel_id`), `dm_channels.owner_id` (plain-text column, no FK). Space-scoped FKs (`space_members`, `member_roles`, `*_overrides`, `bans`, `join_requests`, `voice_restrictions`, layouts/folders) and moderator/owner RESTRICT columns are **not** repointed — a DM/friend replica can never hold them. The stub row is then deleted. Only a `'!federation-replicated'` row is ever a merge source (guard 4).
 
-**1-on-1 DM `federatedId` reconciliation (reattach-dm-reconcile spec §3.1–§3.2).** A 1-on-1 DM's identity is `computeFederatedId(homeUserIdA, homeUserIdB)` — a deterministic SHA-256 of the two sorted home user IDs. The re-bind changes the account's `home_user_id`, so **every** 1-on-1 DM it participates in now derives a different `federatedId`: pre-reattach history stays under the OLD-identity channel while post-reattach messages compute the NEW id and land in a parallel channel — one conversation surfaced twice. So, still inside the re-attach transaction (after the re-bind UPDATE), the endpoint enumerates the account's 1-on-1 channels (exactly 2 members, 1-on-1-shaped `federated_id`) and calls `reconcileDmChannelFederatedId(rawDb, channelId)` on each. That helper recomputes the expected id from the members' **current** home identities and, when it differs from the stored id, either **re-keys in place** (no channel already carries the new id) or **merges the drifted channel INTO the existing new-identity channel and deletes it** (`idx_dm_federated` is UNIQUE, so two rows can never share a `federated_id`). Merge moves `dm_messages` (globally-unique snowflake ids; `attachments`/`dm_reactions` follow by `dm_message_id`), dedupes `dm_members` and `read_states` on their composite PKs, then drops the source row. Group DMs (random-UUID `federatedId`) are **skipped** — their id is member-independent, so re-attach never drifts them. After commit, affected local members receive `dm_channel_closed` (merged source) + `dm_channel_created` (full surviving-channel payload) so the split collapses live without a reload.
+**1-on-1 DM `federatedId` reconciliation (reattach-dm-reconcile spec §3.1–§3.2).** A 1-on-1 DM's identity is `oneOnOneKey(a, b)` (`utils/dmConversation.ts`) — a deterministic SHA-256 of the two sorted home user IDs. The re-bind changes the account's `home_user_id`, so **every** 1-on-1 DM it participates in now derives a different `federatedId`: pre-reattach history stays under the OLD-identity channel while post-reattach messages compute the NEW id and land in a parallel channel — one conversation surfaced twice. So, still inside the re-attach transaction (after the re-bind UPDATE), the endpoint enumerates the account's 1-on-1 channels (exactly 2 members, 1-on-1-shaped `federated_id`) and calls `reconcileDmChannelFederatedId(rawDb, channelId)` on each. That helper recomputes the expected id from the members' **current** home identities and, when it differs from the stored id, either **re-keys in place** (no channel already carries the new id) or **merges the drifted channel INTO the existing new-identity channel and deletes it** (`idx_dm_federated` is UNIQUE, so two rows can never share a `federated_id`). Merge moves `dm_messages` (globally-unique snowflake ids; `attachments`/`dm_reactions` follow by `dm_message_id`), keeps one `dm_members` row per home identity (a member the target already holds, under any local id, is dropped from the source, reopening the target's row when the source's was open), dedupes `read_states` on their composite PK, re-points the source's `federation_mutation_log` and `federation_outbox` rows (`context_id` is the local channel id) to the target, then drops the source row. Re-attach enumerates its channels by 1-on-1-shaped `federated_id`; the helper itself also treats an ownerless row with a UUID key as a group and skips it. Group DMs (random-UUID `federatedId`) are **skipped** — their id is member-independent, so re-attach never drifts them. After commit, affected local members receive `dm_channel_closed` (merged source) + `dm_channel_created` (full surviving-channel payload) so the split collapses live without a reload.
 
 **Why R-local reconciliation is complete, not partial (spec §2).** A 1-on-1 DM is stored on an instance only if that instance is the home of at least one participant. The detached account is homed at the reset domain, i.e. **not native to R** (the peer where it now lives) — so the *other* participant of every 1-on-1 DM it holds on R is necessarily R-native, and R is that channel's authoritative home. Re-keying locally therefore produces the globally-correct id (the same value the R-native counterpart and the new home-identity compute); the reset home instance holds no old-identity channel. There is no cross-instance residual to relay: R-local reconciliation covers 100% of the account's 1-on-1 DMs.
 
@@ -423,7 +472,24 @@ The peering handshake must never report success when trust was not actually re-e
 
 **Handshake `sourceOrigin` honors `PUBLIC_ORIGIN`.** `resolveLocalOrigin()` (`routes/federation.ts`) now delegates to `getOurOrigin()`, so the origin advertised in the handshake `sourceOrigin` is byte-identical to the `X-Federation-Origin` used for all authenticated S2S requests. Previously it used `https://${DOMAIN}` and ignored `PUBLIC_ORIGIN`, which silently desynced the responder's peer-row key from the auth origin on any instance where `PUBLIC_ORIGIN != https://DOMAIN` — producing permanent `403 Not peered`. See "Public Origin Override" below.
 
-**Verification harness.** The self-contained two-instance integration harness (`packages/server/test/helpers/realHandshake.ts` + `packages/server/test/federation-handshake-desync.test.ts`) exercises the REAL cross-instance handshake — actual `/peer/initiate`→`/peer/accept`, the signed `/epoch` health probe (`s2sHealthy`), and `simulateReset` — using ephemeral in-process instances (each with `PUBLIC_ORIGIN` set to its `http://127.0.0.1:<port>` transport URL, its own temp DB and generated secrets, no live host). Case #1 is the clean-handshake control; #2 gates the responder-refusal fix (BUG-1); #4 gates one-click Re-peer recovery (BUG-2).
+**Verification harness.** The self-contained two-instance integration harness (`packages/server/test/helpers/realHandshake.ts` + `packages/server/test/federation-handshake-desync.test.ts`) exercises the REAL cross-instance handshake — actual `/peer/initiate`→`/peer/accept`, the signed `/epoch` health probe (`s2sHealthy`), and `simulateReset`. Each instance is a real server **spawned as a child process** (`tsx src/index.ts`) on an ephemeral loopback port with its own temp DB and generated secrets — not an in-process Fastify app: `config`, `getDb()`, the snowflake worker id, `connectionManager` and the replay-nonce store are all process-global singletons, so two instances cannot share one process. Here every instance also sets `PUBLIC_ORIGIN` to its `http://127.0.0.1:<port>` transport URL. Case #1 is the clean-handshake control; #2 gates the responder-refusal fix (BUG-1); #4 gates one-click Re-peer recovery (BUG-2).
+
+**Two-instance e2e suites (`packages/server/test/federation-e2e-*.test.ts`).** Built on the same spawned-process harness plus `test/helpers/federationE2E.ts`, these gate the relay security fixes end to end — two peered instances, real HMAC-signed HTTP, no Docker/Caddy/LiveKit. They peer exclusively through the real handshake; no suite seeds a `federation_peers` row.
+
+Two harness profiles exist because production collapses three origins into one string (`https://${DOMAIN}`: federated identity, transport URL, and `federation_peers.origin`) and loopback cannot:
+
+| Profile | `PUBLIC_ORIGIN` | What it makes real | Suites |
+|---------|-----------------|--------------------|--------|
+| `bootIdentityPeered` | unset → `https://<DOMAIN>` | Distinct identity domains, so `extractDomain` can tell three instances apart. The handshake leaves the initiator a transport-keyed peer row and the responder an identity-keyed one, so **inbound** relay is fully real. | attribution, stub-claiming, reply-confinement |
+| `bootTransportPeered` | `http://127.0.0.1:<port>` | Identity == transport == peer key, so **outbound** routing (`getGroupDmTargetOrigins`, `sendCallRelay`) resolves to a live peer and the outbox worker really delivers. Federation workers and synthetic LiveKit credentials are enabled. | relay-scoping, call-addressing, outbox-delivery |
+
+`test/helpers/relayTap.ts` is a transparent recording reverse proxy placed in front of a peer: it records every S2S request and forwards it verbatim (same bytes, so the HMAC still verifies), so peering and delivery behave normally while the wire stays readable. It exists because two claims are only observable in transit — which instances a `dm_call_start` was addressed to and which room tokens each payload carried, and whether an all-local DM's create *and* its delete were both broadcast (a leaked pair leaves the receiver's DB looking exactly like a conversation that was never relayed).
+
+Two more tap controls exist for delivery tests: `holdRelayResponses()` forwards relay POSTs but holds the receiver's answers until released (the receiver has applied the batch, the sender has not heard back: the on-the-wire window), and `failNextRelays(n)` answers the next `n` relay POSTs 503 without forwarding them.
+
+**Relay waits and their failure report.** A suite waits for a worker-delivered relay with `waitForRelay(check, { sender, receiver, peerOrigin?, what, timeoutMs? })` from `federationE2E.ts`, not a bare `waitUntil`. On timeout it throws with `describeRelayState`: the sender's peer rows (status, failure counters, last seen/failed, probe pacing), the sender's outbox entries for the receiver's peer row (event type, entity, attempts, next retry, age; the outbox has no delivered flag, so no entry means nothing is waiting), and the last 40 lines of both instances' logs, where the worker writes every failed attempt and rejection. The logs are quoted because `cleanup()` deletes the run directory. `waitForOutboxDrained` waits until the sender has nothing queued or on the wire for a peer.
+
+`packages/server/tsconfig.e2e.json` type-checks these suites and the shared helpers; the main server `tsconfig.json` includes only `src/**/*`, so nothing under `test/` is otherwise compiled. CI runs both (`typecheck:e2e`, then `pnpm -r test`) inside the required "Build & test" job.
 
 ### S2S Identity Deletion (`DELETE /api/federation/identity`)
 
@@ -466,9 +532,123 @@ These S→C events are pushed to the acting user's connected clients by the fede
 
 | Event | Pushed when | Payload |
 |-------|-------------|---------|
-| `federation_peer_rejected` | Outbox worker receives `403 PEERING_REQUIRES_APPROVAL` from a remote instance during auto-peering | `{ peerId: string, origin: string }` |
+| `federation_peer_rejected` | Outbox worker's auto-peering gets one of the remote's two refusals: `403 PEERING_REQUIRES_APPROVAL`, or the codeless `403` revoked answer. Any other `403` is transient | `{ peerId: string, origin: string }` |
 | `federation_peer_active` | A previously `rejected` peer transitions to `active` (e.g., via manual `peer/initiate` or incoming `peer/accept`) | `{ peerId: string, origin: string }` |
 | `federation_peer_reset_detected` | A peer's advertised instance epoch differs from the trusted baseline (wipe-and-reinstall on the same domain) — emitted by `markPeerReset` after routing the peer to `needs_attention` | `{ origin: string }` (admin-only, via `sendToAdmins`) |
+
+---
+
+## 1b. Outbound Requests
+
+Requests this instance addresses to a peer's federation endpoints go through
+`federationFetch` (`utils/federationFetch.ts`). It takes the peer origin, the
+federation path, the fetch init, and one more argument: how this instance came
+to know the origin.
+
+```ts
+export type OriginTrust = 'approved' | 'asserted';
+export async function assertPeerOriginAllowed(origin: string, trust: OriginTrust): Promise<void>;
+export async function federationFetch(origin: string, path: string, init: RequestInit, trust: OriginTrust): Promise<Response>;
+```
+
+### Origin trust
+
+| Trust | Where the origin came from | Address rule |
+|-------|---------------------------|--------------|
+| `approved` | a `federation_peers` row, or the body of an admin-authenticated request | any address |
+| `asserted` | a party with no settled peering relationship: a peering-request row a remote wrote, a handle a local user typed, a callback to a request that was never accepted | must resolve to a publicly routable address |
+
+Both levels run the same format checks first. The origin must parse, must be
+`http:` or `https:`, and must carry no path, query or fragment, because an
+origin is scheme plus host plus port and nothing else. A value that fails those
+checks is a bug in whatever wrote it, wherever it came from, so it is refused at
+both levels rather than joined to a federation path.
+
+`approved` allows a private address deliberately. Peering across a LAN is a
+supported deployment shape, and the two-instance test harness peers on
+loopback. A rule of the form "peer origins must be public" would break both.
+What makes this level safe is not the address, it is that an admin named the
+origin or that the origin is already a row in the peer table.
+
+`asserted` is the level for an origin nobody on this instance has ruled on. It
+must resolve to a public address, so the party that supplied it does not get to
+choose which hosts this instance opens a connection to. The gate resolves the
+hostname once and classifies the result with `classifyAddress`
+(`utils/ipClass.ts`); anything the classifier does not read as `public` is
+refused, and an origin that does not resolve at all is refused too.
+
+The two levels do not circle back on each other. A `federation_peers` row only
+exists because the outbound path that created it was itself gated: either an
+admin typed the origin into `/peer/initiate`, or the handshake that created the
+row ran as `asserted`.
+
+### Call sites
+
+18 outbound sites carry a peer origin: 13 `approved`, 5 `asserted`.
+
+| Trust | Sites |
+|-------|-------|
+| `approved` | `federationEpoch` (`/epoch`), `federationLookup` (`/users/lookup`, `/users/by-home-id`), `federationAttach` (`/verify-attach-proof`, `/users/by-home-id`), `federationOutbox` (`/relay`), `federationWorker` (`/relay`, `/peer/rotate`), `federationPeerActivation` (`/sync`), `federationRecovery` (`/api/instance/info` reachability probe), `routes/users.ts` (`/identity`), `handlers/peerAdmin.ts` (`/peer/rotate`), `handlers/peerHandshake.ts` (`/peer/accept`) |
+| `asserted` | `handlers/approvals.ts` (`/peer/accept` from the inbound and outbound approve branches, `/peer/denied` from the deny branch), `federationPeering.ts:performHandshake` (`/peer/accept`), `storageJanitor.ts` (`/peer/denied` on request expiry) |
+
+**Trust is a property of the caller, not of the function.** `performHandshake`
+is the clearest case: it runs only when no settled peer row exists, and its
+origin reaches it from a handle a user typed (friend-add) or from
+`POST /api/federation/peer/ensure`, which carries `authenticate` and nothing
+more, so any logged-in user can call it. It is `asserted` wherever it runs.
+
+Two sites read as asserted from the outside and are not:
+
+- `handlers/peerHandshake.ts` issues `/peer/accept` from `/peer/initiate`,
+  which carries `preHandler: [authenticate, requireAdmin]`. The origin is the
+  admin's own request body, already through `validateOrigin`. Classifying it
+  `asserted` would break admin-initiated LAN peering, which `validateOrigin`
+  deliberately supports.
+- `federationRecovery.ts:probePeerReachable` has two callers and both iterate
+  `federation_peers` rows with `status='unreachable'`: the recovery tick in
+  `federationWorker.ts` and the admin-only recheck route in `peerAdmin.ts`. No
+  unapproved origin reaches it, and a private peer stays probeable.
+
+### `FEDERATION_ALLOW_PRIVATE_PEERS`
+
+Default `false`, read as `config.federation.allowPrivatePeers`. While it is off,
+the `asserted` address rule above applies. Turning it on skips that rule, so an
+asserted origin may resolve to a private address. `approved` is unaffected
+either way, which is why admin-driven peering with a peer on a private address
+works the same in both settings.
+
+Two situations call for it:
+
+1. **A LAN-only deployment**, where every instance sits on a private address and
+   users add each other by handle. The asserted path has to be allowed to reach
+   a private address there, or handle-driven peering cannot work at all.
+2. **The two-instance test harness** (`test/helpers/twoInstanceHarness.ts`),
+   which spawns every instance on `127.0.0.1` and sets the flag for exactly the
+   same reason. It is set there and only there.
+
+Off is the shipped default so that an instance reachable from the public
+internet gets the narrower behaviour without configuring anything, and the
+operator opts in knowingly. Documented in `.env.example`.
+
+### Redirects
+
+`federationFetch` sends with `redirect: 'manual'` and does not follow. Every
+federation endpoint answers directly, so a 3xx from a peer means the peer is
+misconfigured or the response is pointing the request somewhere else. Callers
+see the 3xx and handle it through the non-2xx branch they already have.
+
+### Other outbound paths
+
+Not every outbound request is addressed to a federation endpoint. The rest of
+the map, so the inventory stays complete:
+
+| Path | Helper | Notes |
+|------|--------|-------|
+| Replicated profile assets (`routes/federation/profile.ts`) | `safeFetch` (`utils/ssrf.ts`) | Fetches a file URL rather than a federation endpoint. Redirects are followed, with every hop's destination re-validated first, and the body is capped at `MAX_PROFILE_ASSET_BYTES` (8 MiB). See [Profile Image File Replication](#profile-image-file-replication). |
+| Federated file replication (`federationWorker.ts`) | `safeFetch` | Same helper, same per-hop re-validation. See [File Download Worker](#file-download-worker-federationworkertsprocessfilequeueentry). |
+| Link embeds, metadata scraping, invite snapshots | `safeFetch` | Not federation traffic at all. See `docs/systems/embeds.md` §3. |
+| Federated login self-heal (`routes/auth.ts`) | its own request | Posts to `https://${user.homeInstance}`, a value stored on the user row, over a fixed path. Scheme is forced to `https`. See `docs/systems/auth.md` §4. |
+| GIF search proxy (`routes/gif.ts`) | its own request | A fixed provider host, no caller-supplied origin. |
 
 ---
 
@@ -515,6 +695,9 @@ Two layers of replay protection:
 3. Re-serialize request body to JSON: `JSON.stringify(request.body)`
 4. `verifySignature(bodyString, signature, peer.hmacSecret, timestamp, nonce)` -- reject if false
 5. Nonce enforcement: duplicate nonce → 409, missing nonce from ratcheted peer → 401, legacy peer → warn
+6. **Source-to-peer binding:** `normalizeOriginForCompare(body.sourceInstance)` must equal `normalizeOriginForCompare(peer.origin)` -- otherwise `403`
+
+**Source-to-peer binding.** The HMAC proves *who sent* the request; `body.sourceInstance` is only what the body *claims*, and every per-event attribution check downstream reads it. Step 6 collapses the two: a batch is only processed when its claimed origin is the peer that actually signed it. An honest sender always stamps its own `getOurOrigin()` there (`federationWorker.ts`), so a mismatch is never a legitimate configuration -- it is one peer speaking as another. `processRelayEvents` re-asserts the same equality as a structural invariant and rejects every event in the batch with `source_peer_mismatch` if it does not hold, so no caller -- HTTP or in-process (`federationPeerActivation.ts` initial sync) -- can feed the pipeline a source the peer did not prove.
 
 **Important:** The body is re-serialized server-side. This means Fastify's JSON parsing and re-stringification must produce identical output to the sender's `JSON.stringify`. In practice this works because both sides use standard `JSON.stringify` with no custom replacers.
 
@@ -533,38 +716,55 @@ Two layers of replay protection:
 
 **`findFederatedUser(homeUserId, homeInstance, db, hints?)`** -- `federation.ts`
 - Three-tier lookup: homeUserId match → domain + username hint match → not found
-- Tier 1: delegates to `resolveLocalUser` (fast path)
-- Tier 2: uses `extractDomain(homeInstance)` + `hints.username` to match stubs created by the auth registration path (which may have a different homeUserId)
-- **Tier 2 excludes detached accounts** (`federation_home_orphaned = 1`): a detached account is sovereign and must never be re-bound to the reset domain's new incarnation via username heuristics — that is exactly how a new same-name user would capture the established account. **Tier 1 (`homeUserId` match) is deliberately NOT excluded:** the new incarnation mints fresh `homeUserId`s, so a tier-1 hit on a detached row is a legitimate historical reference (e.g. an old group-DM attribution relayed by a third instance), not the new incarnation. Mutations are blocked at their own sites (profile_update handler, presence_update handler, `hydrateReplicatedUserProfile` fill-empty, S2S identity delete).
+- Tier 1: the identity itself, via `resolveRelayActor(homeUserId + homeInstance)`. When it reports `mismatch` (the `homeUserId` belongs only to local rows of another identity) the lookup stops: nothing is returned and tier 2 is not tried, so the id can neither reach those rows nor bind a stub by username
+- Tier 2: uses `extractDomain(homeInstance)` + `hints.username` to match rows created by the auth registration path without a home id. **A username match binds only a row that has no `homeUserId` yet** (`home_user_id IS NULL`); `backfillHomeUserId` then records the id on it. A row that carries a home id is already one identity: tier 1 finds it by that id, and a name must never make it stand for a different one
+- **Tier 2 excludes detached accounts** (`federation_home_orphaned = 1`): a detached account is sovereign and must never be re-bound to the reset domain's new incarnation via username heuristics — that is exactly how a new same-name user would capture the established account. **Tier 1 (`homeUserId` match) is deliberately NOT excluded:** the new incarnation mints fresh `homeUserId`s, so a tier-1 hit on a detached row is a legitimate historical reference (e.g. an old group-DM attribution relayed by a third instance), not the new incarnation. Mutations are blocked at their own sites (profile_update handler, presence_update handler, `hydrateReplicatedUserProfile` fill-empty, S2S identity delete), and `attributionRefusal` never accepts a detached identity as the actor of a relayed event from its old home domain (see "Attribution verification", case 1).
 - Side-effect-free — does not modify any records
 - When multiple candidates match in tier 2, prefers real accounts over stubs, then most profile data
-- **Use when:** Read-only lookup that needs to find users created by either auth or relay path
+- **S2S-only.** Neither tier is proof of control over the named identity: tier 1 matches the `homeUserId` + `homeInstance` pair a caller names, and tier 2 matches a domain plus a username hint. Both are safe behind the HMAC-authenticated S2S channel, where the caller is an admin-approved peer and attribution is separately verified. **Never call this from an unauthenticated route.** In particular `POST /api/auth/register` does not — see `auth.md` "Federated Registration Never Claims an Existing Row".
+- **Use when:** Read-only lookup, on an authenticated S2S path, that needs to find users created by either auth or relay path
 
 **`resolveLocalUser(homeUserId, db)`** -- `federation.ts`
 - Read-only lookup. Returns `undefined` if not found.
 - Matches: `(users.homeUserId = homeUserId)` OR `(users.id = homeUserId AND homeInstance IS NULL)`
 - Excludes deleted users (`isDeleted = 0`)
 - When multiple candidates exist: prefers the one with `homeUserId` set (replicated stub) over a local ID match
-- **Use when:** Optional lookups where null is acceptable (member_remove, reaction processing, friend_remove)
+- Ignores `homeInstance`, so it is **not** an identity lookup: never use it to resolve the acting identity of an inbound relay event (use `resolveRelayActor`)
+- **Use when:** Optional lookups where null is acceptable and the id is not a relayed actor or party to one (a relayed `friend_request_update` resolves its requester by pair, with `resolveRelayActor`)
+
+**`resolveRelayActor(actor, db)`** -- `routes/federation/identity.ts`
+- Read-only. Resolves a federated identity (`RelayActor`, a `homeUserId` + `homeInstance` pair) to the local user that IS that identity: same candidate rows as `resolveLocalUser`; a native row is kept when its own id is the `homeUserId` and the `homeInstance` is one of this instance's own names (the host of `getOurOrigin()` or `DOMAIN`, which differ only under `PUBLIC_ORIGIN`); any other row when `sameRelayActor(relayActorOfUser(row), actor)` holds (equal home user id, same home domain)
+- Returns `{ kind: 'found', user }`, `{ kind: 'unknown' }` (no live row carries the `homeUserId`; each handler keeps its own not-found answer), or `{ kind: 'mismatch' }` (the `homeUserId` belongs to local rows of a different identity). A detached row (`federation_home_orphaned = 1`) is returned as `found`: a participant or a historical reference may name one
+- Also tier 1 of `findFederatedUser`, so every `resolveOrCreateReplicatedUser` caller (relay handlers and the client routes that take a `homeUserId` + `homeInstance` pair) resolves by the same rule
+- Called after `attributionRefusal` accepted the same pair. `attributionRefusal` refuses a `mismatch`, and a detached identity, as `attribution_mismatch` (terminal) before any handler runs, so a handler resolving its attributed actor only ever meets `found` or `unknown`; the `mismatch` checks some handlers keep on that actor are a backstop that cannot fire. Together they hold the invariant: the user an inbound event is applied as is a live, attached user homed on the signing peer, or is one of our users with proven standing on it (homeward)
+- **Use when:** Any inbound relay handler that acts as the event's actor without creating a stub: `reaction_add`/`reaction_remove` (reactor), `dm_typing_start`/`dm_typing_stop`, `read_state_update`, `dm_close`/`dm_reopen`, `friend_request_create` (the local recipient), `friend_request_cancel` (sender; recipient also resolved by pair), `friend_remove` (both sides), `friend_request_update` and `friend_add` (both sides; a pair that does not resolve holds no pending request, so nothing is created), `member_remove` (leaving or kicked user), `ownership_transfer` (previous owner, resolved before anything changes), `create` (the author is the resolved participant that IS `message`'s pair), `profile_update`/`presence_update` (the replicated row updated; anything but a `found` row homed elsewhere is acked without effect)
 
 **`resolveOrCreateReplicatedUser(homeUserId, homeInstance, db, hints?)`** -- `federation.ts`
-- Calls `findFederatedUser` first. If found, backfills `homeUserId` for future fast-path lookups and returns.
+- Calls `findFederatedUser` first. If found, backfills `homeUserId` for future fast-path lookups and returns. On a tier-1 `mismatch` it returns `null` and creates nothing: a stub would give one id two identities here.
 - Accepts optional `hints: { username?: string | null }` for tier-2 matching
+- If found and `hints.username` is set, renames a row that still carries a placeholder name (`renamePlaceholderNamedStub`, see "Stub Username Backfill")
 - If not found, creates a stub with `homeInstance` normalized to bare domain via `extractDomain`
-- Collision-safe: appends `_1`, `_2`, ..., `_10` suffix if username exists; after 10 attempts, uses `_<random hex>`
+- Collision-safe (`firstFreeUsername`): appends `~1`, `~2`, ..., `~10` if the username exists; after 10 attempts, uses `~<random hex>`. `~` is not a handle character, so a suffixed name never takes a handle a real user of that instance can have (see "Stub Username Backfill")
 - **Self-homed guard:** an instance never creates a replicated stub homed at its own identity domain (`getOurIdentityDomain()`, DOMAIN-derived). A live self-reference resolves at tier 1; a self-domain identity reaching the create path is a dead incarnation and resolves to `null`. Wire snapshots may carry `deleted: true` — such identities also resolve to `null` at the create path (existing rows still resolve for historical attribution).
 - **Use when:** You MUST have a valid user ID. Always pass `{ username: profile?.username }` when profile data is available.
 
 **`hydrateReplicatedUserProfile(user, profile, db)`** -- `federation.ts:2041`
 - Updates replicated stubs only (`homeInstance` must be set)
-- Only updates null/empty fields (preserves manually-set local values)
-- Exception: avatar/banner are overwritten if the current value is a bare filename (not an absolute URL)
+- Only fills null/empty fields and never rewrites a stored one, `avatarColor` included (see "S2S Profile Hydration")
 - Resolves bare filenames to `{homeInstance}/api/uploads/{filename}` absolute URLs
 - Sets `displayName` from `profile.displayName || profile.username` -- ensures federated users show a human-readable name instead of `user@instance`
+- Renames a row that still carries a placeholder name to `<profile.username>@<domain>` (`applyPlaceholderRename`, see "Stub Username Backfill")
+- When it changed the row (renamed, or a field filled), sends one `user_updated` with the final row to `collectProfileBroadcastTargetIds` after every field is written (`announceUserUpdated`). A rename by `resolveOrCreateReplicatedUser` just before announced the row without the display name hydration fills; this is the event that carries it. A snapshot that fills nothing announces nothing
 
 ### Critical Rule
 
 Any code path that sets `ownerId`, creates a `dm_members` row, or inserts a message MUST use `resolveOrCreateReplicatedUser`. Using `resolveLocalUser` with a `?? null` fallback can cause data corruption (e.g., `ownerId` set to null for group DMs).
+
+### Credentials are per-instance, not per-identity
+
+A federated identity spans instances; its **credentials do not**. Since 2026-09-02 a client-created federated account authenticates with a per-remote secret issued by the identity's home instance (`user_federation_credentials`, `POST /api/users/@me/federation-credential`), not with the account's home password — so `password_hash` on a peer is a credential for that peer alone and carries no authority anywhere else. Nothing in the S2S protocol transports it: peering is HMAC-secret based, relay attribution is `(homeUserId, homeInstance)` bound to the authenticated peer, and re-attach proves identity with a one-time home-minted token (§"S2S Detached-Account Re-Attach Proof"). Full contract in `auth.md` §5b and `client-federation.md` §1.
+
+One coupling remains, and it predates this: the login self-heal in `auth.ts` §4 forwards a password submitted to a peer to the identity's home instance, so a password typed directly into a peer's login form is still meaningful on the home. That is the human login path, not an S2S one — see the residual-exposure note in `auth.md` §5b.
 
 ### Origin Normalization
 
@@ -586,17 +786,68 @@ const normalized = homeInstance.startsWith('http') ? homeInstance : `https://${h
 ```
 
 Locations where normalization is applied:
-- `getGroupDmTargetOrigins()` (`federationOutbox.ts:294`) -- normalizes before comparing to `ourOrigin`
+- `getGroupDmTargetOrigins()` (`federationOutbox.ts`) -- normalizes before comparing to `ourOrigin`
 - `dm.ts:655` -- `isLocalMember` broadcast filter checks both formats
 - `dm.ts:743` -- normalizes target homeInstance before peer origin comparison
 
-**Attribution verification (`verifyAttribution`):**
-- `verifyAttribution(actingUserHomeInstance, sourceInstance)` normalizes both via `extractDomain` and compares
-- Two valid cases:
-  1. **Direct**: `authorDomain === sourceDomain` — standard S2S, peer sends events for its own users
-  2. **Homeward relay**: `authorDomain === extractDomain(getOurOrigin())` — a client-federation user sent a message on a remote server, and the S2S relay forwards it back to the author's home instance
-- Applied as the FIRST check in every relay event processor (13+ handlers) — before user resolution or DB writes
-- Prevents malicious peers from forging events attributed to users on *unrelated* instances (neither source nor receiver)
+**Attribution verification (`attributionRefusal`):**
+
+```typescript
+attributionRefusal(actor: RelayActor | null | undefined, sourceInstance: string, db): AttributionRefusal | null
+// RelayActor = { homeUserId: string; homeInstance: string }
+// AttributionRefusal = 'attribution_mismatch' | 'attribution_unproven'
+```
+
+Returns `null` when the signing peer may speak for the actor, otherwise the reason the handler pushes into `rejected`. Handlers never write a reason of their own for this check.
+
+The actor is passed as a **pair**. A `homeUserId` on its own is not an identity — the column is only unique within one instance — so the signature makes it impossible to attribute an event from an id alone. `sourceInstance` is the HMAC-authenticated peer (bound at the relay boundary, §2), so this is a check against *who actually signed the batch*, never against a self-declared origin.
+
+Two valid cases:
+
+1. **Direct**: `authorDomain === sourceDomain`. A peer is the identity authority for its own users, but not for an id that is already a different identity here: when `resolveRelayActor` reports `mismatch` for the pair, the result is `attribution_mismatch`, before any handler resolves or creates a user. The same holds when the pair resolves to a detached account (`federation_home_orphaned = 1`): its home domain was reset and no longer speaks for it.
+2. **Homeward relay**: `authorDomain === extractDomain(getOurOrigin())` — a client-federation user (e.g. `erin@nova` logged into `orbit`) acted on the remote and the relay carries the event back to their home instance. Accepted **only** when `localUserStandingOnPeer(homeUserId, sourceInstance, db)` returns `proven`.
+
+An actor homed on a third instance is always rejected: the signing peer is neither that instance's identity authority nor delegated by it.
+
+**The two refusal reasons.**
+
+| Reason | When | Sender |
+|---|---|---|
+| `attribution_mismatch` | Malformed actor; actor homed on a third instance; homeward claim for a user id with no live native row (`no_such_user`: never existed, deleted, or only a replicated stub); direct claim whose `homeUserId` belongs only to local rows of a different identity (`resolveRelayActor` reports `mismatch`) or that names a detached account | Terminal. Nothing that arrives later can make the claim true. |
+| `attribution_unproven` | Homeward claim for a live native user with no registry row and no `replicated_instances` entry for the signing peer yet (`unproven`) | Retryable on the normal backoff, until the outbox TTL |
+
+`unproven` exists because the proof is written by the user's own client, after the remote session is open (`syncRegistry` in `instanceStore.ts` runs at the end of the connect flow, and not at all until `autoConnectAll` has read the server registry once). A DM the user writes on the remote in that window reaches home before the proof does. From the receiver's side that is indistinguishable from a peer forging a claim for one of its users, so the event is refused either way and nothing is written; the reason only tells the sender whether a retry can succeed. A peer that really is forging gains nothing from the retry: its own outbox carries the cost (about 36 attempts over the 30-day TTL), and a retry is only accepted once the user has connected to that peer, which is exactly the standing that would let it speak for the user anyway.
+
+`attribution_unproven` is a wire addition and is negotiated per request, see [Relay capabilities](#relay-capabilities). A sender that does not list it receives `attribution_mismatch` for the unproven case too.
+
+**`localUserStandingOnPeer(homeUserId, peerOrigin, db)`** returns `'proven' | 'unproven' | 'no_such_user'`: does the natively-homed local user hold a federated account on the signing peer? This is the whole content of a legitimate homeward relay: such an event can only genuinely exist if the user connected to that peer and acted there. Two records are consulted, both written *exclusively by the user themselves* over an authenticated session on this instance:
+
+| Record | Written by | Notes |
+|---|---|---|
+| `user_federation_registry` row `(user_id, origin)` | `PUT /api/users/@me/federation-registry`, scoped to `request.userId` | Any lifecycle status counts — a connection that is `disconnected` / `auth_expired` today was still real |
+| `users.replicated_instances` JSON entry | `PATCH /api/users/@me`, same scoping | Client-federation topology list |
+
+The actor must resolve to a **native** row (`home_instance IS NULL`, `is_deleted = 0`). A replicated stub that merely carries the same `home_user_id` never satisfies a homeward claim. Origins are compared with `normalizeOriginForCompare` (port-preserving), and malformed `replicated_instances` JSON fails closed.
+
+A peer cannot forge either record, so it cannot manufacture standing to speak for a user who never connected to it. Without this binding, any admin-approved peer could relay events attributed to any local user — including auto-creating a 1-on-1 DM channel between two local users from a forged author pair.
+
+**Residual, in-model exposure:** an instance the user *has* connected to can act as them there — that is what holding an account on it means. Connecting to a remote is therefore a trust decision about that operator, and disconnecting does not revoke it (registry rows persist by design, so history keeps resolving). This is a property of the federation model, not a gap in the check.
+
+**Coverage.** Applied as the FIRST check in every relay event processor, before user resolution or any DB write:
+
+| Handler file | Events guarded | Actor field |
+|---|---|---|
+| `events/dmMessages.ts` | `create`, `update`, `delete`, `reaction_add`, `reaction_remove` | `message`, `target.actor` (`update`/`delete` with a target; an old-shape `delete` has no actor and is scoped by its lookup instead, see `dm-system.md` "Relayed edits and deletes"), `reaction` |
+| `events/membership.ts` | `member_add` (bootstrap + add), `member_remove` (self-leave), `ownership_transfer` | `group.owner`, `membership.addedBy`, `membership.user`, `ownership.previousOwner` |
+| `events/friends.ts` | `friend_request_create/update/cancel`, `friend_add`, `friend_remove` | `friendship.from` / `.to` (`friend_remove` accepts either side; when both are refused, the reason is `attribution_unproven` if either side was unproven) |
+| `events/calls.ts` | `dm_call_start/accept/reject/end`, `dm_typing_start/stop` | `call.caller` / `.acceptor` / `.rejector` / `.endedBy`, `typing` |
+| `events/dmState.ts` | `read_state_update`, `dm_close`, `dm_reopen` | `readState.user`, `dmCloseReopen` |
+
+`read_state_update`, `dm_close`, `dm_reopen` and the two typing events were previously unguarded — they resolved an actor from a bare `home_user_id` with no verification at all, which let any peer ack, close or reopen a DM as any user. They now run the same check as the rest.
+
+**Transitive relays are not accepted.** An event whose actor is homed on neither the signing peer nor this instance is rejected, even when all three are peered. In a 3-instance group DM where a client-federation user acts on a remote, the remote's relay reaches the user's home instance (homeward) but not the *third* instance. This limitation is not new — it has always applied to `create`, `member_add`, reactions and the friend events — and the newly-guarded events now share it rather than diverging from it. Making that case work needs a signed origin-attestation the relaying peer can forward, which is a protocol change, not an attribution relaxation.
+
+`profile_update` and `presence_update` (`profile.ts`, `events/dmState.ts`) use a **stricter** rule that predates this and is deliberately kept: the payload's `homeInstance` must equal the source domain outright, with no homeward branch — only a user's own home instance may mutate their profile or presence here. `group_metadata_update` gates on `dm_channels.owner_home_instance` instead. `file_rejected` carries no user attribution (it is a system event from the rejecting peer).
 
 All origin comparisons use `extractDomain()` or `getOurOrigin()` with normalization, handling both bare domains and full URLs consistently.
 - `federation.ts:2447` -- same pattern in `processFriendRemoveEvent`
@@ -610,34 +861,34 @@ All origin comparisons use `extractDomain()` or `getOurOrigin()` with normalizat
 **Outbound (origin instance):**
 1. Message created via REST (`POST /api/dm/:id/messages`) or WS (`dm_message_create`)
 2. `queueDmRelay(message, channelId, 'create')` called from `dm.ts` / `events.ts`
-3. `buildRelayPayload()` constructs the message portion with `homeUserId`, `homeInstance`, `content`, `replyToId`, `editedAt`, `createdAt`
+3. `buildRelayPayload()` constructs the message portion with `homeUserId`, `homeInstance`, `content`, `replyToId` (sender-local, never adopted by a receiver), `replyTo` (the replied-to message as a `FederationMessageRef`, replies only), `mentions` (the federated identities behind the content's `<@id>` tokens, only when it has any; see "Optional `message.mentions` field"), `editedAt`, `createdAt`
 4. `getDmParticipants(channelId)` resolves all members to `(homeUserId, homeInstance)` pairs with profile snapshots
-5. `getGroupDmTargetOrigins(channelId)` returns `undefined` (no owner -> broadcast to all)
-6. `queueOutboxEvent(messageId, channelId, 'create', payload, undefined)` -> queued to ALL active peers
+5. `getGroupDmTargetOrigins(channelId)` returns the participants' instances minus our own -- `[]` when both participants are local
+6. `queueOutboxEvent(messageId, channelId, 'create', payload, targetOrigins)` -> queued only to those peers; a `[]` target list matches no peer, so a conversation between two local users is never relayed
 
-**Channel creation (1-on-1 with federated user):**
-- When `POST /api/dm` creates a channel where either participant has `homeInstance` set, the deterministic `federatedId = SHA256(sorted([homeUserIdA, homeUserIdB])).slice(0, 32)` is computed and stored immediately
-- This ensures `findOrCreateDmChannel` on the receiving instance finds the existing channel when the S2S reply arrives, preventing duplicate channels
+**Channel creation (1-on-1):**
+- `POST /api/dm` finds or creates the row with `findOrCreateOneOnOne` (`utils/dmConversation.ts`), which stores `oneOnOneKey(a, b) = SHA256(sorted([homeIdentityA, homeIdentityB]).join(':')).slice(0, 32)` on every 1-on-1 from insert, relay on or off and native pairs included; rows from before that get it from the startup backfill (`backfillOneOnOneKeys`, run by `initDatabase`)
+- The receiving instance computes the same key from the relayed participants, so its `findOrCreateOneOnOne` finds the existing copy when the S2S reply arrives, preventing duplicate channels
+- Nothing is relayed at creation. The recipient's membership on the creating instance is inserted closed and opened by the first message (dm-system.md "1-on-1 DM Creation")
 
 **Inbound (receiving instance -- `processCreateEvent`):**
 1. Validate: `event.message` and `event.participants` (>= 2) required
 2. Dedup: check `(sourceInstance, sourceMessageId)` -- reject if exists
 3. Resolve ALL participants via `resolveOrCreateReplicatedUser`, hydrate profiles
-4. No `event.federatedId` -> 1-on-1 path
-5. Compute deterministic `federatedId = SHA256(sorted([homeUserIdA, homeUserIdB])).slice(0, 32)`
-6. `findOrCreateDmChannel(federatedId, [localUserA.id, localUserB.id], db)`:
-   - Find by `federatedId` in `dm_channels`
-   - If exists: ensure both users are members (idempotent insert)
-   - If not: create channel with `federatedId`, add both members
-7. Insert `dm_messages` with `sourceInstance` and `sourceMessageId`
+4. No `event.federatedId` -> 1-on-1 path. The author must be one of the first two participants and the signing peer one of their home origins, else `invalid_target` (see `dm-system.md` "Relayed message creates")
+5. `findOrCreateOneOnOne(db, localUserA, localUserB, { open: 'both' })` (`utils/dmConversation.ts`), keyed `oneOnOneKey` over the two local rows' home identities:
+   - The row holding the key, its members made the pair (missing ones added, a same-identity row under another local id re-pointed; never a third member)
+   - Else an unkeyed row whose members are exactly the pair, keyed
+   - Else a new row with the key, both members open
+6. `lateBindFederatedCall(key, channelId)` binds a call that rang before this copy existed
+7. Insert `dm_messages` with `sourceInstance` and `sourceMessageId`; `replyToId` is `resolveRelayedReplyTarget(message.replyTo)`, which resolves the reference with `resolveLocalDmMessage` and keeps it only when the target is in the same local channel (else `null`); `content` is `rewriteRelayedMentions(message.content, message.mentions)` for a user message, the stored content naming this instance's rows in its mention tokens
 8. Process attachments (see File Replication)
-9. Broadcast `dm_message_created` to local members, **skipping** members whose `homeInstance === sourceInstance` (they already have the original)
+9. Broadcast `dm_message_created` to every local member, members homed on the source instance included; a closed member is reopened and gets `dm_channel_created` (built by `loadDmChannelWire` with this message) first
 
 ### Group DMs
 
 **Outbound (origin instance):**
 Same as 1-on-1 except:
-- `getGroupDmTargetOrigins(channelId)` returns a list of peer origins that have at least one participant
 - Normalizes `homeInstance` to full URL before comparison
 - `queueOutboxEvent` receives `targetPeerOrigins` and only queues to those peers
 - Payload includes `federatedId` (random UUID assigned at channel creation)
@@ -646,18 +897,21 @@ Same as 1-on-1 except:
 1. `event.federatedId` present -> group DM path
 2. Find channel by `federatedId` -- must already exist (bootstrapped by prior `member_add`)
 3. If not found -> reject with `channel_not_found`
-4. Insert message, broadcast to local members
+4. The author must be a member of the channel and the signing peer one of its relay target origins, else `unauthorized_source` (retried; `invalid_target` if the channel is a 1-on-1). See `dm-system.md` "Relayed message creates"
+5. Insert message, broadcast to local members
 
-### Federated ID Generation (`federationOutbox.ts:computeFederatedId`)
+### Federated ID Generation (`utils/dmConversation.ts`)
 
 ```typescript
-// 1-on-1: deterministic 32-char hex hash
-const sorted = [homeUserIdA, homeUserIdB].sort();
+// 1-on-1: oneOnOneKey(a, b), deterministic 32-char hex hash over homeUserId || id
+const sorted = [homeIdentityOf(a), homeIdentityOf(b)].sort();
 return sha256(sorted.join(':')).slice(0, 32);
 
-// Group: random 36-char UUID with dashes
+// Group: mintGroupKey(), random 36-char UUID with dashes, minted once
 return crypto.randomUUID();
 ```
+
+No other code computes or mints a key (ADR 0002). See dm-system.md "Federated ID Algorithm" for when each is stored.
 
 The format difference (32-char hash vs 36-char UUID) is used by the self-healing migration to detect channel type independently of `owner_id`.
 
@@ -677,6 +931,12 @@ This is a **forward- and backward-compatible** addition because the inbound rela
 
 This permissiveness is **intentional** — the relay envelope is designed for additive evolution. Future optional fields should follow this same pattern (no schema bump, document the field here, defaults preserve old-peer behavior).
 
+### Optional `message.mentions` field (#347)
+
+`FederationRelayEvent.message.mentions?: FederationMentionRef[]`, each `{ id, homeUserId, homeInstance }`: an id as it appears in a `<@id>` token of the relayed `content`, and the federated identity of the user it names on the sender. It rides every path that carries content: live `create` and `update` and the sync endpoint's replay of both, which all build the message part with `buildRelayPayload` (the replay on the current content). The receiver (`processCreateEvent`, `processUpdateEvent`) rewrites each listed token to its own row for that identity before storing the content. Sender and receiver rules, validation and limits are in `dm-system.md` "Mentions in relayed messages"; the code is `utils/federationMentions.ts`.
+
+Additive like `message.type`: an older sender omits the list and its content is stored as sent, which leaves foreign ids in the tokens as before; an older receiver ignores the field and does the same.
+
 ### Typing Indicator Relay
 
 **Event types:** `dm_typing_start`, `dm_typing_stop`
@@ -695,7 +955,7 @@ This permissiveness is **intentional** — the relay envelope is designed for ad
 - Calls `sendCallRelay(origin, [event], { peeringTimeoutMs: 0 })` for each remote peer origin — non-active peers are skipped and a background `ensurePeered` warm-up is kicked off instead
 
 **Inbound (`federation.ts`):**
-- `processDmTypingStartEvent` → look up channel by `federatedId`, resolve user via `resolveLocalUser()` (no stub creation for ephemeral events), broadcast `dm_typing` to local members
+- `processDmTypingStartEvent` → look up channel by `federatedId`, resolve user via `resolveRelayActor()` (no stub creation for ephemeral events; unknown → accept silently), broadcast `dm_typing` to local members
 - `processDmTypingStopEvent` → same, broadcast `dm_typing_stop` to local members
 - **Implicit clear:** `processCreateEvent()` also emits `dm_typing_stop` for the message author after processing an inbound relay — primary typing clear mechanism for relayed messages
 
@@ -708,8 +968,13 @@ This permissiveness is **intentional** — the relay envelope is designed for ad
 ```
 Trigger (API/WS handler)
   -> isFederationRelayEnabled()? No -> return silently
+  -> contextType 'dm' with no targetPeerOrigins? -> refuse, log, return
+       (DM traffic is participant-scoped and must never fan out to every peer;
+        an omitted list means broadcast, which only profile/presence may use)
   -> Fetch active peers from federation_peers
   -> Filter to targetPeerOrigins (if specified) -- EXACT string match against peer.origin
+       (an empty array is a target list, not an absence of one: it matches
+        nothing, which is how a local-only DM is suppressed)
   -> If zero peers match -> logs warning and returns
   -> For each peer, in a transaction:
       -> Check for existing outbox entry by (peerId, entityId)
@@ -730,6 +995,16 @@ Trigger (API/WS handler)
 | `update` | `update` | Payload updated, type becomes latest |
 | `delete` | `update` | Payload updated, type becomes `delete` |
 | any | none | New entry inserted |
+| any | on the wire | Payload and type become the incoming event's; the merge waits for the peer's answer |
+
+The table (`mergeUndeliveredEvent` in `federationOutbox.ts`) assumes the peer has not received the existing entry. That is not known while the worker has the entry **on the wire**: read for a POST whose answer has not come back. `federationOutbox.ts` keeps those outbox ids in memory (`rowsOnTheWire`, set by `beginOutboxDelivery`, cleared by `finishOutboxDelivery`), and an event queued for one of them is stored as itself and marks the entry superseded. When the answer comes:
+
+- **Taken** (accepted, or rejected as `duplicate`): a superseded entry is kept (not deleted with the batch) and goes out on the next tick as the newer event. An edit or delete of a message whose create was on the wire is therefore sent as an `update` / `delete`, and a status change made while the previous one was on the wire is not lost.
+- **Not taken** (any other terminal rejection, a retryable rejection, not mentioned, auth failure, HTTP error, network error or timeout, worker stopping): a superseded entry is merged now by the table with the sent event as the existing one (`requeueAfterUndeliveredSend`): a create and delete cancel out, a create with a later edit stays a create (and is refused again if the refusal was terminal). It stays due and is not backed off; only entries nobody touched move to their next backoff step.
+
+Superseding an entry also gives it `createdAt = now` (at least one more than before), because the worker stamps each event's `timestamp` with its entry's `createdAt` and receivers that order by it (read state applies only a strictly greater timestamp) must see the newer event as newer. The original `createdAt` is kept in `rowsOnTheWire` and restored when the entry is merged as not taken, so it keeps its place ahead of entries queued after it.
+
+Before #367 the worker settled entries by id whatever had been merged into them meanwhile, so an accepted batch deleted the newer event with it, and the create-then-delete rule dropped a delete whose create had already reached the peer.
 
 ### Outbox Delivery Worker (`federationWorker.ts:processOutboxTick`)
 
@@ -739,17 +1014,18 @@ Trigger (API/WS handler)
 
 1. Query entries where `nextRetryAt <= now` joined with active peers, ordered by `createdAt ASC`, limit 50
 2. Group by peer
-3. For each peer, reconstruct `FederationRelayEvent[]` from stored payloads:
+3. For each peer, read its entries again (an earlier peer's POST in the same tick may have taken up to the timeout, and entries merged into or removed meanwhile go out as they are now), mark them on the wire (`beginOutboxDelivery`, see [Coalescing Rules](#coalescing-rules-per-peer-per-entity)), and reconstruct `FederationRelayEvent[]` from stored payloads:
    - Parse JSON payload
-   - Copy fields: `federatedId`, `participants`, `message`, `reactions`, `reaction`, `membership`, `ownership`, `group`, `friendship`, file_rejected fields
+   - Copy fields: `federatedId`, `participants`, `message`, `reactions`, `reaction`, `target`, `membership`, `ownership`, `group`, `friendship`, file_rejected fields
    - Set `eventType`, `contextType`, `messageId`, `dmChannelId`, `encryptionVersion`, `timestamp`
 4. Build `FederationRelayRequest` with `version: 1`, `sourceInstance: ourOrigin`
 5. Sign with `buildFederationHeaders(body, peerHmacSecret, ourOrigin)`
 6. POST to `{peerOrigin}/api/federation/relay`
 7. On success (200):
    - Compute the **terminal entity set** = accepted entries ∪ duplicate-rejected entries
-   - Delete all terminal entries from outbox (matched by `entityId` -> `outboxId`)
-   - Log remaining (non-duplicate) rejected entries at `console.warn` (they stay in outbox for retry)
+   - Delete all terminal entries from outbox (matched by `entityId` -> `outboxId`), except entries superseded while on the wire
+   - Every other entry in the batch (non-terminal rejections, and any entry the response does not mention) stays in the outbox and moves to its next backoff step (`attempts + 1`, `nextRetryAt = now + backoff`). Before this, such entries kept their `nextRetryAt` and were resent on every 10-second tick; a run of them at the head of the `createdAt`-ordered batch could crowd newer events out of it
+   - Log non-terminal rejected entries at `console.warn`
    - Store `result.maxUploadSize` on peer record
    - Update peer: `lastSeenAt = now`, `consecutiveFailures = 0`
 8. On failure (non-200 or network error):
@@ -760,10 +1036,12 @@ Trigger (API/WS handler)
 
 #### Terminal rejection reasons
 
-`processOutboxTick` recognizes a configurable set of receiver-acknowledged **terminal rejection reasons** (constant `TERMINAL_REJECTION_REASONS` in `federationWorker.ts`): `duplicate`, `recipient_not_found`, `attribution_mismatch`, `unknown_event_type`, `self_target_invalid`. Outbox entries with these reasons are deleted with no retry.
+`processOutboxTick` recognizes a configurable set of receiver-acknowledged **terminal rejection reasons** (constant `TERMINAL_REJECTION_REASONS` in `federationWorker.ts`): `duplicate`, `recipient_not_found`, `attribution_mismatch`, `unknown_event_type`, `self_target_invalid`, `not_message_author`, `invalid_target`. Outbox entries with these reasons are deleted with no retry. Every other reason is retryable and follows the [retry backoff schedule](#retry-backoff-schedule) until the entry's `expiresAt` (relay TTL, 30 days by default), when the storage janitor deletes it. No rollback callback runs at TTL expiry.
 
 - `duplicate` — the receiving instance already has the row (same `(sourceInstance, sourceMessageId)`); retrying will fail identically until TTL.
 - `recipient_not_found`, `attribution_mismatch`, `unknown_event_type` — structural mismatches that cannot be resolved by retrying.
+- `not_message_author`, `invalid_target` — a relayed `update`/`delete` whose `target` names a message the actor did not write, is malformed, or comes from a peer that is neither a relay target of the message's conversation nor the instance the message came from. See `dm-system.md` "Relayed edits and deletes" for the rule. `invalid_target` is also a relayed 1-on-1 `create` whose author is not one of the pair or whose sender is not a relay target of it (`dm-system.md` "Relayed message creates"; the group case is the retried `unauthorized_source`), a `member_add` into a 1-on-1 or a bootstrap without an owner, with the owner outside the roster, or from a sender none of the roster lives on (`dm-system.md` "Relayed member adds"), a kick or `ownership_transfer` aimed at a 1-on-1, a `reaction_add`/`reaction_remove` on a message in a conversation the sender is not a peer of, or by a reactor outside a 1-on-1 (`dm-system.md` "Inbound: Reaction Add/Remove"), and a `friend_add` refused by the rule in `social.md` "End-to-End Relay Flow: Friend Add".
+- `attribution_unproven` is **not** terminal: the receiver lacks the proof that one of its users holds an account here, and that proof arrives from the user's client. See [the two refusal reasons](#3-identity-resolution).
 - `self_target_invalid` — emitted by `processFriendRequestCreateEvent` when an inbound `friend_request_create`'s `from`-identity equals its `to`-identity (after origin normalization). Defense-in-depth: the sender's local `cannot_friend_self` check should catch this, but the receiver does not trust upstream validation. Retrying will not change the payload. The friend-create rollback callback maps this to client-facing `peer_rejected`.
 
 For non-`duplicate` terminals, the worker invokes a registered permanent-failure callback via `invokePermanentFailureCallback(eventType, messageId, reason)` from `utils/federationRollback.ts`. Currently registered: `friend_request_create` → `rollbackFriendRequestCreate` (deletes the local `friend_requests` row by `relay_message_id` and emits WS `friend_request_relay_failed` to the sender). Other event types may register their own callbacks. See `social.md` §6 "Failure Handling" for the friend-specific rollback contract.
@@ -785,6 +1063,8 @@ Logged at `console.log` ("outbox entry removed (terminal)") to distinguish from 
 | 5 | 1 hour |
 | 6 | 6 hours |
 | 7+ | 24 hours (cap) |
+
+Test instances divide these waits, see [Retry backoff divisor (test only)](#retry-backoff-divisor-test-only).
 
 The schedule above (`BACKOFF_SCHEDULE_MS`) paces per-entry retries. Peer-level recovery from `unreachable` is separate and demand-driven: `processRecoveryTick` probes unreachable peers on `RECOVERY_BACKOFF_MS = [30s, 1m, 5m, 15m]` while they have queued mail (15-min backstop when silent), paced by the per-peer `last_probe_at` / `probe_attempts` columns and the `probePeerReachable` helper in `utils/federationRecovery.ts`. See [PEER_UNREACHABLE_THRESHOLD](#peer_unreachable_threshold).
 
@@ -808,9 +1088,32 @@ Network failures (timeouts, non-401/403 non-2xx responses) are tracked separatel
 interface FederationRelayRequest {
   version: 1;
   sourceInstance: string;          // Full URL, e.g., "https://nova.ddns.net"
+  sourceInstanceId?: string;       // Sender's epoch, see reset detection
+  capabilities?: FederationRelayCapability[];  // Optional, see below
   events: FederationRelayEvent[];  // Max 50 per batch
 }
 ```
+
+#### Relay capabilities
+
+`capabilities` lists relay behaviours the sender implements beyond plain v1. Each capability gates something the receiver would otherwise not send, so an instance that predates it is never handed an answer it was not built for. The receiver reads the field from an untrusted body: anything other than an array counts as empty.
+
+| Capability | Receiver behaviour when listed | When not listed |
+|---|---|---|
+| `attribution_unproven` | May reject a homeward claim whose proof it does not hold yet with `attribution_unproven` | Answers the same case with `attribution_mismatch` |
+
+The outbox worker (`RELAY_CAPABILITIES` in `federationWorker.ts`) sends `['attribution_unproven']`. `sendCallRelay` sends none: call signalling is not retried from the outbox, so it keeps the v1 answer. The mapping happens once, at the HTTP boundary (`rejectionsForSender` in `handlers/relay.ts`); `processRelayEvents` always reports the precise reason, which the sync-pull path discards anyway.
+
+Mixed versions:
+
+| Sender | Receiver | Unproven homeward claim |
+|---|---|---|
+| new | new | `attribution_unproven`, retried on backoff, accepted once the proof lands |
+| new | old | `attribution_mismatch`, terminal (unchanged from before) |
+| old | new | `attribution_mismatch`, terminal (unchanged: the old sender does not list the capability) |
+| old | old | `attribution_mismatch`, terminal |
+
+The capability is needed for the old-sender case: an older worker keeps a rejection it does not recognise in the outbox without backoff, so an unsolicited `attribution_unproven` would be resent every tick until the TTL.
 
 **Response:**
 ```typescript
@@ -837,7 +1140,7 @@ non-overlapping: each messageId appears in exactly one of the three arrays.
 | Bucket | Meaning | Retry? |
 |---|---|---|
 | `accepted` | Processed cleanly, ≥1 recipient reached. | No |
-| `rejected` | Refused at data/protocol layer (schema, attribution, channel-not-found, etc.). | Terminal. |
+| `rejected` | Refused at data/protocol layer (schema, attribution, channel-not-found, etc.). | Per reason: terminal reasons are dropped, the rest retried on backoff (see [Terminal rejection reasons](#terminal-rejection-reasons)). |
 | `undeliverable` | Processed cleanly, zero recipients reachable. | No — call-signaling specific. |
 
 Currently used only for `dm_call_start`:
@@ -863,8 +1166,8 @@ Body limit: 10 MB. Max 50 events per batch. Rate-limited to 90 requests/min per 
 | eventType | Processor | contextType |
 |-----------|-----------|-------------|
 | `create` | `processCreateEvent` | dm |
-| `update` | `processUpdateEvent` | dm |
-| `delete` | `processDeleteEvent` | dm |
+| `update` | `processUpdateEvent` (message resolution and authorship: `dm-system.md` "Relayed edits and deletes") | dm |
+| `delete` | `processDeleteEvent` (same) | dm |
 | `reaction_add` | `processReactionAddEvent` | dm |
 | `reaction_remove` | `processReactionRemoveEvent` | dm |
 | `member_add` | `processMemberAddEvent` | dm |
@@ -891,12 +1194,12 @@ After processing all events, the relay endpoint updates the peer's `lastSeenAt` 
 
 ### member_add (`processMemberAddEvent` -- `federation.ts:1618`)
 
-**Required fields:** `event.federatedId`, `event.membership.user`
+**Required fields:** `event.federatedId`, `event.membership.user`, `event.membership.addedBy`
 
 **Two paths:**
 
 **Bootstrap path** (channel does not exist locally by `federatedId`):
-1. Requires `event.group` metadata (owner + full member roster + group metadata snapshot)
+1. Requires `event.group` metadata (owner + full member roster + group metadata snapshot). The owner is required and must match `membership.addedBy` by home identity. The adder must pass `attributionRefusal` before any writes, the owner must be in the resolved roster, and the signing peer must be one of the roster's instances (`mayRelayInto`); else `invalid_target` and nothing is created. See `dm-system.md` "Relayed member adds"
 2. Creates `dm_channels` row with `federatedId`, `ownerId` (resolved via `resolveOrCreateReplicatedUser`), `ownerHomeUserId`, `ownerHomeInstance`, plus the bootstrap `name`, `icon`, and `metadataUpdatedAt` from `event.group`
 3. When `event.group.icon` is non-null, mirrors `processGroupMetadataUpdateEvent` and calls `downloadProfileAsset(icon, sourceInstance)` — stores the local bare filename on success or the absolute URL on failure
 4. Adds ALL roster members from `event.group.members` (each resolved via `resolveOrCreateReplicatedUser`)
@@ -921,7 +1224,7 @@ interface FederationGroupPayload {
 Older peers that omit these fields fall back to safe defaults (null name/icon, `metadataUpdatedAt = 0`). Receivers never re-relay these fields — only the owner's home instance authors `group_metadata_update` events.
 
 **Incremental path** (channel already exists):
-1. Validates authority: any HMAC-verified peer is accepted (relaxed — the `sourceInstance === channel.ownerHomeInstance` check was removed to support cross-instance access). The per-user attribution check (`verifyAttribution`) still applies.
+1. Validates authority: `attributionRefusal` on `membership.addedBy`, then the channel must be a group (`ownerId` set; else `invalid_target`), and the adder must be the current owner and a member of this instance's copy with the signing peer one of its relay target origins before the add (`mayRelayInto`); else `unauthorized_source`. Only the current owner may add. Existing attribution rules still permit an authenticated homeward relay from a conversation peer where that owner has proven federated presence. See `dm-system.md` "Relayed member adds".
 2. Cancels soft-delete if channel was pending GC
 3. Resolves added user via `resolveOrCreateReplicatedUser`
 4. Enforces max 10 members
@@ -930,9 +1233,9 @@ Older peers that omit these fields fall back to safe defaults (null name/icon, `
 
 ### member_remove (`processMemberRemoveEvent` -- `federation.ts:1825`)
 
-1. Find channel by `federatedId` -- if not found, accept idempotently
+1. Find channel by `federatedId` -- if not found, accept idempotently. A kick (`reason !== 'leave'`) on a 1-on-1 (no `ownerId`) is refused `invalid_target`
 2. Validate authority: owner's instance for kicks (`reason !== 'leave'`), any instance for self-leave
-3. Resolve user via `resolveLocalUser` -- if not found, accept idempotently
+3. Resolve user via `resolveRelayActor` -- if not found, accept idempotently
 4. Insert system message (before deletion, so broadcast includes the leaving user)
 5. Delete `dm_members` row, clean up `read_states`
 6. Broadcast `dm_member_removed` to remaining local members
@@ -940,12 +1243,13 @@ Older peers that omit these fields fall back to safe defaults (null name/icon, `
 
 ### ownership_transfer (`processOwnershipTransferEvent` -- `federation.ts:1938`)
 
-1. Find channel by `federatedId` -- if not found, accept idempotently
+1. Find channel by `federatedId` -- if not found, accept idempotently. A 1-on-1 (no `ownerId`) is refused `invalid_target`: it has no owner to transfer
 2. Validate authority: `normalizeOriginForCompare(sourceInstance) === normalizeOriginForCompare(channel.ownerHomeInstance)`. Both sides are normalized to handle the bare-vs-full storage convention (see `dm-system.md` historical bugs for why this matters).
-3. Resolve new owner via `resolveOrCreateReplicatedUser` (**never** `resolveLocalUser` -- must guarantee valid ID)
-4. Update `dm_channels`: `ownerId`, `ownerHomeUserId`, `ownerHomeInstance` (canonicalized to full URL on storage via `canonicalizeHomeInstance` so future authority checks stay stable)
-5. Broadcast `dm_owner_updated` WebSocket event with `newOwnerHomeUserId` + `newOwnerHomeInstance` so local clients can refresh their owner-routing cache without reconnecting
-6. Insert system message with previous owner as actor
+3. Resolve the previous owner (the attributed actor) via `resolveRelayActor` before any change: unknown → the system message falls back to the channel's recorded owner
+4. Resolve new owner via `resolveOrCreateReplicatedUser` (**never** `resolveLocalUser` -- must guarantee valid ID)
+5. Update `dm_channels`: `ownerId`, `ownerHomeUserId`, `ownerHomeInstance` (canonicalized to full URL on storage via `canonicalizeHomeInstance` so future authority checks stay stable)
+6. Broadcast `dm_owner_updated` WebSocket event with `newOwnerHomeUserId` + `newOwnerHomeInstance` so local clients can refresh their owner-routing cache without reconnecting
+7. Insert system message with previous owner as actor
 
 Triggered by both auto-transfer-on-leave and the manual `POST /api/dm/:id/transfer` endpoint — the receiver path is the same.
 
@@ -1164,7 +1468,7 @@ When a user marks a DM channel as read (`channel_ack`) or marks it unread (`mark
 
 **Inbound (`processReadStateUpdateEvent`):**
 1. Resolve channel by `federatedId` — reject if not found
-2. Resolve user via `resolveLocalUser` — reject if not found
+2. Resolve user via `resolveRelayActor`: reject `user_not_found` if unknown
 3. Translate `messageRef` to local message ID:
    - If `sourceInstance` matches our origin: `sourceMessageId` IS our local ID
    - Otherwise: look up `dm_messages` by `source_instance + source_message_id`
@@ -1213,23 +1517,22 @@ Called from `dm.ts` after the local close or reopen is committed.
 1. Fetch the channel's `federatedId` — if null (local-only DM), return silently
 2. Fetch the acting user's `(homeUserId, homeInstance)` federation identity
 3. Build `FederationRelayEvent` with `eventType` and `dmCloseReopen` payload
-4. `getGroupDmTargetOrigins(dmChannelId)` resolves the delivery targets:
-   - 1-on-1 DMs (`ownerId = NULL`): returns `undefined` → broadcast to ALL active peers
-   - Group DMs: returns the set of peer origins that have at least one participant
+4. `getGroupDmTargetOrigins(dmChannelId)` resolves the delivery targets — the set of
+   peer origins that host at least one participant, for both 1-on-1 and group DMs
 5. Enqueue via `appendMutationLog` + `queueOutboxEvent`
 
 ### Inbound
 
 **`processDmCloseEvent` (`federation.ts`):**
 1. Look up channel by `federatedId` — if not found, accept silently (idempotent)
-2. Resolve acting user via `resolveLocalUser` (lookup-only; no stub creation for close/reopen) — if not found, accept silently
+2. Resolve acting user via `resolveRelayActor` (lookup-only; no stub creation for close/reopen): if unknown, accept silently
 3. If the user has no `dm_members` row in this channel, accept silently
 4. Set `dm_members.closed = 1` for the resolved local user
 5. Broadcast `dm_channel_closed` to the user's local WebSocket connections
 
 **`processDmReopenEvent` (`federation.ts`):**
 1. Look up channel by `federatedId` — if not found, accept silently
-2. Resolve acting user via `resolveLocalUser` — if not found, accept silently
+2. Resolve acting user via `resolveRelayActor`: if unknown, accept silently
 3. If the user has no `dm_members` row, accept silently
 4. Set `dm_members.closed = 0`
 5. Build full `DmChannel` payload and broadcast `dm_channel_created` to the user's local WebSocket connections (mirrors the automatic reopen path in `broadcastDmMessage`)
@@ -1257,6 +1560,8 @@ This fixes a gap where relayed messages bypassed the closed-state reopen logic, 
 | Cancel outgoing request | `friend_request_cancel` | `from.homeInstance === sourceInstance` |
 | Accept creates friendship | `friend_add` | `to.homeInstance === sourceInstance` |
 | Remove friend | `friend_remove` | Either side's instance |
+
+When a relayed friendship forms on the requester's instance, and when a `friend_add` is refused: see `social.md` §6, "End-to-End Relay Flow: Friend Add".
 
 ### Target Resolution (`getFriendEventTargets`)
 
@@ -1294,7 +1599,7 @@ The full event payload is stored in both `appendMutationLog` (for sync) and `que
 
 **`processFriendRequestCancelEvent` (`federation.ts:2254`):**
 - Authority check: `from.homeInstance !== sourceInstance` -> reject
-- Both users must exist locally. If not, accept idempotently.
+- Both users resolved via `resolveRelayActor`: both must exist locally, else accept idempotently.
 - Delete the pending friend request. Broadcast `friend_request_cancelled` to recipient.
 
 **`processFriendAddEvent` (`federation.ts:2318`):**
@@ -1302,13 +1607,13 @@ The full event payload is stored in both `appendMutationLog` (for sync) and `que
 - Resolve both users via `resolveOrCreateReplicatedUser` + hydrate profiles
 - Insert `friends` row (idempotent)
 - Auto-resolve any pending `friend_requests` to `'accepted'` (handles out-of-order delivery)
-- Determine which user is local (`from.homeInstance === ourOrigin`) and broadcast `friend_request_accepted`
+- Determine which user is local (`isOwnDomain` on `from`'s home domain, so a bare domain and a full origin both match) and broadcast `friend_request_accepted`
 
 **`processFriendRemoveEvent` (`federation.ts:2404`):**
 - Authority check: either `from.homeInstance` or `to.homeInstance` must be `sourceInstance`
-- Both users resolved via `resolveLocalUser`. If not found, accept idempotently.
+- Both users resolved via `resolveRelayActor`. If either is not found, accept idempotently.
 - Delete `friends` row in both directions
-- Determine local user (whose `homeInstance` is NOT the source) and broadcast `friend_removed`
+- Determine local user (the side whose home domain is ours, `isOwnDomain`) and broadcast `friend_removed`
 
 ---
 
@@ -1325,7 +1630,7 @@ When relay events carry `FederationRelayProfileSnapshot` data:
 
 Snapshots for tombstoned users carry `deleted: true` and no profile fields — the internal `!deleted:<id>` username marker never leaves the instance (`getDmParticipants`, `buildProfileSnapshot`).
 
-`hydrateReplicatedUserProfile` is **best-effort fill-empty only**: it never overwrites an existing avatar/banner/displayName/bio. This protects locally-downloaded bare filenames produced by `processProfileUpdateEvent` (which carries the monotonic `profileUpdatedAt` version) from being clobbered back to absolute URLs on the next DM/friend relay. Authoritative updates flow exclusively through the version-checked `profile_update` event.
+`hydrateReplicatedUserProfile` is **best-effort fill-empty only**: it never overwrites an existing displayName/avatar/avatarColor/banner/bio. A relayed snapshot carries no version, and a DM relayed by one instance carries snapshots of participants homed on other instances, built from its own replicas, which can be stale. Taking such a snapshot over a stored value let a stale third-party replica flip a field (it did so for `avatarColor`) and announce each flip. Fill-empty also protects locally-downloaded bare filenames produced by `processProfileUpdateEvent` (which carries the monotonic `profileUpdatedAt` version) from being clobbered back to absolute URLs on the next DM/friend relay. Authoritative updates flow exclusively through the version-checked `profile_update` event.
 
 **Detached-account guard:** Alongside the native-user skip (`!user.homeInstance → return`), the function also **no-ops on detached rows** (`federation_home_orphaned = 1 → return user`). A detached account retains its `homeInstance` for provenance (design §7), so the native-user skip alone would not catch it; without this guard a DM/friend relay from the reset domain's new incarnation, resolved via an old `homeUserId` tier-1 hit, could fill the sovereign account's empty fields. This is the same domain-keyed mutation class as `profile_update`/`presence_update`, guarded at its own site (design §4.3).
 
@@ -1347,22 +1652,23 @@ Profile data is synced server-to-server. The home instance is authoritative — 
 
 **Coalescing:** `entityId = homeUserId`. Rapid successive edits coalesce to one delivery per peer.
 
-**Processing:** Remote overwrites all 6 mutable fields unconditionally; `displayName` falls back to `payload.displayName ?? payload.username`. Rejects if incoming `profileUpdatedAt ≤ stored`. Broadcasts `user_updated` to local WS clients.
+**Processing:** The row updated is the one that IS the payload's `homeUserId` + `homeInstance` (`resolveRelayActor`) and is homed elsewhere; a native user of this instance is never one, and anything else is acked without effect (no replica here). Remote overwrites all 6 mutable fields unconditionally; `displayName` falls back to `payload.displayName ?? payload.username`. Rejects if incoming `profileUpdatedAt ≤ stored`. Broadcasts `user_updated` to local WS clients.
 
-**Detached-account guard:** After the domain-collision check and before the version check, if the resolved `localUser` has `federation_home_orphaned = 1` (detached — home domain was reset, now a sovereign local account), the event is **acked (messageId pushed to `accepted`) and skipped without applying**. The reset domain's new incarnation must never overwrite an established account's profile by replaying its old `homeUserId`. Ack rather than reject because the sender legitimately considers the identity theirs to update; from this side the update simply no-ops.
+**Detached-account guard:** After the identity lookup and before the version check, if the resolved `localUser` has `federation_home_orphaned = 1` (detached — home domain was reset, now a sovereign local account), the event is **acked (messageId pushed to `accepted`) and skipped without applying**. The reset domain's new incarnation must never overwrite an established account's profile by replaying its old `homeUserId`. Ack rather than reject because the sender legitimately considers the identity theirs to update; from this side the update simply no-ops.
 
 #### Profile Image File Replication
 
 When a `profile_update` relay carries avatar or banner absolute URLs, the receiving instance downloads the image files locally rather than storing remote URLs. This eliminates cross-origin dependencies — avatars render from the local `/api/uploads/` endpoint.
 
 **Flow:** `processProfileUpdateEvent` calls `downloadProfileAsset(url, sourceInstance)` for each of avatar/banner:
-1. SSRF check (URL hostname must match authenticated source instance)
-2. `fetch` with 10s timeout
+1. Origin check (URL hostname must match authenticated source instance). This constrains the first request only, which is why step 2 does not use bare `fetch`.
+2. `safeFetch` with 10s timeout. It validates the target and re-validates the destination of every redirect hop before following it, so the origin check cannot be sidestepped by a peer answering with a 30x.
 3. Content-type validation (`image/*` only)
-4. Stream to temp file (`temp_{snowflake}{ext}`), atomic rename to `{snowflake}{ext}`
-5. Store local bare filename in user row
+4. Size cap (`MAX_PROFILE_ASSET_BYTES`, 8 MiB). A declared `content-length` over the cap is refused before the file is opened; the body is then counted as it streams and the transfer is aborted the moment it exceeds the cap, so a peer cannot answer with an unbounded body.
+5. Stream to temp file (`temp_{snowflake}{ext}`), atomic rename to `{snowflake}{ext}`
+6. Store local bare filename in user row
 
-**Fallback:** On any download failure (timeout, HTTP error, non-image content, SSRF mismatch), the absolute URL is stored instead. This degrades to the pre-replication behavior — the avatar loads cross-origin from the home instance.
+**Fallback:** On any download failure (timeout, HTTP error, non-image content, origin mismatch, refused redirect target, over-cap body), the absolute URL is stored instead. The temp file is unlinked on every failure path. This degrades to the pre-replication behavior — the avatar loads cross-origin from the home instance.
 
 **File cleanup:** When avatar/banner changes, the old local file is deleted via `deleteUploadFile()`. The check `!oldValue.startsWith('http')` ensures only locally-downloaded files are deleted, not absolute URL strings.
 
@@ -1385,44 +1691,58 @@ Native users' status (and optional rich activities) is projected to peers via th
 **Payload:** `FederationPresenceUpdatePayload`:
 - `homeUserId`, `homeInstance`
 - `status: 'online' | 'idle' | 'dnd' | 'offline'`
-- `activities?: Activity[]` (omitted when empty)
+- `activities?: Activity[]`. Current senders always include it (`[]` for none). The receiver reads a list as the full set and an absent field as "unchanged": peers that predate this send status-only relays on every connect and in their activation snapshot, also while the user is playing.
 - `ts: number` — emitter clock (last-write-wins per stub if needed)
 
 **Outbox-only — never written to mutation log.** Presence is ephemeral. Replaying old presence on peer activation would be wrong (stale state). The outbox queues directly without `appendMutationLog`. Stale entries that fail delivery beyond retry budget are dropped.
 
 **Sender call sites** (all in `utils/federationPresence.ts:queuePresenceRelay`):
-- `ws/handler.ts` (auth path) — `online`
+- `ws/handler.ts` (auth path) — the user's chosen status (`users.chosen_status`)
 - `ws/handler.ts` (`finalizeDisconnect`) — `offline`
-- `ws/events.ts` (`handlePresenceUpdate`) — manual `online`/`idle`/`dnd`
+- `ws/presence.ts` (`applyChosenStatus`) — manual `online`/`idle`/`dnd`, from REST `PATCH /api/users/@me` and the WS `presence_update` client event
 - `ws/events.ts` (`handleActivityUpdate`) — when activities change
 - `routes/users.ts` (showActivity-toggle clear) — cleared activities
 
+The auth-path relay carries the activities another session of the user already reported (none on a first connection), so a second device connecting does not clear the user's activity on peers.
+
 No-op for replicated users (we don't own their presence).
+
+**Friendship snapshot** (`snapshotPresenceForFriend`, called by `exchangeFriendPresence` in `ws/presence.ts` once, at the step that created the friendship row: local accept, or whichever of the relayed `friend_request_update` (accepted) and `friend_add` formed it): for a native side whose new friend is a replicated row, one `presence_update` with the native's current status and activities, targeted at the friend's home (`getFriendEventTargets`). Skipped when the native is offline. The friend's home usually had no row for the native when the native's current activity began, so it dropped that relay; without this, the friend saw no activity until it changed (#340).
+
+**Detached accounts have no status on other instances.** `queuePresenceRelay` and `snapshotPresenceForPeer` skip every row with `home_instance` set, detached ones included, although a detached account owns its chosen status locally (`ownsChosenStatus`). This is deliberate: a detached account's outbound identity is still its old home identity (`relayActorOfUser`, the DM message builder and client registration on other instances all send `homeUserId` + the reset `homeInstance`), and the receiver below only accepts a `presence_update` from the identity's home instance. A relay under the old identity would be rejected by every peer as `attribution_mismatch`; one under this instance's own id would match no row anywhere. Changing that means giving detached accounts a new outbound identity or a new attribution rule (#310).
 
 **Targeting:** broadcast to all active peers (mirrors `profile_update`). Peers without a stub silently no-op. Privacy: status is already public to anyone authorized to see the user via friend/DM/space relationships, so broadcast-fanout adds no new disclosure surface.
 
 **Coalescing:** `entityId = userId`, `contextId = userId`. Rapid status flaps coalesce to the latest queued event per peer.
 
-**Receiver:** `processPresenceUpdateEvent` (`routes/federation.ts`). Strict attribution — `payload.homeInstance` domain MUST equal source peer's domain. Resolves the local stub by `homeUserId`, validates the stub's `homeInstance` matches the payload's domain, updates the stub's `status`, and broadcasts a WS `presence_update` to local users via `collectProfileBroadcastTargetIds(stub.id)` — friends, DM members, and space co-members.
+**Receiver:** `processPresenceUpdateEvent` (`routes/federation.ts`). Strict attribution — `payload.homeInstance` domain MUST equal source peer's domain. Resolves the local stub that IS the payload's `homeUserId` + `homeInstance` (`resolveRelayActor`; a native user of this instance is never one, and anything but a `found` row homed elsewhere is acked without effect), updates the stub's `status`, keeps the activities for the stub in `ConnectionManager.userActivities` (a list replaces them after `validateActivities`, the local `activity_update` limits; `[]` or `offline` clears them; an absent field or a list that fails validation leaves them unchanged), and broadcasts a WS `presence_update` to local users via `collectProfileBroadcastTargetIds(stub.id)` — friends, DM members, and space co-members — with `activities` when they changed (empty clears on clients), without it otherwise, and with the stub's `homeUserId`/`homeInstance`. The kept activities are what the ready payload and the friendship snapshot report for the remote user.
 
-**Detached-account guard:** After the domain-collision check and before the status write, if the resolved stub has `federation_home_orphaned = 1` (detached — home domain was reset, now a sovereign local account), the event is **acked (messageId pushed to `accepted`) and skipped without applying**. The reset domain's new incarnation must never flip an established account's presence by replaying its old `homeUserId`. Ack (not reject) mirrors the `profile_update` guard rationale — the sender considers the identity theirs, so we no-op rather than trigger a retry loop.
+**Detached-account guard:** After the identity lookup and before the status write, if the resolved stub has `federation_home_orphaned = 1` (detached — home domain was reset, now a sovereign local account), the event is **acked (messageId pushed to `accepted`) and skipped without applying**. The reset domain's new incarnation must never flip an established account's presence by replaying its old `homeUserId`. Ack (not reject) mirrors the `profile_update` guard rationale — the sender considers the identity theirs, so we no-op rather than trigger a retry loop.
 
 **Peer lifecycle hooks** (`utils/federationPresence.ts`):
-- **`onPeerActivated`** invokes `snapshotPresenceForPeer(origin)` — emits a `presence_update` only for online natives that have an S2S relationship with the peer (friend/DM with a peer-stub, or `replicatedInstances` opt-in for the peer origin). Snapshot work scales with relationship count, not native count.
-- **`onPeerDeactivated`** invokes `markPeerStubsOffline(origin)` — flips every stub from that peer to `offline` and broadcasts a local `presence_update` so users see them go offline immediately.
+- **`onPeerActivated`** awaits `snapshotPresenceForPeer(origin)` — emits a `presence_update` (status and current activities) only for online natives that have an S2S relationship with the peer (friend/DM with a peer-stub, or `replicatedInstances` opt-in for the peer origin). Snapshot work scales with relationship count, not native count.
+- **`onPeerDeactivated`** invokes `markPeerStubsOffline(origin)` — flips every stub from that peer to `offline`, drops the activities kept for it, and broadcasts a local `presence_update` so users see them go offline immediately.
 - **Flap recovery semantics:** `onPeerActivated` re-runs on every transition into `active`, including the 15-minute health-check `unreachable → active` recovery. This is load-bearing for correctness: `markPeerStubsOffline` ran on the prior deactivation, presence is not in the mutation log, so a fresh snapshot is the only signal that re-establishes truth. The relationship-scoped query bounds the cost.
 
 #### Stub Username Backfill
 
-Legacy stubs (created before the realname scheme shipped) used `${homeUserId}@${domain}` as the local username. The current scheme uses `${realname}@${domain}` (`hints.username` in `resolveOrCreateReplicatedUser`). Backfill heals existing legacy rows.
+A replicated stub is named `<realname>@<domain>` when a username for the identity is known at creation (`hints.username` in `resolveOrCreateReplicatedUser`), and `<homeUserId>@<domain>` when it is not. Creation and the rename below read the hint through one function, `handleFromHint` (`stubName.ts`): only a handle-shaped hint (`[a-z0-9_]` after trimming and lowercasing) is a username, so a hint such as a display name leaves the row id-named. The id name is still minted today, not only by rows from before the realname scheme: a client route whose home lookup got no answer, a `dm_call_start` caller (the call payload carries only a display name, which is never used as a username), and any relay whose snapshot lacks a username. Before the call relay stopped passing it, an incoming call from an unknown caller named the row after the caller's display name (`<display name>@<domain>`). Both are placeholder names, and such a row is renamed once, the first time a username for it arrives. Home usernames never change, so the rename is one-way.
 
-**Worker:** `utils/federationStubBackfill.ts:backfillStubUsernamesForPeer(peerOrigin)`. Enumerates legacy-shaped stubs whose `home_instance` matches the peer's domain, asks the peer for the canonical username via `lookupRemoteUserByHomeId`, rewrites the stub's username and (if displayName is null) seeds displayName from the same fallback. Idempotent and collision-safe.
+**Placeholder names:** `isPlaceholderNamedStub(user)` in `routes/federation/stubName.ts` holds for a replicated row (`password_hash = '!federation-replicated'`, so a federated account's login name is never touched), with a `homeUserId`, not detached (`federation_home_orphaned = 0`), whose username ends with `@<homeInstance>` and whose local part is either the `homeUserId` or not shaped like a handle (`[a-z0-9_]+`; registration has accepted only `[a-zA-Z0-9_]` since the first release, so a space, dot, dash, non-ASCII letter or `@` proves it is not the home username). A display-name placeholder that happens to be handle-shaped (display name "kai" for the user `kai_dev`) cannot be told apart from a real handle and is not renamed. A suffixed name (`<handle>~<n>`) is not a placeholder either: the row's handle is known, so the client DM routes and the backfill do not ask its home about it (see "Suffixed names").
 
-**Hook points:**
-- `onPeerActivated` — runs per-peer on every transition to `active` (catches stubs whose home was unreachable on a prior pass).
-- `startupBootstrapSync` — one-shot pass at boot for ALL currently-active peers (not just `lastSyncedAt = 0` first-time peers).
+**The rename:** `applyPlaceholderRename(user, username, db, seed?)` writes it; `renamePlaceholderNamedStub` (same arguments) writes it and then announces it. Only a handle-shaped `username` renames a row, so a display name never does. When another row already holds `<username>@<domain>` (a stale replica of an account deleted on its home whose username was registered again, while the deletion never reached this instance), the stub takes the first free `<username>~<n>@<domain>` (`firstFreeUsername`, the rule creation uses), and is then no longer a placeholder. With a `seed` (the backfill passes the lookup answer) an empty `displayName` is filled with `displayName ?? username` and a differing `status` is taken over. The announcement is `announceUserUpdated`: `user_updated` to `collectProfileBroadcastTargetIds(user.id)`, as `processProfileUpdateEvent` does. Hydration renames with `applyPlaceholderRename` and announces once, after it has filled the profile.
 
-**New endpoint: `POST /api/federation/users/by-home-id`** (HMAC-authenticated, rate-limited 60/min/peer). Body: `{ homeUserId: string }`. Response: `{ found: false }` or `{ found: true, user: { homeUserId, username, profile: { displayName, avatar, avatarColor, banner, bio } } }`. Native non-deleted users only.
+**Suffixed names.** The suffix separator `~` is outside the handle alphabet (`[a-z0-9_]`), so a suffixed name can never be the real handle of another user of that instance. Earlier versions used `_`: `kai_1` given to a second `kai` shadowed a later real `kai_1`, who became `kai_1_1`, and the first kept `kai_1` for good. A row named `<handle>~<n>@<domain>` is re-checked by every hint that reports that same handle (identity resolution and hydration, `applyPlaceholderRename`): it moves to the first free name for the handle when that is earlier than its own (`<handle>@<domain>` once the stale holder is tombstoned or renamed), announces the move, and otherwise keeps its name without a write. A random suffix is kept, not redrawn. A hint with another handle, and a hint that is not handle-shaped, leaves it alone. A row only ever moves to an earlier name for its own handle and never renames another row, so two rows cannot trade names. Rows suffixed with `_<n>` by earlier versions look like handles and are not re-checked.
+
+**Where it runs:**
+- **Identity resolution.** `resolveOrCreateReplicatedUser` renames the row it finds whenever the caller passes `hints.username`. That covers every relay handler that passes the snapshot's username (DM `create`, membership, friend events), the friend-add route (the hint is the home's lookup answer) and the client DM routes below, without a rename call at each site. The hint carries the same trust as at creation: a stub minted from the same event would have taken that name.
+- **Hydration.** `hydrateReplicatedUserProfile` renames the row when the snapshot carries `username`, after its native-row and detached-row guards, and announces the row once its fields are filled.
+- **Client DM routes.** `resolveRemoteIdentityForClient` (`utils/federationClientIdentity.ts`), used by every `routes/dm.ts` route that takes a `homeUserId` + `homeInstance` pair, asks the home (`lookupRemoteUserByHomeId`) for an unknown identity or a placeholder-named row, then resolves with the answer's username and hydrates the answer's profile. A row with its real name costs no network call. The client never supplies a username. A new row is created only for a snowflake-shaped `homeUserId`, and not when the home answers that the user does not exist. The lookup is made only when the domain is an active peer (the identity's bare host maps to the peer's stored origin through `resolveOriginFromHostname`, including a peer whose origin carries a port) and waits at most `CLIENT_HOME_LOOKUP_TIMEOUT_MS` (2 s), since the client's request is open meanwhile. Without an answer (no active peer yet, unreachable, rate limited, timeout) the row gets the id name, as before, and the same home is not asked about the same id again for 60 s (in-memory, per process); the peer-activation backfill or the first relayed username renames it. See api.md "Naming a remote user".
+- **Backfill worker.** `utils/federationStubBackfill.ts:backfillStubUsernamesForPeer(peerOrigin)` enumerates placeholder-named stubs whose `home_instance` matches the peer's domain, asks the peer via `lookupRemoteUserByHomeId`, and renames with the answer as seed. An answer about a different id is ignored, and a failed answer for one stub leaves it for the next pass without stopping the others. Idempotent. Hook points:
+  - `onPeerActivated` — runs per-peer on every transition to `active` (catches stubs whose home was unreachable on a prior pass).
+  - `startupBootstrapSync` — one-shot pass at boot for ALL currently-active peers (not just `lastSyncedAt = 0` first-time peers).
+
+**New endpoint: `POST /api/federation/users/by-home-id`** (HMAC-authenticated, rate-limited 60/min/peer). Body: `{ homeUserId: string }`. Response: `{ found: false }` or `{ found: true, user: { homeUserId, username, profile: { displayName, avatar, avatarColor, banner, bio } } }`. Native non-deleted users only. `lookupRemoteUserByHomeId` reads only an explicit `{ found: false }` as `not_found`; 429 is `rate_limited`, and every other answer (network error, timeout, any other status such as 404 from a peer without the route, a body that is not JSON or not either shape) is `unreachable`. It throws only when the peer row is missing.
 
 ---
 
@@ -1434,9 +1754,11 @@ Reactions are queued by WS event handlers in `events.ts`:
 - `dm_reaction_add` -> `queueOutboxEvent(reactionId, channelId, 'reaction_add', payload, targetOrigins)`
 - `dm_reaction_remove` -> `queueOutboxEvent(messageId, channelId, 'reaction_remove', payload, targetOrigins)`
 
-Payload includes `userId`, `homeUserId`, `emoji`, `createdAt`, plus `messageId` and `messageHomeInstance` for cross-instance message resolution.
+Payload includes `userId`, `homeUserId`, `emoji`, `createdAt`, plus `messageId` and `messageHomeInstance` for cross-instance message resolution: the reacted-to message as a `FederationMessageRef`, built by `dmMessageFederationRef` (see `dm-system.md` "Naming a message across instances").
 
-The mutation log entry for reactions stores a simpler payload (no `messageId`/`messageHomeInstance`), while the outbox entry carries the full reaction payload including those fields.
+The WS reaction handlers accept a federated account (a user whose `homeInstance` is another instance) like any DM member. Until #295 they silently dropped its DM reactions: a leftover of the `isFederated` gate that `662143bf` lifted for every other DM operation, so a client whose DM was pinned to a remote origin could not react at all.
+
+The mutation log entry for reactions stores a simpler payload (no `messageId`/`messageHomeInstance`), while the outbox entry carries the full reaction payload including those fields. The sync endpoint (`POST /api/federation/sync`) fills them when it replays a reaction: it reads the reacted-to row (the log's `entity_id`) and names it with the same `dmMessageFederationRef`, so a replayed reaction resolves on the receiver exactly like a live one. A reaction whose message row is gone by the time of the sync is not replayed.
 
 ### Inbound
 
@@ -1444,7 +1766,7 @@ The mutation log entry for reactions stores a simpler payload (no `messageId`/`m
 1. Resolve message via `resolveLocalDmMessage(canonicalMessageId, messageHomeInstance, sourceInstance, db)`:
    - If `messageHomeInstance === getOurOrigin()` -> find by local ID (the message originated here)
    - Otherwise -> find by `(messageHomeInstance || sourceInstance, canonicalMessageId)` tracking -- uses `messageHomeInstance` when available (correct origin in 3-instance relay), falls back to `sourceInstance`
-2. Resolve reacting user via `resolveLocalUser` (must already exist)
+2. Resolve reacting user via `resolveRelayActor` (must already exist): unknown → `user_not_found`
 3. Dedup: check existing reaction by `(dmMessageId, userId, emoji)`
 4. Insert `dm_reactions`, broadcast `reaction_added` to local clients
 
@@ -1494,7 +1816,7 @@ Mirror of `onPeerActivated` for the transition *out* of `active`. Invoked wherev
 - `utils/federationWorker.ts` auth-failure path when status flips to `needs_attention`
 - `utils/federationWorker.ts` resolvePendingPeers case `'rejected'`
 - `routes/federation.ts` admin revoke endpoint
-- `utils/federationPeering.ts` performHandshake 403 `PEERING_REQUIRES_APPROVAL` path
+- `utils/federationPeering.ts` performHandshake 403 path (`settleRejectedHandshake`, only when the row was still `pending`)
 
 Deduplicated by peerId using a **separate** `inFlightDeactivation` map (not shared with activation) so flapping peers retain clean activate-then-deactivate ordering.
 
@@ -1522,7 +1844,7 @@ Event types covered by `appendMutationLog` (replayed on sync-pull):
 
 | Event type | `contextType` | Source |
 |---|---|---|
-| DM `create` / `update` / `delete` | `dm` | `federationOutbox.queueDmRelay`, `dm.ts` delete handler |
+| DM `create` / `update` / `delete` | `dm` | `federationOutbox.queueDmRelay`, `federationOutbox.queueDmMessageDeleteRelay` |
 | `reaction_add` / `reaction_remove` | `dm` | `ws/events.ts` |
 | `member_add` / `member_remove` / `ownership_transfer` | `dm` | `dm.ts` |
 | `dm_close` / `dm_reopen` | `dm` | `federationOutbox.queueDmCloseRelay` |
@@ -1568,7 +1890,7 @@ HMAC-authenticated. Returns events from the `federation_mutation_log`.
 - Joins `federation_mutation_log` with `dm_messages` to reconstruct events
 - Only returns locally-created messages (`source_instance IS NULL` via the LEFT JOIN)
 - Handles delete mutations separately (message rows don't exist for deletes)
-- For create/update: fetches current message state from DB, builds full relay event with attachments and participants
+- For create/update: fetches current message state from DB and builds the message part with `buildRelayPayload`, the live relay's builder, so a replayed message carries the same `type`, author identity (`getOurOrigin()` for a native author), `replyTo` and `mentions` as a live one; adds attachments (`sourceUrl` on `getOurOrigin()`) and participants
 - Membership/friend mutations store the full event payload in the mutation log, so they are returned directly
 
 **Friend sync:**
@@ -1599,12 +1921,12 @@ Four relay event types are processed in `processRelayEvents()`:
 
 | Event Type | Direction | Key Payload Fields |
 |---|---|---|
-| `dm_call_start` | Host → Peers | `federatedId`, `livekitUrl`, `tokens: Record<string, string>` (keyed by `homeUserId`), `caller: { homeUserId, homeInstance, displayName }`, `participants` |
+| `dm_call_start` | Host → each participant-homing peer | `federatedId`, `livekitUrl`, `tokens: Record<string, string>` (keyed by `homeUserId`, **scoped to the recipient's own members**), `caller: { homeUserId, homeInstance, displayName }`, `participants` (full roster) |
 | `dm_call_accept` | Participant → Host, then Host → All Peers | `federatedId`, `acceptor: { homeUserId, homeInstance }` |
 | `dm_call_reject` | Participant → Host, then Host → All Peers | `federatedId`, `rejector: { homeUserId, homeInstance }` |
 | `dm_call_end` | Any → Host (if not host), then Host → All Peers | `federatedId`, `endedBy: { homeUserId, homeInstance }` |
 
-All events carry standard relay fields: `eventType`, `messageId`, `encryptionVersion: 0`, `timestamp`. All events pass through `verifyAttribution()` before any DB or state mutations.
+All events carry standard relay fields: `eventType`, `messageId`, `encryptionVersion: 0`, `timestamp`. All events pass through `attributionRefusal()` before any DB or state mutations.
 
 ### Direct Delivery (No Outbox)
 
@@ -1629,7 +1951,7 @@ All events carry standard relay fields: `eventType`, `messageId`, `encryptionVer
 
 ### Call Flows
 
-**Start:** Host validates membership, generates LiveKit tokens for all DM members (local + remote), broadcasts `dm_call_incoming` to local WS clients, then sends `dm_call_start` S2S to each remote instance with per-user tokens.
+**Start:** Host validates membership, broadcasts `dm_call_incoming` to local WS clients, then sends `dm_call_start` S2S to each instance that homes a remote DM member. The relay is built per recipient: the host mints tokens only for the members that recipient homes. A DM with no remote member is not relayed at all, and peers that home no DM member are not contacted. See "Token Scoping" below.
 
 **Accept:** Remote instance sends `dm_call_accept` S2S to host. Host transitions `ringing → active`, broadcasts `dm_call_accepted` locally, fans out `dm_call_accept` to all other remote instances.
 
@@ -1654,6 +1976,20 @@ Room name = `federatedId` (the cross-instance stable UUID), never the local `dmC
 - **Identity:** `${homeUserId}:${displayName}`
 - **Permissions:** full DM grants (mic, camera, screen share, subscribe, data channel)
 
+### Token Scoping
+
+A federated call token is a bearer credential: whoever holds it can join the room and publish under the identity it was minted for. Peers are admin-approved but not trusted, so `sendFederatedCallStart` (`ws/events.ts`) treats the token map as a per-recipient secret:
+
+- Remote members are bucketed by their home instance (`canonicalizeHomeInstance`; comparisons use `normalizeOriginForCompare`, since `homeInstance` is stored both bare and scheme-prefixed). Each bucket is exactly the set of identities that peer is entitled to act for.
+- `buildRelayEvent(recipients)` mints tokens for that bucket only. No peer receives the caller's token, a local member's token, or a token for a member homed on another peer.
+- With no remote members the function returns before minting anything — a purely local call produces zero relays, so no peer learns it happened.
+- Only bucketed origins are contacted; there is no all-peers broadcast. `affectedUserIds` on a `dm_call_undeliverable` failure is derived from the failing peer's bucket.
+- Per-recipient keying also removes the ambiguity of one global `homeUserId → token` map, where the same `homeUserId` on two instances would collide.
+
+`participants` is the non-secret roster and is still sent in full, because Path B recipients need it to match a participant to a local identity.
+
+Recipient side (`routes/federation/events/calls.ts`): both Path A and Path B skip a local member with no token in the payload rather than dispatching a `dm_call_incoming` the client cannot use. This is reachable for a member homed on a third instance who holds a client-federation connection here; their own home instance receives their token and rings them.
+
 ### Public LiveKit URL
 
 The URL sent in S2S payloads is always `https://${DOMAIN}/livekit` (the Caddy-proxied public address). The internal `LIVEKIT_URL` env var (`http://livekit:7880`) is never sent to peers.
@@ -1672,7 +2008,7 @@ interface FederatedCallEntry {
   callerHomeUserId: string;
   federatedCallHost: string;    // peer origin of the host instance
   livekitUrl: string;
-  tokens: Map<string, string>;  // homeUserId → LiveKit token
+  tokens: Map<string, string>;  // homeUserId → LiveKit token (only members this instance homes)
   state: 'ringing' | 'active';
   startedAt: number;
 }
@@ -1695,11 +2031,10 @@ All workers are started by `startFederationWorkers()` on server boot and stopped
 | Janitor | 1h | -- | -- | `runFederationJanitor` (sync) |
 | Startup bootstrap sync | Once at startup | -- | 30s per page | `startupBootstrapSync` → `onPeerActivated` |
 | Dead-incarnation sweep | Once at startup | -- | -- | `sweepDeadIncarnationArtifacts` (sync, idempotent) |
-| DM `federatedId` reconciliation | Once at startup | -- | -- | `reconcileDriftedDmFederatedIds` (sync, idempotent) |
 
 `sweepDeadIncarnationArtifacts` — startup, idempotent: deletes DM channels with no native member (with explicit child-row cleanup) and unreferenced replicated stubs homed at this instance's own domain; still-referenced stubs are skipped and logged. It does not rely on FK cascade (must not assume `PRAGMA foreign_keys` is ON): the channel delete explicitly clears its `dm_reactions`/`attachments`/`dm_messages`/`dm_members`/`read_states` rows, and the stub delete explicitly clears its `dm_reactions`/`reactions`/`read_states` rows — and the stub's deletable guard mirrors the non-cascading FKs to `users.id` by hand (a future non-cascading FK to `users.id` needs a matching NOT-EXISTS clause).
 
-`reconcileDriftedDmFederatedIds` — startup, idempotent (reattach-dm-reconcile spec §3.3): in one transaction, iterates every 1-on-1 DM channel (exactly 2 members, 1-on-1-shaped `federated_id`) and calls `reconcileDmChannelFederatedId` on each, re-keying or merging any whose stored id has drifted from its members' current home identities. This **heals accounts re-attached before inline reconciliation shipped** (§3.2) — including the live split-conversation duplicate — without manual DB surgery. On a clean database every channel is a no-op (one hash per 1-on-1 channel); it logs a summary only when it changed something (`[federation] DM federatedId reconciliation: rekeyed N, merged M`). Wired next to `sweepDeadIncarnationArtifacts` in `startFederationWorkers`.
+The 1-on-1 key sweep that used to run here (`reconcileDriftedDmFederatedIds`) is `backfillOneOnOneKeys`, run by `initDatabase` on every boot whether or not the workers start, and widened to unkeyed rows: every 1-on-1 (no owner, exactly 2 members, not soft-deleted) whose key is NULL or differs from its members' current home identities goes through `reconcileDmChannelFederatedId`. It still **heals accounts re-attached before inline reconciliation shipped** (§3.2). See dm-system.md "Federated ID Algorithm".
 
 ### Janitor Cleanup (`storageJanitor.ts:runFederationJanitor`)
 
@@ -1710,8 +2045,11 @@ All workers are started by `startFederationWorkers()` on server boot and stopped
 | `federation_file_queue` (completed) | `createdAt < (now - 7 days)` | 7 days |
 | `federation_file_queue` (any) | `expiresAt < now` | 30 days (set at queue time) |
 | `dm_channels` (soft-deleted) | `deletedAt < (now - 24h)` | 24-hour grace period |
+| `federation_peers` (unused auto rows) | `status = 'pending'`, `initiated_by = 'auto'`, `created_at < (now - 1h)`, no outbox entry other than `presence_update`, no handshake with the origin in flight | 1-hour grace (`AUTO_PENDING_PEER_GRACE_MS`) |
 
 DM channel hard-delete cascades: reactions, embeds, attachments (DB rows + disk files), messages, members, outbox entries, mutation log entries, file queue entries.
+
+**Unused auto pending peer rows (`cleanupUnusedAutoPendingPeers`).** A `pending` row that local traffic created is kept for the entries waiting on its handshake. Once those are gone (typically expired at the relay TTL while the origin never answered) nothing removed the row, because untargeted broadcasts (`queueOutboxEvent` with no targets reaches `pending` peers) keep queueing `presence_update` onto it, and while it existed `/peer/initiate` for the origin answered `409`. The sweep runs after the outbox expiry in the same janitor pass and deletes such a row together with its presence entries (explicitly, not via the foreign-key cascade), then sends `federation_peers_changed` to admins. Only `presence_update` entries are disposable: presence never enters the mutation log, a presence event for a user the receiver has no copy of is a no-op there, and every activation sends a fresh snapshot (`snapshotPresenceForPeer` in `onPeerActivated`), so a later peering loses nothing. Any other entry, including a `profile_update` broadcast, keeps the row until that entry's own TTL. The one-hour grace equals `UNLINKED_AGE_MS` and the janitor interval, so a row is never removed by the sweep that first sees it and the worker has made several paced attempts on it first. Rows an admin or the remote created, and auto rows that left `pending`, are never touched.
 
 ### Worker Startup Gate
 
@@ -1721,11 +2059,19 @@ DM channel hard-delete cascades: reactions, embeds, attachments (DB rows + disk 
 
 `PUBLIC_ORIGIN` env (read via `config.publicOrigin`, consumed by `getOurOrigin()` in `utils/federationAuth.ts`) overrides the federation transport URL verbatim, taking precedence over the default `https://${DOMAIN}`. When unset, behaviour is unchanged. Intended for reverse-proxy / dev-without-TLS deployments where the public origin must be advertised explicitly (typically `http://...`) and differs from the bare `DOMAIN` value used for federated identity. The seed-peer integration harness (`seedPeer.ts`) does NOT use this override — see it for why localhost-port instances cannot collapse to a single peer row. The **real-handshake** harness (`realHandshake.ts`) does the opposite: it sets `PUBLIC_ORIGIN` to each instance's ephemeral `http://127.0.0.1:<port>` so the advertised `sourceOrigin` matches the transport, exercising the same path as production.
 
+**A `PUBLIC_ORIGIN` on another hostname than `DOMAIN` is not supported for federation.** A peer keys this instance by the transport origin and cannot map an identity naming the `DOMAIN` host to that row (`resolveOriginFromHostname` matches only the host, or the one active peer on a port-less hostname), so first contact with this instance's users keeps the `<homeUserId>@<domain>` name until a username arrives by relay, and friend-add by that domain dials `https://DOMAIN` instead of the existing peering. A different scheme or a port on the same hostname is supported.
+
 **Handshake `sourceOrigin` honors this override.** `resolveLocalOrigin()` (`routes/federation.ts`) delegates to `getOurOrigin()`, so the origin advertised in the `/peer/accept` handshake body is identical to the `X-Federation-Origin` used for authenticated S2S requests. Using `https://${DOMAIN}` directly (the prior behavior) desynced the responder's peer-row key from the auth origin whenever `PUBLIC_ORIGIN != https://DOMAIN`, causing permanent `403 Not peered`. See "Trust re-establishment contract" (§1).
 
 ### Test-Only Routes
 
 `POST /api/admin/test/seed-peer` directly inserts a `federation_peers` row, skipping the multi-step peer handshake. Strictly gated: `NODE_ENV='test'` AND `ENABLE_TEST_ROUTES='1'` together; returns 404 in any other configuration. Used exclusively by the two-instance integration harness in `packages/server/test/`. Validates `origin` (must be http(s) URL), `hmacSecret` (≥32 chars), and `status` (must be one of `'active'`, `'pending'`, `'awaiting_approval'`, `'rejected'`, `'revoked'`, `'needs_attention'`, `'unreachable'`, `'accepted'`).
+
+### Retry backoff divisor (test only)
+
+`FEDERATION_BACKOFF_DIVISOR` (`config.federation.backoffDivisor`, read once in `config.ts`) divides every federation retry wait: `BACKOFF_SCHEDULE_MS` for outbox entries and file downloads, and `RECOVERY_BACKOFF_MS` for unreachable-peer probes and pending-peer handshakes (`retryWait` in `federationWorker.ts`). Unset or 1 is the production schedule. It must be a whole number ≥ 1, so it can only shorten waits; 0 and fractions refuse to boot. The health-check interval and the 15-minute silent-peer backstop are not retry waits and are not divided.
+
+The two-instance harness sets 30 in every spawned instance (`HARNESS_BACKOFF_DIVISOR` in `twoInstanceHarness.ts`), so the retries come after 1 s, 2 s, 10 s. Production's first retry is 30 s, longer than any relay wait in the e2e suites, so without it a relay whose first attempt failed on a loaded runner (a busy peer, a timed-out request) would fail its test while the instance behaved as designed. Not an operator setting: a larger divisor only makes an instance retry a struggling peer harder.
 
 ### Rate-limit bypass (test only)
 

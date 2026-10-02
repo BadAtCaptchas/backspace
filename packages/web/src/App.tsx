@@ -5,12 +5,14 @@ import { RegisterPage } from './components/auth/RegisterPage';
 import { AppLayout } from './components/layout/AppLayout';
 import { JoinPage } from './components/JoinPage';
 import { SwAutoUpdate } from './components/ui/SwUpdatePrompt';
-import { ScreenSharePicker } from './components/voice/ScreenSharePicker';
+import { TelemetryAsk } from './components/telemetry/TelemetryAsk';
+import { ScreenShareSetup } from './components/voice/ScreenShareSetup';
 import { useAuthStore } from './stores/authStore';
 import { isElectron } from './platform/platform';
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const token = useAuthStore((s) => s.token);
+  // i18n-check: allow-literal — the `; return` between the two elements is code, not text.
   if (!token) return <Navigate to="/login" replace />;
   return <>{children}</>;
 }
@@ -49,13 +51,14 @@ export function App() {
 
   return (
     <div className={`flex flex-col ${showTitleBar ? 'h-screen' : 'contents'}`}>
-      {showTitleBar && <>
-        <div className="h-8 flex-shrink-0 bg-surface-base titlebar-drag" />
-        <div className="h-px flex-shrink-0 bg-border-hard" />
-      </>}
+      {showTitleBar && (
+        <div className="flex-shrink-0 bg-surface-base border-b border-border-hard titlebar-drag"
+          style={{ height: 'var(--titlebar-inset)', borderBottomWidth: 'calc(1px / var(--interface-scale))' }} />
+      )}
       <div className={showTitleBar ? 'flex-1 min-h-0' : 'contents'}>
         <SwAutoUpdate />
-        <ScreenSharePicker />
+        <TelemetryAsk />
+        <ScreenShareSetup />
         <Routes>
           <Route
             path="/login"
@@ -87,6 +90,14 @@ export function App() {
           />
           <Route
             path="/explore"
+            element={
+              <ProtectedRoute>
+                <AppLayout />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/backspace"
             element={
               <ProtectedRoute>
                 <AppLayout />

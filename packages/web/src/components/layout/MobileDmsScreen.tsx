@@ -1,4 +1,6 @@
 import React, { useMemo } from 'react';
+import { useTranslation } from 'react-i18next';
+import { useFormatters } from '../../i18n/formatters';
 import { useUIStore } from '../../stores/uiStore';
 import { useSpaceStore } from '../../stores/spaceStore';
 import { useChatStore } from '../../stores/chatStore';
@@ -10,7 +12,7 @@ import { AvatarStack } from '../ui/AvatarStack';
 import { Mascot } from '../ui/Mascot';
 import { resolveAssetUrl } from '../../utils/assetUrls';
 import { useNavigate } from 'react-router-dom';
-import { parseFederatedUsername, isFederationGlobeApplicable, isSelf } from '../../utils/identity';
+import { parseFederatedUsername, isFederationGlobeApplicable, isSelf, userDisplayName } from '../../utils/identity';
 import { useCanonicalUserView } from '../../utils/userViewLookup';
 import { formatDmSidebarPreview, formatDmHeaderName } from '../../utils/dmFormatters';
 import type { DmChannel, User } from '@backspace/shared';
@@ -33,7 +35,7 @@ function MobileFriendBubble({
   const avatarUrl = canonical.avatar
     ? resolveAssetUrl(canonical.avatar, friend._instanceOrigin) ?? `/api/uploads/${canonical.avatar}`
     : null;
-  const displayName = canonical.displayName ?? parseFederatedUsername(canonical.username).baseName;
+  const displayName = userDisplayName(canonical);
 
   return (
     <button
@@ -82,6 +84,7 @@ function MobileDmRow({
   onContextMenu: (e: React.MouseEvent, id: string, isGroup: boolean) => void;
   formatTimestamp: (ts: number) => string;
 }) {
+  const { t } = useTranslation(['dm', 'common']);
   const otherMembers = dm.members.filter(m => authUser ? !isSelf(m, authUser) : m.id !== authUser);
   const isGroup = !!dm.ownerId;
   const rawMainUser = otherMembers[0] ?? null;
@@ -93,7 +96,7 @@ function MobileDmRow({
   // keep the canonical view of the single other member.
   const name = isGroup
     ? formatDmHeaderName(dm, authUser ?? null)
-    : mainUser?.displayName ?? (parseFederatedUsername(mainUser?.username ?? '').baseName || 'Unknown');
+    : (mainUser && userDisplayName(mainUser)) || t('common:states.unknown');
 
   // Show a single federation globe next to the group name when any non-self
   // member is federated. No tooltip on mobile — the new `group-dm-info` screen
@@ -181,6 +184,7 @@ function MobileDmRow({
 }
 
 export function MobileDmsScreen() {
+  const { t } = useTranslation(['dm', 'common']);
   const pushMobileScreen = useUIStore((s) => s.pushMobileScreen);
   const openModal = useUIStore((s) => s.openModal);
 
@@ -189,6 +193,7 @@ export function MobileDmsScreen() {
   const authUser = useAuthStore((s) => s.user);
   const friends = useSocialStore((s) => s.friends);
   const navigate = useNavigate();
+  const f = useFormatters();
   const openContextMenu = useContextMenuStore((s) => s.open);
   const setCurrentChannel = useChatStore((s) => s.setCurrentChannel);
 
@@ -222,7 +227,7 @@ export function MobileDmsScreen() {
       {
         key: 'leave-group',
         type: 'action',
-        label: 'Leave Group',
+        label: t('dm:list.leaveGroup'),
         danger: true,
         icon: <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M15.75 9V5.25A2.25 2.25 0 0013.5 3h-6a2.25 2.25 0 00-2.25 2.25v13.5A2.25 2.25 0 007.5 21h6a2.25 2.25 0 002.25-2.25V15m3 0l3-3m0 0l-3-3m3 3H9" /></svg>,
         onClick: () => {
@@ -240,24 +245,24 @@ export function MobileDmsScreen() {
   const formatTimestamp = (ts: number): string => {
     const now = Date.now();
     const diff = now - ts;
-    if (diff < 60_000) return 'now';
-    if (diff < 3600_000) return `${Math.floor(diff / 60_000)}m`;
-    if (diff < 86400_000) return `${Math.floor(diff / 3600_000)}h`;
-    if (diff < 604800_000) return `${Math.floor(diff / 86400_000)}d`;
-    return new Date(ts).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+    if (diff < 60_000) return t('dm:list.justNow');
+    if (diff < 3600_000) return t('dm:list.minutesShort', { count: Math.floor(diff / 60_000) });
+    if (diff < 86400_000) return t('dm:list.hoursShort', { count: Math.floor(diff / 3600_000) });
+    if (diff < 604800_000) return t('dm:list.daysShort', { count: Math.floor(diff / 86400_000) });
+    return f.formatShortDate(ts);
   };
 
   return (
     <div className="flex flex-col h-full bg-surface-base">
       {/* Header */}
       <header className="h-12 flex items-center justify-between px-4 border-b border-border-soft shrink-0">
-        <h1 className="text-base font-semibold text-txt-primary">Messages</h1>
+        <h1 className="text-base font-semibold text-txt-primary">{t('dm:list.title')}</h1>
         <div className="flex items-center gap-1">
           <button
             onClick={() => pushMobileScreen('friends')}
             className="h-8 px-3 rounded-lg text-xs font-medium text-accent-primary hover:bg-interactive-hover transition-colors"
           >
-            Friends
+            {t('common:labels.friends')}
           </button>
         </div>
       </header>
@@ -295,7 +300,7 @@ export function MobileDmsScreen() {
         {sortedDms.length === 0 && (
           <div className="flex flex-col items-center justify-center h-40 opacity-80">
             <Mascot state="sleeping" className="w-20 h-20 mb-2" />
-            <p className="text-txt-tertiary text-sm">No conversations yet.</p>
+            <p className="text-txt-tertiary text-sm">{t('dm:list.empty')}</p>
           </div>
         )}
       </div>

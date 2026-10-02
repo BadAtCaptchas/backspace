@@ -1,27 +1,46 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { useFormatters } from '../../i18n/formatters';
 import { useNavigate } from 'react-router-dom';
-import ReactMarkdown from 'react-markdown';
 import type { User } from '@backspace/shared';
 import { Avatar } from '../ui/Avatar';
 import { Username } from '../ui/Username';
+import { ProfileBio } from './ProfileBio';
 import { useSpaceStore, getApiForOrigin, resolveUserOrigin } from '../../stores/spaceStore';
 import { api } from '../../api/client';
-import { useUIStore } from '../../stores/uiStore';
+import { describeError } from '../../i18n/errors';
+import { useUIStore, type ProfileMemberContext } from '../../stores/uiStore';
 import { getAvatarGradient, adjustColor, mutedGradient } from '../../utils/gradients';
 import { parseFederatedUsername } from '../../utils/identity';
 import { useCanonicalUserView } from '../../utils/userViewLookup';
 import { loadFederatedMutuals } from '../../utils/mutuals';
+import { replaceEmojiShortcodes } from '../../utils/emojiShortcodes';
+import { computeFloatingPosition, type AnchorRect, type Placement } from '../../hooks/useFloatingPosition';
+import { useProfileMemberRoles } from '../../hooks/useProfileMember';
+import { useShownStatus } from '../../hooks/useShownStatus';
+import { viewerCanEditMemberRoles } from '../../utils/roleHierarchy';
+import { ProfileRoles } from './ProfileRoles';
+
+/** Gap between the card and the element it was opened from. */
+const ANCHOR_OFFSET = 8;
 
 interface UserProfilePopoutProps {
   user: User;
   onClose: () => void;
-  position?: { top: number; left: number };
+  /** Rect of the element the card was opened from. */
+  anchor: AnchorRect;
+  placement?: Placement;
+  /** The space member the card was opened for; shows their roles in that space. */
+  member?: ProfileMemberContext | null;
 }
 
-export function UserProfilePopout({ user: propUser, onClose, position }: UserProfilePopoutProps) {
+export function UserProfilePopout({ user: propUser, onClose, anchor, placement = 'right', member = null }: UserProfilePopoutProps) {
+  const { t } = useTranslation(['social', 'common']);
   const navigate = useNavigate();
-  const addDmChannel = useSpaceStore((s) => s.addDmChannel);
+  const f = useFormatters();
+  const upsertDmCopy = useSpaceStore((s) => s.upsertDmCopy);
   const openModal = useUIStore((s) => s.openModal);
+  const addToast = useUIStore((s) => s.addToast);
   // Resolve to the best-known view of this user from the userViews cache.
   // The prop frequently arrives as a federated stub (when the carrying DM
   // came from a sibling instance that won the populateFromReady dedup race);
@@ -31,9 +50,22 @@ export function UserProfilePopout({ user: propUser, onClose, position }: UserPro
   const user = useCanonicalUserView(propUser);
   const { baseName, domain } = parseFederatedUsername(user.username);
   const displayName = user.displayName ?? baseName;
+  const shownStatus = useShownStatus(user, user.status);
 
   const origin = resolveUserOrigin(user);
   const userApi = getApiForOrigin(origin);
+  const roles = useProfileMemberRoles(member);
+  const isMobile = useUIStore((s) => s.isMobile);
+  // Edit Roles opens the member role editor, which is desktop-only. It is
+  // offered by the rule the editor gates with (permissions.md, "Role
+  // hierarchy"), read from the loaded space the card was opened in.
+  const canEditRoles = useSpaceStore((s) => {
+    if (!member || s.currentSpaceId !== member.spaceId) return false;
+    const space = s.spaces.find((sp) => sp.id === member.spaceId);
+    const target = s.members.find((m) => m.userId === member.userId);
+    if (!space || !target) return false;
+    return viewerCanEditMemberRoles(space, s.members, s.roles, s.spacePermissions.get(space.id), target);
+  }) && !isMobile;
 
   const [mutualCounts, setMutualCounts] = useState<{ friends: number; spaces: number } | null>(null);
 
@@ -43,12 +75,38 @@ export function UserProfilePopout({ user: propUser, onClose, position }: UserPro
       .catch(() => {});
   }, [user.id, user.homeUserId]);
 
-  const top = position
-    ? Math.min(Math.max(8, position.top), window.innerHeight - 460)
-    : undefined;
-  const left = position
-    ? Math.min(Math.max(8, position.left), window.innerWidth - 356)
-    : undefined;
+  // Placed off the card's *measured* size rather than a guessed height: the card
+  // grows with the bio, the custom status and the mutuals row, so any constant
+  // here would cut tall cards off at the bottom of the viewport.
+  const cardRef = useRef<HTMLDivElement>(null);
+  const [placed, setPlaced] = useState<{ top: number; left: number } | null>(null);
+
+  useLayoutEffect(() => {
+    const card = cardRef.current;
+    if (!card) return;
+
+    const place = () => {
+      const { width, height } = card.getBoundingClientRect();
+      // 'start': the card's top edge lines up with the row it came from, the
+      // way it always has — centring a tall card on a 32px avatar would drag it
+      // up over unrelated content.
+      const next = computeFloatingPosition(anchor, width, height, placement, ANCHOR_OFFSET, 'start');
+      setPlaced((prev) =>
+        prev && prev.top === next.top && prev.left === next.left
+          ? prev
+          : { top: next.top, left: next.left },
+      );
+    };
+
+    place();
+    const observer = new ResizeObserver(place);
+    observer.observe(card);
+    window.addEventListener('resize', place);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener('resize', place);
+    };
+  }, [anchor, placement]);
 
   const handleSendMessage = async () => {
     try {
@@ -64,18 +122,30 @@ export function UserProfilePopout({ user: propUser, onClose, position }: UserPro
         homeUserId: user.homeUserId ?? undefined,
         homeInstance: user.homeInstance ?? undefined,
       });
-      addDmChannel(channel);
+      // The answer joins its conversation; open the conversation's row.
+      const rowId = upsertDmCopy('', channel, 'stated');
       useUIStore.getState().setShowDms(true);
       onClose();
-      navigate(`/channels/@me/${channel.id}`);
+      navigate(`/channels/@me/${rowId}`);
     } catch (err) {
-      console.error('Failed to create DM channel:', err);
+      addToast(t('social:sendMessage.failed', { reason: describeError(err) }), 'warning');
     }
   };
 
   const handleViewFullProfile = () => {
     onClose();
-    openModal('userProfile', { userId: user.id, user, origin });
+    openModal('userProfile', { userId: user.id, user, origin, member });
+  };
+
+  const handleEditRoles = () => {
+    if (!member) return;
+    onClose();
+    openModal('memberRoles', { spaceId: member.spaceId, userId: member.userId });
+  };
+
+  const handleAvatarClick = (event: React.MouseEvent) => {
+    event.stopPropagation();
+    handleViewFullProfile();
   };
 
   // Banner display
@@ -89,12 +159,17 @@ export function UserProfilePopout({ user: propUser, onClose, position }: UserPro
         return mutedGradient(g.from, g.to);
       })();
 
+  // Parked off-screen for the one layout pass before the card knows how tall it
+  // is; `useLayoutEffect` places it before the browser paints, so it never
+  // renders visibly in the wrong spot.
+  const cardStyle = placed ?? { top: -9999, left: -9999 };
+
   return (
     <div
+      ref={cardRef}
+      data-user-profile-popout
       className="fixed z-[200] w-[340px] rounded-[12px] overflow-hidden animate-fade-in select-none glass-modal"
-      style={position
-        ? { top, left }
-        : { top: '50%', left: '50%', transform: 'translate(-50%, -50%)' }}
+      style={cardStyle}
     >
       {/* Banner */}
       <div
@@ -108,29 +183,30 @@ export function UserProfilePopout({ user: propUser, onClose, position }: UserPro
       {/* Body */}
       <div className="px-4 pb-4 relative">
         {/* Avatar */}
+        {/* The picture escalates to the full profile — the card is a preview, and
+            clicking the face is the obvious way to ask for the whole thing. It
+            deliberately does NOT reopen the card (see issue #37). */}
         <Avatar
           src={user.avatar}
           name={displayName}
           size={80}
-          status={user.status as 'online' | 'idle' | 'dnd' | 'offline' | null}
+          status={shownStatus}
           userId={user.homeUserId ?? user.id}
           user={user}
+          onClick={handleAvatarClick}
           ring={{ width: 4, color: 'rgba(20,20,26,0.85)' }}
           className="mt-[-44px] mb-3"
         />
 
         {/* Name & info */}
         <div>
-          <Username
-            username={user.displayName ?? baseName}
-            className="text-[16px] font-semibold leading-tight"
-          />
+          <span className="text-[16px] font-semibold leading-tight">{displayName}</span>
           <div className="text-[13px] text-txt-tertiary">
             <Username username={user.username} showAt className="text-[13px] text-txt-tertiary" />
           </div>
           {user.customStatus && (
             <div className="text-[13px] text-txt-secondary italic mt-1">
-              {user.customStatus}
+              {replaceEmojiShortcodes(user.customStatus)}
             </div>
           )}
         </div>
@@ -141,22 +217,17 @@ export function UserProfilePopout({ user: propUser, onClose, position }: UserPro
             <div className="border-t border-white/[0.06] my-3" />
             <div>
               <span className="text-[11px] uppercase tracking-wide font-semibold text-txt-tertiary">
-                About Me
+                {t('social:profile.aboutMe')}
               </span>
-              <div className="text-[13px] text-txt-secondary mt-1 whitespace-pre-wrap break-words leading-relaxed [&_strong]:font-semibold [&_strong]:text-txt-primary [&_em]:italic [&_a]:text-accent-primary [&_a]:underline">
-                <ReactMarkdown
-                  allowedElements={['p', 'strong', 'em', 'a', 'br']}
-                  unwrapDisallowed
-                  components={{
-                    a: ({ href, children }) => (
-                      <a href={href} target="_blank" rel="noopener noreferrer">{children}</a>
-                    ),
-                  }}
-                >
-                  {user.bio}
-                </ReactMarkdown>
-              </div>
+              <ProfileBio bio={user.bio} />
             </div>
+          </>
+        )}
+
+        {roles.length > 0 && (
+          <>
+            <div className="border-t border-white/[0.06] my-3" />
+            <ProfileRoles roles={roles} />
           </>
         )}
 
@@ -166,22 +237,22 @@ export function UserProfilePopout({ user: propUser, onClose, position }: UserPro
         <div className="space-y-1.5">
           <div>
             <span className="text-[11px] uppercase tracking-wide font-semibold text-txt-tertiary">
-              Member Since
+              {t('social:profile.memberSince')}
             </span>
             <span className="text-[12px] text-txt-secondary ml-2">
-              {new Date(user.createdAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}
+              {f.formatMediumDate(user.createdAt)}
             </span>
           </div>
           {mutualCounts && (mutualCounts.friends > 0 || mutualCounts.spaces > 0) && (
             <div className="text-[12px] text-txt-tertiary">
               {mutualCounts.friends > 0 && (
-                <span>{mutualCounts.friends} mutual friend{mutualCounts.friends !== 1 ? 's' : ''}</span>
+                <span>{t('social:mutuals.friends', { count: mutualCounts.friends })}</span>
               )}
               {mutualCounts.friends > 0 && mutualCounts.spaces > 0 && (
                 <span className="mx-1">&middot;</span>
               )}
               {mutualCounts.spaces > 0 && (
-                <span>{mutualCounts.spaces} mutual space{mutualCounts.spaces !== 1 ? 's' : ''}</span>
+                <span>{t('social:mutuals.spaces', { count: mutualCounts.spaces })}</span>
               )}
             </div>
           )}
@@ -192,13 +263,21 @@ export function UserProfilePopout({ user: propUser, onClose, position }: UserPro
           onClick={handleSendMessage}
           className="w-full mt-3 py-2 rounded-lg text-[13px] font-medium text-txt-primary bg-white/[0.06] hover:bg-white/[0.10] border border-white/[0.08] transition-colors"
         >
-          Send Message
+          {t('social:profile.sendMessage')}
         </button>
+        {canEditRoles && (
+          <button
+            onClick={handleEditRoles}
+            className="w-full mt-1.5 py-2 rounded-lg text-[13px] font-medium text-txt-secondary hover:text-txt-primary bg-transparent hover:bg-white/[0.04] transition-colors"
+          >
+            {t('social:profile.editRoles')}
+          </button>
+        )}
         <button
           onClick={handleViewFullProfile}
           className="w-full mt-1.5 py-2 rounded-lg text-[13px] font-medium text-txt-tertiary hover:text-txt-secondary bg-transparent hover:bg-white/[0.04] transition-colors"
         >
-          View Full Profile
+          {t('social:profile.viewFull')}
         </button>
       </div>
     </div>

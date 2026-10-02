@@ -1,9 +1,11 @@
-import React from 'react';
+import React, { createContext, useContext } from 'react';
 import ReactMarkdown, { defaultUrlTransform } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Highlight, themes } from 'prism-react-renderer';
 import type { Components } from 'react-markdown';
 import { MentionBadge } from './MentionBadge';
+import { remarkEmojiShortcodes } from '../../utils/remarkEmojiShortcodes';
+import { replaceMentionTokens } from '../../utils/mentionTokens';
 
 // ─── Remark Plugin: Tag Bare Fenced Blocks ─────────────────────────────────
 // react-markdown v9 removed the `inline` prop from <code>. Fenced blocks
@@ -39,20 +41,16 @@ function walkTree(node: MdastNode) {
 // brackets) before remark plugins can see the text nodes. We solve this by
 // converting mention tokens to standard markdown links BEFORE the parser
 // runs. The `a` component override then detects the mention:// scheme.
-// Code spans and fenced blocks are matched first and preserved as-is.
+// Code spans and fenced blocks are kept as-is by the shared token scan
+// (utils/mentionTokens.ts), the same scan the reply preview, the mention
+// highlight and the alert rule use.
 
 function preprocessMentions(raw: string): string {
-  return raw.replace(
-    /(```[\s\S]*?```|`[^`]+`)|<@([a-zA-Z0-9_-]+)>/g,
-    (match, codeBlock: string | undefined, userId: string | undefined) => {
-      if (codeBlock) return codeBlock;
-      return `[@${userId}](mention://${userId})`;
-    },
-  );
+  return replaceMentionTokens(raw, (userId) => `[@${userId}](mention://${userId})`);
 }
 
 // ─── URL Transform: Allow mention:// Scheme ─────────────────────────────────
-// react-markdown v9's defaultUrlTransform strips URLs with unknown protocols.
+// react-markdown's defaultUrlTransform strips URLs with unknown protocols.
 // We whitelist mention:// so the `a` component override receives the full href.
 
 function urlTransform(url: string): string {
@@ -74,7 +72,7 @@ const aetherTheme = {
 
 // ─── Markdown Component Overrides ──────────────────────────────────────────
 
-const REMARK_PLUGINS = [remarkGfm, remarkDefaultCodeLang];
+const REMARK_PLUGINS = [remarkGfm, remarkDefaultCodeLang, remarkEmojiShortcodes];
 
 function CodeBlock({ language, code }: { language: string; code: string }) {
   // 'text' means a bare fenced block with no language — render without highlighting
@@ -111,6 +109,18 @@ function CodeBlock({ language, code }: { language: string; code: string }) {
 
 const MemoizedCodeBlock = React.memo(CodeBlock);
 
+// ─── Mentions: Channel Context ─────────────────────────────────────────────
+// The component overrides below are built once and shared by every message,
+// so the channel a message belongs to reaches its mention badges through
+// context rather than through the overrides.
+
+const MentionChannelContext = createContext<string | null>(null);
+
+function ChannelMentionBadge({ userId }: { userId: string }) {
+  const channelId = useContext(MentionChannelContext);
+  return <MentionBadge userId={userId} channelId={channelId} />;
+}
+
 function buildComponents(): Components {
   return {
     // Paragraphs → spans to avoid block nesting issues in chat messages
@@ -121,11 +131,11 @@ function buildComponents(): Components {
     // so we intercept that pattern here instead of using a remark plugin.
     a: ({ href, children }) => {
       if (href?.startsWith('mention://')) {
-        return <MentionBadge userId={href.slice('mention://'.length)} />;
+        return <ChannelMentionBadge userId={href.slice('mention://'.length)} />;
       }
       const mentionMatch = href?.match(/^(?:mailto:)?@([a-zA-Z0-9_-]+)$/);
       if (mentionMatch) {
-        return <MentionBadge userId={mentionMatch[1]!} />;
+        return <ChannelMentionBadge userId={mentionMatch[1]!} />;
       }
       return (
         <a
@@ -220,12 +230,20 @@ const MARKDOWN_COMPONENTS = buildComponents();
 
 interface MarkdownRendererProps {
   content: string;
+  /**
+   * The channel the content was written in; `<@id>` mentions resolve among
+   * that channel's people (see `MentionBadge`). Omitted for text that belongs
+   * to no channel, where a mention cannot be resolved.
+   */
+  channelId?: string | null;
 }
 
-export const MarkdownRenderer = React.memo(function MarkdownRenderer({ content }: MarkdownRendererProps) {
+export const MarkdownRenderer = React.memo(function MarkdownRenderer({ content, channelId = null }: MarkdownRendererProps) {
   return (
-    <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={MARKDOWN_COMPONENTS} urlTransform={urlTransform}>
-      {preprocessMentions(content)}
-    </ReactMarkdown>
+    <MentionChannelContext.Provider value={channelId}>
+      <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={MARKDOWN_COMPONENTS} urlTransform={urlTransform}>
+        {preprocessMentions(content)}
+      </ReactMarkdown>
+    </MentionChannelContext.Provider>
   );
 });

@@ -1,10 +1,11 @@
 import React, { useMemo } from 'react';
+import { useTranslation } from 'react-i18next';
 import type { MemberWithUser, Activity } from '@backspace/shared';
+import { useFormatters } from '../../i18n/formatters';
 import { useSpaceStore } from '../../stores/spaceStore';
-import { useActivityStore } from '../../stores/activityStore';
+import { useActivityStore, activitiesFor } from '../../stores/activityStore';
 import { useUIStore } from '../../stores/uiStore';
 import { Avatar } from '../ui/Avatar';
-import { Username } from '../ui/Username';
 import { ActivityCard, hasRichActivity, getActivityAccentClass } from '../ui/ActivityCard';
 import { getPrimaryActivity } from '@backspace/shared/src/activities.js';
 import { parseFederatedUsername, isFederationGlobeApplicable } from '../../utils/identity';
@@ -13,15 +14,31 @@ import { MobileScreenHeader } from './MobileScreenHeader';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 
 /**
- * Derives the display group for a member based on their highest-positioned role
- * or owner status. Returns { key, label, color, position }.
+ * Which heading a member group renders under: the owner and the plain
+ * "online" bucket are translated, a role group shows the role's own name.
  */
-function getMemberGroup(member: MemberWithUser, ownerId: string | undefined) {
+type MemberGroupKind = 'owner' | 'role' | 'online';
+
+interface MemberGroup {
+  key: string;
+  kind: MemberGroupKind;
+  /** The role name for `kind: 'role'`; null for the translated buckets. */
+  label: string | null;
+  color: string | undefined;
+  position: number;
+}
+
+/**
+ * Derives the display group for a member based on their highest-positioned role
+ * or owner status.
+ */
+function getMemberGroup(member: MemberWithUser, ownerId: string | undefined): MemberGroup {
   if (ownerId && member.userId === ownerId) {
     const ownerRole = member.roles?.find(r => r.position > 0);
     return {
       key: '__owner__',
-      label: 'OWNER',
+      kind: 'owner',
+      label: null,
       color: ownerRole?.color ?? 'rgb(var(--accent-rose))',
       position: Infinity,
     };
@@ -31,6 +48,7 @@ function getMemberGroup(member: MemberWithUser, ownerId: string | undefined) {
     const top = sorted[0]!;
     return {
       key: top.id,
+      kind: 'role',
       label: top.name.toUpperCase(),
       color: top.color,
       position: top.position,
@@ -38,7 +56,8 @@ function getMemberGroup(member: MemberWithUser, ownerId: string | undefined) {
   }
   return {
     key: '__online__',
-    label: 'ONLINE',
+    kind: 'online',
+    label: null,
     color: undefined,
     position: -1,
   };
@@ -59,7 +78,7 @@ function MobileMemberRow({
   activities: Activity[];
   isRichActivity: boolean;
   accentClass: string;
-  onClickMember: (userId: string) => void;
+  onClickMember: (member: MemberWithUser) => void;
 }) {
   const canonical = useCanonicalUserView(member.user);
   const { baseName } = parseFederatedUsername(canonical.username);
@@ -71,7 +90,7 @@ function MobileMemberRow({
 
   return (
     <div
-      onClick={() => onClickMember(member.userId)}
+      onClick={() => onClickMember(member)}
       className={rowClass}
     >
       <Avatar
@@ -83,11 +102,12 @@ function MobileMemberRow({
         user={canonical}
       />
       <div className="flex-1 min-w-0">
-        <Username
-          username={displayName}
-          className={`text-[13.5px] leading-[1.2] font-medium truncate ${isOffline ? 'text-txt-tertiary' : (!colorStyle ? 'text-txt-primary' : '')}`}
+        <span
+          className={`text-[13.5px] leading-[1.2] font-medium truncate ${colorStyle ? (isOffline ? 'opacity-60' : '') : (isOffline ? 'text-txt-tertiary' : 'text-txt-primary')}`}
           style={colorStyle}
-        />
+        >
+          {displayName}
+        </span>
         {!isOffline && isFederationGlobeApplicable(canonical) && (
           <div className="text-[10px] leading-[1.3] text-txt-tertiary truncate opacity-60">@{parseFederatedUsername(canonical.username).domain}</div>
         )}
@@ -107,6 +127,8 @@ interface MobileMembersScreenProps {
 }
 
 export function MobileMembersScreen({ params }: MobileMembersScreenProps) {
+  const { t } = useTranslation(['spaces', 'common']);
+  const { formatNumber } = useFormatters();
   const members = useSpaceStore((s) => s.members);
   const spaces = useSpaceStore((s) => s.spaces);
   const currentSpaceId = useSpaceStore((s) => s.currentSpaceId);
@@ -116,6 +138,7 @@ export function MobileMembersScreen({ params }: MobileMembersScreenProps) {
 
   const spaceId = params?.spaceId || currentSpaceId;
   const space = spaces.find(s => s.id === spaceId);
+  const spaceOrigin = space?._instanceOrigin ?? '';
   const ownerId = space?.ownerId;
 
   // Mirror desktop MemberSidebar's `showMemberSkeleton`: gate the skeleton
@@ -127,11 +150,11 @@ export function MobileMembersScreen({ params }: MobileMembersScreenProps) {
     const online = members.filter(m => m.user.status !== 'offline');
     const offline = members.filter(m => m.user.status === 'offline');
 
-    const groups = new Map<string, { label: string; color: string | undefined; position: number; members: MemberWithUser[] }>();
+    const groups = new Map<string, { kind: MemberGroupKind; label: string | null; color: string | undefined; position: number; members: MemberWithUser[] }>();
     for (const m of online) {
       const group = getMemberGroup(m, ownerId);
       if (!groups.has(group.key)) {
-        groups.set(group.key, { label: group.label, color: group.color, position: group.position, members: [] });
+        groups.set(group.key, { kind: group.kind, label: group.label, color: group.color, position: group.position, members: [] });
       }
       groups.get(group.key)!.members.push(m);
     }
@@ -156,13 +179,21 @@ export function MobileMembersScreen({ params }: MobileMembersScreenProps) {
     return undefined;
   };
 
-  const handleMemberClick = (userId: string) => {
-    pushMobileScreen('user-profile', { userId });
+  const handleMemberClick = (member: MemberWithUser) => {
+    pushMobileScreen('user-profile', { userId: member.userId, spaceId: member.spaceId, memberUserId: member.userId });
+  };
+
+  const groupHeading = (kind: MemberGroupKind, label: string | null): string => {
+    if (kind === 'owner') return t('spaces:members.groups.owner');
+    if (kind === 'online') return t('common:states.online');
+    return label ?? '';
   };
 
   const renderMember = (member: MemberWithUser, isOffline = false) => {
-    const colorStyle = isOffline ? undefined : getMemberColor(member);
-    const activities = userActivities.get(member.userId) ?? [];
+    // Roles do not depend on presence: an offline member keeps their colour,
+    // dimmed with the rest of the row.
+    const colorStyle = getMemberColor(member);
+    const activities = activitiesFor(userActivities, member.user, spaceOrigin);
     const isRichActivity = !isOffline && hasRichActivity(activities);
     const primary = getPrimaryActivity(activities);
     const accentClass = primary ? getActivityAccentClass(primary.type) : '';
@@ -184,10 +215,10 @@ export function MobileMembersScreen({ params }: MobileMembersScreenProps) {
 
   return (
     <div className="flex flex-col h-full bg-surface-base">
-      <MobileScreenHeader title={totalCount > 0 ? `Members — ${totalCount}` : 'Members'} />
+      <MobileScreenHeader title={totalCount > 0 ? t('spaces:members.titleWithCount', { count: totalCount }) : t('common:labels.members')} />
       <div className="flex-1 overflow-y-auto p-3">
         {showMemberSkeleton ? (
-          <div className="px-2 pt-2" role="status" aria-label="Loading members">
+          <div className="px-2 pt-2" role="status" aria-label={t('spaces:members.loading')}>
             {/* Role group 1 — match real row geometry: w-9 h-9 avatar +
                 gap-2.5 + py-2.5 → ~52px row height. */}
             <div
@@ -238,14 +269,14 @@ export function MobileMembersScreen({ params }: MobileMembersScreenProps) {
           </div>
         ) : onlineCount === 0 && offlineMembers.length === 0 ? (
           <div className="flex items-center justify-center h-40 text-txt-tertiary text-sm">
-            No members found
+            {t('common:labels.noMembersFound')}
           </div>
         ) : (
           <>
             {roleGroups.map(([key, group]) => (
               <div key={key} className="mb-4">
                 <h3 className="text-[10.5px] font-bold text-txt-tertiary uppercase tracking-[0.06em] px-2 mb-1">
-                  {group.label} — {group.members.length}
+                  {groupHeading(group.kind, group.label)} — {formatNumber(group.members.length)}
                 </h3>
                 {group.members.map((m) => renderMember(m))}
               </div>
@@ -254,7 +285,7 @@ export function MobileMembersScreen({ params }: MobileMembersScreenProps) {
             {offlineMembers.length > 0 && (
               <div>
                 <h3 className="text-[10.5px] font-bold text-txt-tertiary uppercase tracking-[0.06em] px-2 mb-1">
-                  OFFLINE — {offlineMembers.length}
+                  {t('common:states.offline')} — {formatNumber(offlineMembers.length)}
                 </h3>
                 {offlineMembers.map((m) => renderMember(m, true))}
               </div>

@@ -17,12 +17,18 @@ import { useUIStore } from '../stores/uiStore';
  */
 export function broadcastVoiceStatus(overrideOrigin?: string): void {
   const vs = useVoiceStore.getState();
-  const { isMuted, isDeafened, isCameraOn, isScreenSharing, currentVoiceChannelId, spaceMutedUserIds, spaceDeafenedUserIds } = vs;
-  if (!currentVoiceChannelId) return;
+  const {
+    isMuted, isDeafened, isCameraOn, isScreenSharing, currentVoiceChannelId,
+    activeDmCall, callOrigin, spaceMutedUserIds, spaceDeafenedUserIds,
+  } = vs;
+  const voiceTargetId = currentVoiceChannelId ?? activeDmCall?.dmChannelId;
+  if (!voiceTargetId) return;
 
-  const origin = overrideOrigin ?? getChannelOrigin(currentVoiceChannelId);
+  const origin = overrideOrigin ?? callOrigin ?? getChannelOrigin(voiceTargetId);
   const myId = getMyUserIdForOrigin(origin);
-  const spaceId = useSpaceStore.getState().channelToSpaceMap.get(currentVoiceChannelId);
+  const spaceId = currentVoiceChannelId
+    ? useSpaceStore.getState().channelToSpaceMap.get(currentVoiceChannelId)
+    : null;
   const spaceKey = (spaceId && myId) ? `${spaceId}:${myId}` : '';
 
   const effectiveMuted = isMuted || spaceMutedUserIds.has(spaceKey);
@@ -137,8 +143,16 @@ export function joinVoiceChannel(
   channelId: string,
   connectFn?: (channelId: string, isDm?: boolean) => Promise<void>,
 ): void {
-  const { currentVoiceChannelId, setCurrentVoiceChannel, addVoiceUser, removeVoiceUser } = useVoiceStore.getState();
-  if (currentVoiceChannelId === channelId) return;
+  const {
+    currentVoiceChannelId, voiceConnectionStatus,
+    setCurrentVoiceChannel, addVoiceUser, removeVoiceUser,
+  } = useVoiceStore.getState();
+  // Re-selecting the channel we are already live in stays a no-op, but a
+  // dropped session deliberately keeps `currentVoiceChannelId` set so the
+  // session can be resumed. Without the status check the same click would mean
+  // "nothing" instead of "reconnect", and hanging up would be the only way
+  // back into the channel the user never meant to leave.
+  if (currentVoiceChannelId === channelId && voiceConnectionStatus !== 'disconnected') return;
 
   // Leave old instance if switching cross-origin
   if (currentVoiceChannelId) {
@@ -231,7 +245,8 @@ export async function requestMicPermission(): Promise<boolean> {
     // Resume context first — iOS may have suspended it during the denied
     // state.
     await audioManager.resumeContext();
-    await audioManager.setInputDevice(inputDeviceId);
+    const stream = await audioManager.setInputDevice(inputDeviceId);
+    if (!stream) return false;
     useVoiceStore.getState().setMicPermissionDenied(false);
     return true;
   } catch (err: unknown) {

@@ -7,9 +7,11 @@ Source files:
 - `docker-compose.yml` -- base stack: `backspace` + `caddy` (+ optional `livekit`) services, healthcheck
 - `docker-compose.proxy.yml` -- proxy/tunnel overlay: publishes the app on `127.0.0.1:APP_PORT` and drops Caddy
 - `.github/workflows/docker-publish.yml` -- multi-arch (amd64+arm64) GHCR image publish
+- `.github/workflows/ci.yml` (`build-image` job) -- builds the amd64 image on every PR and push to main without pushing it, so a Dockerfile that no longer matches the build scripts fails before a tag does (1.1.0 shipped without an image for that reason)
 - `Caddyfile` -- reverse proxy / auto-HTTPS config (All-in-One mode only)
 - `install.sh` -- interactive first-time setup, mode-aware (allinone / proxy / tunnel)
 - `deploy.sh` -- rsync + rebuild to Heidi's two boxes
+- `update.sh` -- operator update: snapshot, fetch, restart, verify, roll back
 - `backup.sh` / `restore.sh` -- manual snapshot + restore tooling (host side)
 - `packages/server/src/config.ts` -- `config.backup.*` env parsing
 - `packages/server/src/utils/backup.ts` -- `createSnapshot` (VACUUM INTO), `listSnapshots`, `pruneSnapshots`, off-box hook
@@ -53,16 +55,40 @@ One installer, three modes, recorded as `DEPLOY_MODE` in `.env`. `install.sh` au
 
 **`COMPOSE_FILE` wiring.** In proxy/tunnel mode install.sh writes `COMPOSE_FILE=docker-compose.yml:docker-compose.proxy.yml` into `.env`. Docker Compose reads `COMPOSE_FILE` from `.env`, so **every** later `docker compose …` command in the directory transparently uses both files — the operator (and the update commands) never need `-f` flags. All-in-One leaves `COMPOSE_FILE` unset (defaults to `docker-compose.yml`).
 
-**Server proxy-awareness.** The server sets Fastify `trustProxy: true`, so it trusts `X-Forwarded-*` from the fronting proxy/tunnel. `getOurOrigin()` returns `https://${DOMAIN}` (federation/public identity) whenever `DOMAIN` is set and `PUBLIC_ORIGIN` is unset — correct in all three modes, since the public URL is `https://DOMAIN` regardless of which layer terminates TLS. No `PUBLIC_ORIGIN` is needed for a normal proxy/tunnel deployment.
+**Server proxy-awareness.** The server sets Fastify `trustProxy` to a count of trusted hops (`TRUSTED_PROXY_HOPS`, default 1, see below), so it trusts `X-Forwarded-*` from the fronting proxy/tunnel but not from anything beyond it. `getOurOrigin()` returns `https://${DOMAIN}` (federation/public identity) whenever `DOMAIN` is set and `PUBLIC_ORIGIN` is unset — correct in all three modes, since the public URL is `https://DOMAIN` regardless of which layer terminates TLS. No `PUBLIC_ORIGIN` is needed for a normal proxy/tunnel deployment.
+
+**The trusted hop count (`TRUSTED_PROXY_HOPS`).** `trustProxy` is not `true`; it is a count of the proxies in front of the app that are trusted to have written `X-Forwarded-For`. It is set in `.env` like every other deployment fact, defaults to **1**, and is read and validated in `packages/server/src/config.ts`; `install.sh` writes the line into a generated `.env`, commented out at the default, and preserves an explicit value across re-runs. A set value that is not a non-negative integer stops the server at boot rather than quietly becoming 1, and so does anything above 4 (a CDN in front of your own proxy in front of a tunnel is 3, so a larger number is a typo, and a typo like 11 would trust the whole forwarded chain again). A blank line reads as unset and gives you the default. What the refusal actually says, and why the ceiling is 4, is in [web-security.md](web-security.md) section 9. `docker-compose.yml` passes `.env` to the container wholesale (`env_file`), so setting it there is all it takes. `request.ip` is therefore the address the nearest proxy appended, not the left-most thing in the header, so a client cannot choose the address its rate limits are counted under. Every rate limit in the app keys on that address (see [api.md](api.md), "Rate limiting"), as does the unauthenticated federation peer-accept limiter, and it is what the request log records.
+
+One is correct for all three modes as shipped: the bundled Caddy, an operator's reverse proxy and a tunnel daemon are each one hop. Two deployments need a different number, and the app cannot detect either of them for itself:
+
+- **A CDN in front of your own reverse proxy** is two hops. Left at 1, the app sees the CDN's address and everyone behind it shares a rate-limit bucket. Set `TRUSTED_PROXY_HOPS=2` **if your inner proxy appends to `X-Forwarded-For`**, which nginx configured with the snippet above does. If the inner proxy is the bundled Caddy, the number on its own does nothing: Caddy discards the CDN's entry unless its `trusted_proxies` names the CDN, so the app is handed the CDN's address whatever the count. Configure `trusted_proxies` in the Caddyfile first, then set 2. See [web-security.md](web-security.md) section 9.
+- **No proxy at all**, the app exposed directly on its port, is zero hops. Left at 1, the app believes an `X-Forwarded-For` header a client sends, because from inside the process one proxy and one lying client look the same. Set `TRUSTED_PROXY_HOPS=0`, which ignores the header and uses the socket address.
+
+Too low costs a shared bucket; too high hands the key back to the client. **Your proxy config needs no change for this:** appending to `X-Forwarded-For` (nginx's `$proxy_add_x_forwarded_for`, which the snippet this installer prints uses) is exactly what the hop count expects, and Caddy's overwrite is fine too. An evaded rate limit was never an authentication bypass, since every route still authenticates and authorizes; what it cost was the brake on brute force and flooding. See [web-security.md](web-security.md) section 9.
+
+**Custom public port.** When the public port is not 443, it goes into `DOMAIN` itself (`DOMAIN=chat.example.com:1443`). `DOMAIN` is the host clients type, and everything the instance advertises (`getOurOrigin()`, invite links, the generated `LIVEKIT_URL`) is built from it, so the port propagates with no second variable. Only `proxy` mode supports it: install.sh rejects a port in `allinone` (Caddy needs 80/443 for issuance; `docker-compose.yml` publishes only those) and in `tunnel` (the provider's edge answers on 443). The installer splits `DOMAIN_HOST` / `DOMAIN_PORT` for the DNS check and the printed snippets (`listen <port> ssl`, `server_name <host>`). The proxy must pass the `Host` header through unchanged: the nginx snippets use `$http_host`, because `$host` strips the port. The server itself never builds a URL from the request host (the tus `Location` is relative for exactly this reason, see uploads.md), so a proxy that mangles `Host` can only break what it terminates. Federation with a port in `DOMAIN` is not supported (see Known Limitations).
 
 **Voice per mode.** LiveKit media is WebRTC over UDP and never flows through the HTTP proxy/tunnel — the media ports (`3478/udp` TURN, `7881/tcp` fallback, `50000-60000/udp` media) must be reachable from clients directly. All-in-One proxies LiveKit *signaling* through Caddy (`/livekit` → `host.docker.internal:7880`); a reverse-proxy operator must replicate that route (`/livekit` → `127.0.0.1:7880`, prefix stripped) **and** open the media ports. Over a tunnel, voice is unavailable and install.sh force-disables it. See `docs/systems/voice.md` for LiveKit tuning.
 
 ### Build: multi-stage Dockerfile
 
-`Dockerfile` has two stages:
+`Dockerfile` has three stages:
 
-1. **`builder`** (`node:20-slim`) — enables pnpm via corepack, installs the full workspace with `pnpm install --frozen-lockfile`, copies `shared`/`server`/`web` source, and runs `pnpm --filter @backspace/web build` to produce the static frontend (`packages/web/dist`).
-2. **`runtime`** (`node:20-slim`) — installs the native toolchain for `better-sqlite3` plus `ffmpeg` (`python3 make g++ ffmpeg`), installs production-only deps with `pnpm install --prod --frozen-lockfile` (`tsx` is a server runtime dependency), copies `shared` + `server` source and the prebuilt `web/dist`, creates `/app/data/uploads`, and starts the server with `node --import tsx/esm src/index.ts` from `/app/packages/server`.
+1. **`deps`** (`node:24-slim`): enables pnpm via corepack and produces the production dependency tree with `pnpm install --prod --frozen-lockfile` (`tsx` is a server runtime dependency). This is the only stage that installs `better-sqlite3`. It carries no C toolchain: the prebuilt binary ships inside the npm package and nothing is compiled.
+2. **`builder`** (`node:24-slim`): installs just the frontend's dependency subset with `pnpm install --frozen-lockfile --filter @backspace/web...`, copies `shared`/`web` source, and runs `pnpm --filter @backspace/web build` to produce the static frontend (`packages/web/dist`). The filter keeps the server's dependencies out of this stage, so no toolchain is needed here either.
+3. **`runtime`** (`node:24-slim`): installs `ffmpeg` (media) + `gosu` (privilege drop) only, with **no C toolchain**. Copies the production `node_modules` from `deps`, `shared` + `server` source, and the prebuilt `web/dist` from `builder`, creates `/app/data/uploads`, and runs the server **as the non-root `node` user** via `docker-entrypoint.sh` (which chowns `/app/data` as root, then `exec gosu node`) with `node --import tsx/esm src/index.ts` from `/app/packages/server`. It runs no `pnpm install` of its own.
+
+**No package manager ships in the runtime stage.** It installs nothing from a registry, so `pnpm` is not activated there and the `npm`/`npx` that `node:24-slim` bundles are deleted. Both used to ride along unused, and together they accounted for 17 of the image's 20 fixable HIGH/CRITICAL scan findings, in code that never executed (see [security-scanning.md](security-scanning.md)). Anything a future change needs to install at build time belongs in `deps`, copied into `runtime` the way `better-sqlite3` already is.
+
+**Why the `deps` stage exists.** It keeps the dependency install in one place, so the runtime stage copies a finished `node_modules` and runs no install of its own.
+
+**Why the base is Node 24.** Node 20 reached end of life on 2026-04-30, and `docker-compose.yml` defaults self-hosters to the moving `latest` tag, so whatever the image runs is what lands on their machines. Node 24 is the active LTS and is one of the two legs of the CI matrix in `.github/workflows/ci.yml`, so the image runs a version the repo tests. Node 26 has a longer support runway but stays a Current line until 2026-10-28; moving to it belongs after that date, together with a CI leg for it.
+
+**Why the image carries no C toolchain.** `better-sqlite3` 13.x is an N-API addon (`NAPI_VERSION=10`, which is why it declares `engines.node: >=22`) and publishes its prebuilt binaries inside the npm package itself: `prebuilds/linux-x64.node`, `linux-arm64.node`, the musl pair, darwin and win32. The binary is not tied to one Node ABI, so a Node major bump within the supported range needs no new asset, and the install downloads nothing beyond the package. That is why the `deps` stage installs neither `python3`, `make` nor `g++`, and it is also why the root `package.json` lists `better-sqlite3` under `pnpm.ignoredBuiltDependencies` rather than `onlyBuiltDependencies`: the package still carries a `binding.gyp`, and pnpm runs `node-gyp rebuild` on sight of one regardless of the package's `gypfile: false`, which on an image with no Python fails the build. Ignoring the build script is the correct call because there is nothing to build. Before changing the base again, confirm the `better-sqlite3` release still ships `prebuilds/linux-x64.node` and `prebuilds/linux-arm64.node` (`npm pack better-sqlite3@<version>` and list the tarball) and that its `engines.node` still admits the new major. If a future version drops a prebuild, the build fails at import time inside the container rather than falling back to a compile, and the toolchain has to come back together with the `onlyBuiltDependencies` entry.
+
+Node 20 is no longer a supported runtime: `engines.node` is `>=22.12.0`, which is the floor every dependency in the tree declares (`better-sqlite3` 13 needs 22, `wrangler` and `miniflare` need 22, `@electron/rebuild` and `@electron/fuses` need 22.12), and CI tests 22 and 24.
+
+**All three `FROM` lines are pinned by digest.** The digest is the one for the multi-arch index, not for a single platform's manifest, so the same pin resolves on `linux/amd64` and `linux/arm64`. The human-readable tag stays in the reference (`node:24-slim@sha256:...`) and the exact Node version is recorded in the comment above each stage. Renewing the pin means resolving the index digest again, `docker buildx imagetools inspect node:24-slim --format '{{.Manifest.Digest}}'`, and confirming the new image's Node major is still inside `better-sqlite3`'s `engines.node` range.
 
 The server is run through `tsx` (no separate transpile step); TypeScript is executed directly at runtime.
 
@@ -72,6 +98,53 @@ The server is run through `tsx` (no separate transpile step); TypeScript is exec
 - **`deploy.sh`** captures the commit locally (the remote has no `.git` after rsync) and exports it inline before the remote `docker compose up -d --build`.
 
 Empty/unset → `config.commit` is `null` (local dev, tarball install, or git unavailable). The source URL itself is `config.sourceCodeUrl` (env `BACKSPACE_SOURCE_URL`, default upstream) — operators running a modified build MUST set it to their fork.
+
+### Web bundle and the precache limit
+
+The frontend's service worker (vite-plugin-pwa, `generateSW`) precaches the whole build so the app starts offline. Workbox leaves any file larger than `maximumFileSizeToCacheInBytes` out of the precache manifest with only a build warning, so a main chunk that outgrows the limit silently stops being cached. The limit is defined once, as `PRECACHE_MAX_FILE_BYTES` in `packages/web/src/build/precache.ts`, and `vite.config.ts` builds the worker with it.
+
+`scripts/check-precache-size.mjs` runs in CI's build job right after `pnpm build`. It reads the limit from that module (through Vite's `runnerImport`), lists the precached files from `packages/web/dist/sw.js`, adds any file under `dist/assets/` the manifest is missing (which is where a file over the limit ends up), and fails when any of them is larger than 90% of the limit. Run it locally the same way after a web build.
+
+The settings panels (user settings, instance administration, space settings, and their mobile screens) are loaded on demand from `components/modals/lazySettingsPanels.tsx` and render inside its `SettingsPanelSuspense`. Their chunks are ordinary `.js` build assets, so the default precache patterns cover them and they open offline. Voice stays in the startup bundle on purpose: joining a call or accepting one must not wait on a chunk fetch. When the check fails, split another surface that the first screen does not need the same way.
+
+### Container hardening (non-root)
+
+The runtime image runs as the unprivileged `node` user (uid 1000), not root. On
+container start, `docker-entrypoint.sh` runs as root only long enough to `chown`
+the `./data` bind mount to `node` (only entries not already node-owned, so it is
+near-instant after the first boot), then drops privileges via `gosu` and execs the
+server. The build toolchain (`python3`/`make`/`g++`) is not installed in the
+runtime stage. `sharp` and `better-sqlite3` both load prebuilt binaries that
+are installed in the separate `deps` stage and copied in, so neither needs a
+compiler at any stage.
+That keeps the runtime attack surface small. `ffmpeg` remains (a real runtime
+dependency).
+
+The published image carries an SBOM and SLSA provenance attestation, and the
+amd64 image is scanned by Trivy before publish (report-only). Note: only the
+amd64 image is scanned; the arm64 image is published unscanned.
+
+**Minimum Docker version:** the attestation-bearing multi-arch image requires a
+reasonably modern Docker to `pull` cleanly (Docker Engine 24+ recommended).
+Very old daemons (≤ 20.10) may mishandle the `unknown/unknown` attestation
+manifests. New installs via `install.sh` (get.docker.com) are fine.
+
+**Upgrade note for existing self-hosters:** on the first start of the hardened
+image, the contents of your host `./data` directory are chowned to uid 1000. This
+is expected and idempotent. On an instance with a large `uploads/` tree on slow
+storage (e.g. a Pi on SD), the **first** restart after upgrade may take noticeably
+longer as this one-time chown runs before the server starts; subsequent boots only
+touch not-yet-node-owned entries and are near-instant. If you previously accessed
+`./data` on the host as a different user, adjust host-side access accordingly. `./restore.sh` continues to
+work — it swaps files inside a throwaway root container, and root can rewrite the
+now uid-1000-owned files.
+
+**Release-gate (maintainer):** before the first `v*` tag that ships this image,
+do a real `docker compose pull && docker compose up -d` on both an amd64 host and
+the arm64 Pi to confirm the attestation-bearing image pulls cleanly on the actual
+deployment Docker versions, and that the container boots non-root with a writable
+`./data` on real Linux (the macOS Docker Desktop bind-mount ownership display is
+not representative of Linux behaviour).
 
 ### Run: `docker compose up -d --build`
 
@@ -108,6 +181,19 @@ Caddy provisions and renews TLS certificates automatically for `DOMAIN`; the per
 - It polls `curl -fsS --resolve DOMAIN:443:127.0.0.1 https://DOMAIN/api/health` for ~30 s. Using `--resolve` connects to the **local** Caddy while presenting the real SNI/Host and performing full certificate verification, so a pass proves a valid public cert is installed *and* the app answers over TLS. This is deliberately **hairpin-safe**: many self-hosted boxes cannot reach their own public address (router NAT hairpin), so a plain external self-request would false-negative even when the site is fine for everyone else.
 - **Live** → the summary shows `HTTPS: Live`. **Not live yet** → `HTTPS: Not live yet` plus guidance (point DNS here, open/forward ports 80/443, watch `docker compose logs -f caddy`); Caddy keeps retrying and HTTPS comes up automatically once both are in place.
 
+**Telemetry environment.** Two variables, neither required. Full detail in [telemetry.md](telemetry.md).
+
+| Var | Default | Meaning |
+|-----|---------|---------|
+| `TELEMETRY` | _(unset)_ | Read by `install.sh` only, for unattended installs. `on` or `off` runs the same transition the admin route runs (`setTelemetryEnabled` in `packages/server/src/telemetry/state.ts`), written into the running container after the health check the same way the instance name is; `on` for an instance that is already on keeps its id and its last reported day. Any other value prints an error and changes nothing. Unset, the installer writes nothing and the admin panel asks after the first login. The running server never reads it. |
+| `TELEMETRY_ENDPOINT` | `https://hello.backspacechat.com` | Receiver base URL for the daily ping, read by the server and by the metrics collector. Point it at a local `wrangler dev` to test end to end. |
+
+**Space directory environment.** One variable, not required. Full detail in [directory.md](directory.md).
+
+| Var | Default | Meaning |
+|-----|---------|---------|
+| `DIRECTORY_ENDPOINT` | `https://explore.backspacechat.com` | Hub base URL for the opt-in space directory, read by the server only. Unset means the project hub. **Set to an empty string to disable the feature**: the pinger does not start and the Explore page's Outer Space section is absent (the proxy answers `404 directory_disabled`), for forks and air-gapped installs. Point it at a local `wrangler dev` to test end to end. Listing itself is a database setting an admin switches on in Instance settings; nothing in the environment lists anything. |
+
 ### Redeploy: `deploy.sh [pi|vm|all]`
 
 `./deploy.sh` is Heidi's redeploy helper for the two live instances — `nova.ddns.net` (Raspberry Pi) and `orbit.ddns.net` (VM). It does **not** build locally; it `rsync`s the working tree to the target (excluding `node_modules`, `.env`, `data/`, build output, and a list of local-only paths) and then runs `docker compose up -d --build` on the remote so the image is rebuilt in place. Targets:
@@ -119,6 +205,40 @@ Caddy provisions and renews TLS certificates automatically for `DOMAIN`; the per
 | `all` / `both` (default) | Both, in parallel |
 
 The `data/` directory is excluded from the rsync, so application data on each box is never overwritten by a deploy.
+
+### Update a running instance: `update.sh`
+
+The operator-facing update path, and what the admin Updates panel points at.
+
+```
+./update.sh              Update, with one confirmation prompt
+./update.sh --check      Report whether an update exists. Changes nothing
+./update.sh --yes        Update without prompting (ssh, cron)
+./update.sh --no-backup  Skip the pre-update snapshot. Not recommended
+```
+
+Sequence:
+
+1. **Preflight.** Docker reachable (falls back to `sudo` the way `install.sh` does), Compose v2 present, `.env` and `docker-compose.yml` present, and the compose project actually defines a `backspace` service. `COMPOSE_FILE` lives in `.env`, so proxy and tunnel installs resolve both files with no `-f` flags.
+2. **Record the rollback point.** `docker inspect` for the running container's image ID. Refuses to proceed if it cannot determine one.
+3. **Resolve the target reference.** `docker compose config --images backspace`, which is **not** necessarily the reference the running container was created from. An operator who repins `BACKSPACE_IMAGE_TAG` changes the former without touching the latter, and rolling back against the running container's reference would restore the old image under a name compose no longer looks at, bringing the failed version straight back up.
+4. **Refresh the checkout, tolerantly.** No `.git` (an rsync-deployed host) says so and carries on. A dirty tree or a diverged branch refuses to pull, says why, and carries on. Local edits are never clobbered, and the image update still applies.
+5. **Back up.** Calls `./backup.sh`. **The one step whose failure is fatal**, because everything after it is only safe to attempt because it happened.
+6. **Fetch.** `docker compose pull backspace`, or `docker compose build backspace` on a from-source install, chosen from `BACKSPACE_INSTALL_CHANNEL` and falling back to inferring it from the image reference.
+7. **Skip a no-op.** If the fetched image ID equals the recorded one, report and exit 0 without restarting. Restarting a chat server for nothing disconnects everyone in a voice call.
+8. **Restart.** `docker compose up -d backspace`. **The service is named explicitly and `--remove-orphans` is never passed.** Compose actively suggests that flag on hosts running other containers in the same project, and following it would delete them. Both live instances run co-hosted services behind the same Caddy, so this is a real deletion, not a hypothetical one.
+9. **Health gate.** Polls `docker inspect` for `healthy`, up to 180s. The compose healthcheck is `interval: 30s, retries: 5, start_period: 30s`, so anything under roughly 120s would produce false failures. On timeout it prints the container state, the last health-probe output, and the tail of the logs.
+10. **Verify the version moved.** Reads `/api/instance/info` through the container and compares against the pre-update value. A container that comes up healthy while still running the old code is a failed update, and this is the only check that catches it.
+11. **Roll back on failure.** Re-tags the recorded image ID to the target reference, `up -d backspace`, waits for healthy, and reports both the failure and the restored version. It then warns that the local tag now points at the previous image and should be restored with `docker compose pull backspace` once the problem is fixed.
+
+`--check` is read-only. It reports the running version and the install channel, then looks up the latest release tag from the GitHub API with `curl` or `wget` and compares. It touches no Docker state and degrades to a plain statement of the running version when neither tool is available.
+
+**Rehearsed end to end** on a live throwaway instance before shipping: a real update, a no-op re-run, and a deliberately broken update (image repinned at `alpine:3.20`) that failed the health gate and rolled back to a healthy instance on the previous image. Co-hosted containers were untouched throughout.
+
+Two shell traps this script exists on the far side of, worth knowing before editing it:
+
+- **`grep -q` under `set -o pipefail`.** `grep -q` exits at its first match, which SIGPIPEs the upstream command and fails the pipeline. `docker compose config --services | grep -qx backspace` reported "no backspace service" against a compose file whose *first* listed service is backspace. Membership is now tested with a bash `contains_line` helper. The same applies to any `… | head -1` without a trailing `|| true`.
+- **`sed -i`** differs between GNU and BSD. `install.sh`'s `record_install_channel` rewrites `.env` through a temp file instead.
 
 ---
 
@@ -167,7 +287,7 @@ Behavior (`packages/server/src/scripts/remediate-seed-admin.ts`):
 - **Targets only the local seed admin** — `username = 'admin'` with `home_instance IS NULL` and `is_admin = 1`. Replicated/federated users are never touched.
 - **Rotates only `admin123`.** It verifies the current hash against `admin123`; if the password has already been changed, it is a **no-op** ("nothing to do"). It is fully idempotent — safe to run repeatedly.
 - **Never deletes** the account (the default-space ownership constraint above).
-- On rotation it generates a 24-character random password, updates the hash, prints the new password to stdout, **and** writes it to `data/seed-admin-rotated.txt` (mode `0600`, root-owned via the bind-mount). **Store the password somewhere safe, then delete `data/seed-admin-rotated.txt`.**
+- On rotation it generates a 24-character random password, updates the hash, prints the new password to stdout, **and** writes it to `data/seed-admin-rotated.txt` (mode `0600`, **root-owned** — the script runs via `docker exec`, which bypasses the entrypoint's gosu drop and runs as root, so this file is uid 0 until the next container restart re-chowns it). **Store the password somewhere safe, then delete `data/seed-admin-rotated.txt`** (a non-root host user may need `sudo`).
 
 > **Note — sessions are not invalidated.** Rotation changes the stored password hash only; it does **not** revoke existing JWTs. An already-logged-in admin session survives until the token expires (`JWT_EXPIRES_IN`, default 30 days). Rotation closes off *future* logins with the old password; it does not eject a currently active session. If you must terminate live sessions immediately, rotate `JWT_SECRET` (which invalidates **all** tokens instance-wide) and restart.
 
@@ -250,7 +370,7 @@ They do **not** protect against **hardware loss** (disk failure, the box being d
 
 ## 4. Restore
 
-Restores are driven by `./restore.sh` from the host. Because `data/` (including `backspace.db` and `data/backups/`) is **container-owned (root)** via the bind-mount, the host user cannot rewrite those files directly — so the actual swap runs inside a throwaway root `alpine` container that mounts `data/`.
+Restores are driven by `./restore.sh` from the host. Because `data/` (including `backspace.db` and `data/backups/`) is **container-owned (uid 1000)** via the bind-mount, the host user cannot rewrite those files directly — so the actual swap runs inside a throwaway root `alpine` container that mounts `data/`.
 
 ### List snapshots
 
@@ -279,6 +399,17 @@ The pre-restore copy means a mistaken restore is itself undoable: the previous D
 
 > The `pre-restore` reason tag is **not** in the auto-pruned reason set (`pre-migration` / `scheduled` / `manual`), so pre-restore copies are retained until manually cleaned up. Periodically prune old `*-pre-restore.db` files by hand if disk is tight.
 
+### Restoring an older snapshot into a newer build
+
+A snapshot only carries the schema of the build that wrote it. On boot `initDatabase()` re-runs `migrate()`, so a snapshot taken before a migration is brought forward automatically and the restore itself works. What a restore always costs is the **data** written between the snapshot and now.
+
+One case is worth calling out because the loss is silent rather than visible. `user_federation_credentials` (migration `0011`) holds the per-remote secret each user's client presents on other instances (`auth.md` §5b). Restoring a snapshot from before those rows were written leaves the remote accounts holding secrets this instance no longer knows:
+
+- The client self-heals **while a remote token is still valid** — the credential comes back with `provisioned_at` NULL, so `ensureRemoteCredential` rotates that remote account onto a freshly issued secret with no user interaction.
+- Where the token has already expired, the user re-authenticates once through the per-instance login form on that connection. Nothing is permanently lost; nobody is locked out.
+
+No action is required after a restore. Watch `docker compose logs -f backspace` for `[federation] Credential migration deferred` lines, which name any connection that could not be reconciled yet.
+
 ---
 
 ## 5. Image Pinning & Upgrades
@@ -292,7 +423,7 @@ The third-party images are **pinned to explicit tags** in `docker-compose.yml`, 
 
 Pinning makes deploys reproducible — a rebuild pulls the exact same proxy/SFU version every time, so an upstream release can't silently change behavior under you.
 
-The `backspace` image itself defaults to `ghcr.io/thezwiss/backspace:latest` (`BACKSPACE_IMAGE` / `BACKSPACE_IMAGE_TAG`). `latest` is chosen for a frictionless first install, but it is a **moving** tag: operators who want reproducible upgrades should pin `BACKSPACE_IMAGE_TAG` to a released version (e.g. `1.0.0`) in `.env` and bump it deliberately. On the source-build paths (`deploy.sh`, `install.sh`'s fallback) the image is built from the `Dockerfile`, which pins the `node:20-slim` base.
+The `backspace` image itself defaults to `ghcr.io/thezwiss/backspace:latest` (`BACKSPACE_IMAGE` / `BACKSPACE_IMAGE_TAG`). `latest` is chosen for a frictionless first install, but it is a **moving** tag: operators who want reproducible upgrades should pin `BACKSPACE_IMAGE_TAG` to a released version (e.g. `1.0.0`) in `.env` and bump it deliberately. On the source-build paths (`deploy.sh`, `install.sh`'s fallback) the image is built from the `Dockerfile`, which pins the `node:24-slim` base by digest.
 
 **Upgrade procedure:** bump the tag in `docker-compose.yml` → test the new version (locally or on one box) → redeploy. Concretely:
 
@@ -310,6 +441,8 @@ These are accepted constraints of the current deploy model, documented so operat
 
 - **`deploy.sh` still builds on each target host.** The public `install.sh` path now defaults to the prebuilt GHCR image (multi-arch, so a Pi pulls a native image), but `deploy.sh` — Heidi's rsync-then-`up -d --build` helper for `nova`/`orbit` — deliberately builds from the rsynced working tree on the box (it caps the build cache and prunes old images to compensate). A native-module or toolchain regression can still surface on ARM but not x86, or vice-versa, on that path; the CI multi-arch build catches most such regressions before release.
 - **A deploy causes brief downtime + WebSocket reconnect.** `docker compose up -d --build` rebuilds and recreates the `backspace` container; while it restarts, the server is briefly unavailable and every connected client's WebSocket drops and must reconnect. There is no rolling/zero-downtime deploy. Clients reconnect automatically, but in-flight requests during the swap can fail.
+- **Open clients switch to a new web build within about a minute of the deploy, by reloading.** A client in a voice channel or DM call (including one still ringing) keeps running the old build until the call ends, then reloads onto the new one. While any tab in a browser has a call, the other tabs of that browser wait with it. The web and desktop clients behave the same way.
+- **Federation does not carry a port in `DOMAIN`.** The identity helpers (`extractDomain`, the `homeInstance` validation on registration, the hostname comparisons in the federation routes) work on the bare hostname, so two instances that differ only by port would collide and a ported instance cannot register replicated users on a peer. Single-instance use on a custom port is supported; federating such an instance needs the identity audit that `normalizeOriginForCompare` already notes as tracked.
 - **`deploy.sh all` can mask one host failing.** The `all` target runs both deploys in parallel (`deploy … & deploy … & wait`). The visible "Deployment complete." is printed regardless of whether one host's build failed mid-stream; the failure scrolls by in the interleaved output. After an `all` deploy, **confirm `/api/health` on both boxes** rather than trusting the final line. For a high-stakes change, deploy to one box at a time.
 
 ---

@@ -1,54 +1,24 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { useSpaceStore } from '../../../stores/spaceStore';
+import { useTranslation } from 'react-i18next';
+import { useSpaceStore, getApiForOrigin } from '../../../stores/spaceStore';
 import { useUIStore } from '../../../stores/uiStore';
-import { api } from '../../../api/client';
+import { HttpError } from '../../../api/client';
 import { PermissionBits, stringToPermissions, permissionsToString } from '../../../utils/permissions';
+import { PERMISSION_GROUPS, type PermDef, type PermissionGroupId } from '../../../utils/permissionGroups';
+import { usePermissionNames } from '../../ui/OverrideEntry';
+import { describeError } from '../../../i18n/errors';
 import type { Role } from '@backspace/shared';
+import {
+  viewerCanManageRoleAt,
+  useViewerHeldPermissions,
+  viewerCanSwitchBit,
+  viewerCanCreateRoleWith,
+  viewerHoldsEveryBit,
+} from '../../../utils/roleHierarchy';
+import { RoleOrderList } from './RoleOrderList';
+import { LockNote, LOCK_ICON } from '../../ui/LockNote';
 
-// ─── Permission display groups ─────────────────────────────────────────────
-
-interface PermDef {
-  bit: bigint;
-  label: string;
-}
-
-const PERMISSION_GROUPS: { name: string; perms: PermDef[] }[] = [
-  {
-    name: 'General',
-    perms: [
-      { bit: PermissionBits.ADMINISTRATOR, label: 'Administrator' },
-      { bit: PermissionBits.VIEW_CHANNEL, label: 'View Channels' },
-      { bit: PermissionBits.MANAGE_CHANNELS, label: 'Manage Channels' },
-      { bit: PermissionBits.MANAGE_ROLES, label: 'Manage Roles' },
-      { bit: PermissionBits.MANAGE_SPACE, label: 'Manage Space' },
-      { bit: PermissionBits.CREATE_INVITE, label: 'Create Invite' },
-      { bit: PermissionBits.KICK_MEMBERS, label: 'Kick Members' },
-      { bit: PermissionBits.BAN_MEMBERS, label: 'Ban Members' },
-    ],
-  },
-  {
-    name: 'Text',
-    perms: [
-      { bit: PermissionBits.SEND_MESSAGES, label: 'Send Messages' },
-      { bit: PermissionBits.MANAGE_MESSAGES, label: 'Manage Messages' },
-      { bit: PermissionBits.ATTACH_FILES, label: 'Attach Files' },
-      { bit: PermissionBits.READ_MESSAGE_HISTORY, label: 'Read Message History' },
-      { bit: PermissionBits.ADD_REACTIONS, label: 'Add Reactions' },
-    ],
-  },
-  {
-    name: 'Voice',
-    perms: [
-      { bit: PermissionBits.CONNECT, label: 'Connect' },
-      { bit: PermissionBits.SPEAK, label: 'Speak' },
-      { bit: PermissionBits.MUTE_MEMBERS, label: 'Mute Members' },
-      { bit: PermissionBits.DEAFEN_MEMBERS, label: 'Deafen Members' },
-      { bit: PermissionBits.MOVE_MEMBERS, label: 'Move Members' },
-      { bit: PermissionBits.DISCONNECT_MEMBERS, label: 'Disconnect Members' },
-      { bit: PermissionBits.STREAM, label: 'Stream' },
-    ],
-  },
-];
+const ALL_PERMISSION_DEFS: PermDef[] = PERMISSION_GROUPS.flatMap((group) => group.perms);
 
 const PRESET_COLORS = [
   '#b9bbbe', '#a5f3c4', '#ffc9a9', '#c4b5fd', '#93c5fd',
@@ -74,34 +44,32 @@ interface RolesPanelProps {
 }
 
 export function RolesPanel({ spaceId }: RolesPanelProps) {
+  const { t } = useTranslation(['spaces', 'common']);
   const roles = useSpaceStore((s) => s.roles);
   const loadSpaceDetail = useSpaceStore((s) => s.loadSpaceDetail);
+  const space = useSpaceStore((s) => s.spaces.find((sp) => sp.id === spaceId));
+  const members = useSpaceStore((s) => s.members);
+  // A new role starts at the bottom (position 1), so creating one needs a top
+  // role above that (permissions.md, "Role hierarchy").
+  const canCreateRole = !space || viewerCanManageRoleAt(space, members, 1);
 
   const [editingRoleId, setEditingRoleId] = useState<string | null>(null);
   const [isNewRole, setIsNewRole] = useState(false);
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState('');
 
-  // Sort: non-everyone roles by position desc, @everyone always last
-  const sortedRoles = [...roles].sort((a, b) => {
-    const aIsEveryone = a.id === spaceId;
-    const bIsEveryone = b.id === spaceId;
-    if (aIsEveryone) return 1;
-    if (bIsEveryone) return -1;
-    return b.position - a.position;
-  });
-
   const handleCreateRole = async () => {
     setCreating(true);
     setError('');
     try {
-      const uniqueName = getUniqueRoleName('new role', roles);
-      const newRole = await api.roles.create(spaceId, { name: uniqueName });
+      const uniqueName = getUniqueRoleName(t('spaces:roles.defaultName'), roles);
+      // Roles live on the space's own instance (client-federation.md).
+      const newRole = await getApiForOrigin(space?._instanceOrigin ?? '').roles.create(spaceId, { name: uniqueName });
       await loadSpaceDetail(spaceId);
       setIsNewRole(true);
       setEditingRoleId(newRole.id);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to create role');
+      setError(describeError(err));
     } finally {
       setCreating(false);
     }
@@ -128,7 +96,7 @@ export function RolesPanel({ spaceId }: RolesPanelProps) {
 
   return (
     <div className="space-y-5">
-      <h2 className="text-lg font-semibold text-txt-primary mb-6">Roles</h2>
+      <h2 className="text-lg font-semibold text-txt-primary mb-6">{t('spaces:roles.title')}</h2>
       {error && (
         <div className="p-2 bg-accent-rose/10 border border-accent-rose/30 rounded text-txt-danger text-sm">{error}</div>
       )}
@@ -136,52 +104,26 @@ export function RolesPanel({ spaceId }: RolesPanelProps) {
       <div className="sticky top-0 z-10 pointer-events-none pb-3">
         <button
           onClick={handleCreateRole}
-          disabled={creating}
+          disabled={creating || !canCreateRole}
           className="glass-bubble rounded-full px-3 py-1.5 flex items-center gap-1.5 text-sm text-txt-primary hover:text-txt-secondary transition-colors pointer-events-auto disabled:opacity-50"
         >
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
             <line x1="12" y1="5" x2="12" y2="19" />
             <line x1="5" y1="12" x2="19" y2="12" />
           </svg>
-          {creating ? 'Creating...' : 'Create Role'}
+          {creating ? t('spaces:roles.creating') : t('spaces:roles.create')}
         </button>
       </div>
 
       <div>
-        <div className="text-[11px] font-semibold text-txt-tertiary uppercase tracking-wider mb-1.5">Roles</div>
-        <p className="text-xs text-txt-tertiary mb-2">Roles define what permissions members have. Higher roles take priority.</p>
+        <div className="text-[11px] font-semibold text-txt-tertiary uppercase tracking-wider mb-1.5">{t('spaces:roles.listHeading')}</div>
+        <p className="text-xs text-txt-tertiary">{t('spaces:roles.description')}</p>
+        <p className="text-xs text-txt-tertiary mb-2">{t('spaces:roles.hierarchyHint')}</p>
         <div className="rounded-lg bg-white/[0.02] p-2">
-          <div className="space-y-0.5">
-            {sortedRoles.map((role) => {
-              const isEveryone = role.id === spaceId;
-              return (
-                <button
-                  key={role.id}
-                  onClick={() => { setIsNewRole(false); setEditingRoleId(role.id); }}
-                  className="w-full flex items-center justify-between px-3 py-2 rounded hover:bg-interactive-hover transition-colors text-left group"
-                >
-                  <div className="flex items-center gap-2.5 min-w-0">
-                    <div
-                      className="w-3 h-3 rounded-full flex-shrink-0"
-                      style={{ backgroundColor: role.color }}
-                    />
-                    <span className="text-sm text-txt-primary truncate">
-                      {isEveryone ? '@everyone' : role.name}
-                    </span>
-                  </div>
-                  <svg
-                    className="w-4 h-4 text-txt-tertiary group-hover:text-txt-secondary transition-colors flex-shrink-0"
-                    fill="none"
-                    viewBox="0 0 24 24"
-                    stroke="currentColor"
-                    strokeWidth={2}
-                  >
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
-                  </svg>
-                </button>
-              );
-            })}
-          </div>
+          <RoleOrderList
+            spaceId={spaceId}
+            onOpen={(roleId) => { setIsNewRole(false); setEditingRoleId(roleId); }}
+          />
         </div>
       </div>
     </div>
@@ -200,16 +142,34 @@ interface RoleEditViewProps {
 }
 
 function RoleEditView({ role, spaceId, isNew, onBack, onDeleted, onCopied }: RoleEditViewProps) {
+  const { t } = useTranslation(['spaces', 'common']);
+  const permissionNames = usePermissionNames();
   const loadSpaceDetail = useSpaceStore((s) => s.loadSpaceDetail);
   const roles = useSpaceStore((s) => s.roles);
+  const space = useSpaceStore((s) => s.spaces.find((sp) => sp.id === spaceId));
+  const members = useSpaceStore((s) => s.members);
   const isEveryone = role.id === spaceId;
+  // Roles at or above the viewer's top role can be looked at, not changed
+  // (permissions.md, "Role hierarchy"); the server refuses the change anyway.
+  const canEdit = !space || viewerCanManageRoleAt(space, members, role.position);
+  // Held-bits rule (permissions.md): only bits the viewer holds can be
+  // switched, and a copy can only carry bits they hold.
+  const held = useViewerHeldPermissions(spaceId);
+  const copyCarriesUnheld = !viewerCanCreateRoleWith(held, stringToPermissions(role.permissions));
+  const canCopy = (!space || viewerCanManageRoleAt(space, members, 1)) && !copyCarriesUnheld;
+  // Deleting switches the role's bits off for everyone holding it.
+  const offersDelete = !isEveryone && canEdit;
+  const deleteCarriesUnheld = offersDelete && !viewerHoldsEveryBit(held, stringToPermissions(role.permissions));
+  const hasUnheldToggle = canEdit && ALL_PERMISSION_DEFS.some((perm) => !viewerCanSwitchBit(held, perm.bit));
+  // Every role write goes to the space's own instance (client-federation.md).
+  const roleApi = () => getApiForOrigin(space?._instanceOrigin ?? '').roles;
 
   const [draftName, setDraftName] = useState(role.name);
   const [nameError, setNameError] = useState('');
   const nameInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    if (!isEveryone && nameInputRef.current) {
+    if (!isEveryone && canEdit && nameInputRef.current) {
       nameInputRef.current.focus();
       nameInputRef.current.select();
     }
@@ -217,11 +177,11 @@ function RoleEditView({ role, spaceId, isNew, onBack, onDeleted, onCopied }: Rol
 
   const validateName = (name: string): string => {
     const trimmed = name.trim();
-    if (!trimmed) return 'Role name cannot be empty';
+    if (!trimmed) return t('spaces:roles.nameEmpty');
     const isDuplicate = roles.some(
       (r) => r.id !== role.id && r.name.toLowerCase() === trimmed.toLowerCase()
     );
-    return isDuplicate ? 'A role with this name already exists' : '';
+    return isDuplicate ? t('spaces:roles.nameDuplicate') : '';
   };
 
   const [draftColor, setDraftColor] = useState(role.color);
@@ -240,6 +200,7 @@ function RoleEditView({ role, spaceId, isNew, onBack, onDeleted, onCopied }: Rol
   const hasChanges = hasNameChange || hasColorChange || hasPermChange;
 
   const togglePermission = (bit: bigint) => {
+    if (!canEdit || !viewerCanSwitchBit(held, bit)) return;
     setDraftPermissions((prev) => (prev & bit) !== 0n ? prev & ~bit : prev | bit);
   };
 
@@ -252,15 +213,15 @@ function RoleEditView({ role, spaceId, isNew, onBack, onDeleted, onCopied }: Rol
       if (hasNameChange) data.name = draftName.trim();
       if (hasColorChange) data.color = draftColor;
       if (hasPermChange) data.permissions = permissionsToString(draftPermissions);
-      await api.roles.update(spaceId, role.id, data);
+      await roleApi().update(spaceId, role.id, data);
       await loadSpaceDetail(spaceId);
-      addToast('Role saved', 'success', 2000);
+      addToast(t('spaces:roles.saved'), 'success', 2000);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Failed to save role';
-      if (msg.includes('already exists')) {
-        setNameError(msg);
+      // A duplicate name belongs on the name field, not in the save banner.
+      if (err instanceof HttpError && err.code === 'role_name_taken') {
+        setNameError(t('spaces:roles.nameDuplicate'));
       } else {
-        setSaveError(msg);
+        setSaveError(describeError(err));
       }
     } finally {
       setSaving(false);
@@ -277,6 +238,7 @@ function RoleEditView({ role, spaceId, isNew, onBack, onDeleted, onCopied }: Rol
   };
 
   const handleDelete = async () => {
+    if (deleteCarriesUnheld) return;
     if (!confirmDelete) {
       setConfirmDelete(true);
       return;
@@ -284,11 +246,11 @@ function RoleEditView({ role, spaceId, isNew, onBack, onDeleted, onCopied }: Rol
     setDeleting(true);
     setSaveError('');
     try {
-      await api.roles.delete(spaceId, role.id);
+      await roleApi().delete(spaceId, role.id);
       await loadSpaceDetail(spaceId);
       onDeleted();
     } catch (err) {
-      setSaveError(err instanceof Error ? err.message : 'Failed to delete role');
+      setSaveError(describeError(err));
       setConfirmDelete(false);
     } finally {
       setDeleting(false);
@@ -301,8 +263,8 @@ function RoleEditView({ role, spaceId, isNew, onBack, onDeleted, onCopied }: Rol
     setCopying(true);
     setSaveError('');
     try {
-      const uniqueName = getUniqueRoleName(`Copy of ${role.name}`, roles);
-      const newRole = await api.roles.create(spaceId, {
+      const uniqueName = getUniqueRoleName(t('spaces:roles.copyName', { name: role.name }), roles);
+      const newRole = await roleApi().create(spaceId, {
         name: uniqueName,
         color: role.color,
         permissions: role.permissions ?? undefined,
@@ -310,9 +272,17 @@ function RoleEditView({ role, spaceId, isNew, onBack, onDeleted, onCopied }: Rol
       await loadSpaceDetail(spaceId);
       onCopied(newRole.id);
     } catch (err) {
-      setSaveError(err instanceof Error ? err.message : 'Failed to copy role');
+      setSaveError(describeError(err));
     } finally {
       setCopying(false);
+    }
+  };
+
+  const groupTitle = (id: PermissionGroupId): string => {
+    switch (id) {
+      case 'general': return t('spaces:roles.groups.general');
+      case 'text': return t('spaces:roles.groups.text');
+      case 'voice': return t('spaces:roles.groups.voice');
     }
   };
 
@@ -327,24 +297,35 @@ function RoleEditView({ role, spaceId, isNew, onBack, onDeleted, onCopied }: Rol
           <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
             <path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" />
           </svg>
-          Back to roles
+          {t('spaces:roles.backToList')}
         </button>
       </div>
 
       {isNew && !hasChanges && (
         <div className="p-2 bg-status-online/10 border border-status-online/30 rounded text-status-online text-sm">
-          Role created — customize it below
+          {t('spaces:roles.created')}
         </div>
+      )}
+
+      {!canEdit && <LockNote>{t('spaces:roles.aboveYou')}</LockNote>}
+
+      {(hasUnheldToggle || copyCarriesUnheld) && (
+        <LockNote>
+          {hasUnheldToggle && t('spaces:roles.unheldLocked')}
+          {hasUnheldToggle && copyCarriesUnheld && ' '}
+          {copyCarriesUnheld && t(deleteCarriesUnheld ? 'spaces:roles.copyDeleteUnheld' : 'spaces:roles.copyUnheld')}
+        </LockNote>
       )}
 
       {/* Identity card (Name + Color — not shown for @everyone) */}
       {!isEveryone && (
         <div>
-          <div className="text-[11px] font-semibold text-txt-tertiary uppercase tracking-wider mb-1.5">Identity</div>
-          <div className="rounded-lg bg-white/[0.02] p-3.5 space-y-4">
+          <div className="text-[11px] font-semibold text-txt-tertiary uppercase tracking-wider mb-1.5">{t('spaces:roles.identity')}</div>
+          {/* A disabled fieldset disables every control inside it. */}
+          <fieldset disabled={!canEdit} className={`rounded-lg bg-white/[0.02] p-3.5 space-y-4 min-w-0 ${canEdit ? '' : 'opacity-60'}`}>
             <div>
               <label className="block text-xs text-txt-secondary mb-1.5">
-                Role Name
+                {t('spaces:roles.nameLabel')}
               </label>
               <input
                 ref={nameInputRef}
@@ -363,7 +344,7 @@ function RoleEditView({ role, spaceId, isNew, onBack, onDeleted, onCopied }: Rol
             </div>
             <div>
               <label className="block text-xs text-txt-secondary mb-1.5">
-                Role Color
+                {t('spaces:roles.colorLabel')}
               </label>
               <div className="flex items-center gap-2 flex-wrap">
                 {PRESET_COLORS.map((c) => (
@@ -397,15 +378,15 @@ function RoleEditView({ role, spaceId, isNew, onBack, onDeleted, onCopied }: Rol
                 />
               </div>
             </div>
-          </div>
+          </fieldset>
         </div>
       )}
 
       {/* Permission groups — each gets its own section card */}
       {PERMISSION_GROUPS.map((group) => (
-        <div key={group.name}>
+        <div key={group.id}>
           <div className="text-[11px] font-semibold text-txt-tertiary uppercase tracking-wider mb-1.5">
-            {group.name}
+            {groupTitle(group.id)}
           </div>
           <div className="rounded-lg bg-white/[0.02] p-3.5">
             <div className="space-y-1">
@@ -414,31 +395,57 @@ function RoleEditView({ role, spaceId, isNew, onBack, onDeleted, onCopied }: Rol
                 const hasAdmin = (draftPermissions & PermissionBits.ADMINISTRATOR) !== 0n;
                 const isOn = isAdminBit ? hasAdmin : hasAdmin || (draftPermissions & perm.bit) !== 0n;
                 const isInherited = !isAdminBit && hasAdmin;
+                const isUnheld = canEdit && !viewerCanSwitchBit(held, perm.bit);
+                const isLocked = isInherited || !canEdit || isUnheld;
+                const name = permissionNames[perm.key];
                 return (
                   <label
-                    key={perm.label}
-                    className={`flex items-center justify-between py-1.5 px-2 rounded cursor-pointer group/perm ${
-                      isInherited ? 'opacity-50 cursor-default' : 'hover:bg-interactive-hover'
+                    key={perm.key}
+                    className={`flex items-center justify-between gap-3 py-1.5 px-2 rounded group/perm ${
+                      isLocked ? 'cursor-default' : 'cursor-pointer hover:bg-interactive-hover'
                     }`}
                   >
-                    <span className={`text-sm ${isAdminBit ? 'text-txt-danger font-medium' : 'text-txt-primary'}`}>
-                      {perm.label}
+                    <span className={`text-sm ${isLocked ? 'opacity-50 ' : ''}${isAdminBit ? 'text-txt-danger font-medium' : 'text-txt-primary'}`}>
+                      {name}
                     </span>
-                    <div
-                      onClick={(e) => {
-                        e.preventDefault();
-                        if (!isInherited) togglePermission(perm.bit);
-                      }}
-                      className={`relative w-9 h-5 rounded-full transition-colors ${
-                        isInherited ? 'cursor-default' : 'cursor-pointer'
-                      } ${isOn ? 'bg-accent-primary' : 'bg-interactive-muted'}`}
-                    >
+                    <span className="flex items-center gap-2 flex-shrink-0">
+                      {isUnheld && (
+                        <svg
+                          width="12" height="12" viewBox="0 0 24 24" fill="currentColor"
+                          className="text-txt-tertiary"
+                          role="img"
+                          aria-label={t('spaces:roles.unheldPermission')}
+                        >
+                          <title>{t('spaces:roles.unheldPermission')}</title>
+                          <path d={LOCK_ICON} />
+                        </svg>
+                      )}
                       <div
-                        className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow-sm transition-transform ${
-                          isOn ? 'translate-x-4' : 'translate-x-0.5'
-                        }`}
-                      />
-                    </div>
+                        role="switch"
+                        aria-checked={isOn}
+                        aria-disabled={isLocked}
+                        aria-label={name}
+                        tabIndex={isLocked ? -1 : 0}
+                        onClick={(e) => {
+                          e.preventDefault();
+                          if (!isLocked) togglePermission(perm.bit);
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key !== ' ' && e.key !== 'Enter') return;
+                          e.preventDefault();
+                          if (!isLocked) togglePermission(perm.bit);
+                        }}
+                        className={`relative w-9 h-5 rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-primary ${
+                          isLocked ? 'cursor-default opacity-50' : 'cursor-pointer'
+                        } ${isOn ? 'bg-accent-primary' : 'bg-interactive-muted'}`}
+                      >
+                        <div
+                          className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow-sm transition-transform ${
+                            isOn ? 'translate-x-4' : 'translate-x-0.5'
+                          }`}
+                        />
+                      </div>
+                    </span>
                   </label>
                 );
               })}
@@ -461,14 +468,14 @@ function RoleEditView({ role, spaceId, isNew, onBack, onDeleted, onCopied }: Rol
                     onClick={handleDiscard}
                     className="px-3 py-1 text-sm text-txt-tertiary hover:text-txt-secondary transition-colors"
                   >
-                    Discard
+                    {t('spaces:settings.discardChanges')}
                   </button>
                   <button
                     onClick={handleSave}
                     disabled={saving || (!isEveryone && !draftName.trim()) || !!nameError}
                     className="px-3 py-1.5 bg-accent-primary hover:bg-accent-primary/80 text-white text-sm font-medium rounded-full transition-colors disabled:opacity-50"
                   >
-                    {saving ? 'Saving...' : 'Save'}
+                    {saving ? t('common:states.saving') : t('common:actions.save')}
                   </button>
                 </>
               )}
@@ -477,24 +484,24 @@ function RoleEditView({ role, spaceId, isNew, onBack, onDeleted, onCopied }: Rol
               )}
               <button
                 onClick={handleCopy}
-                disabled={copying}
+                disabled={copying || !canCopy}
                 className="px-3 py-1.5 text-sm font-medium rounded-full text-txt-secondary hover:bg-interactive-hover transition-colors disabled:opacity-50"
               >
-                {copying ? 'Copying...' : 'Copy Role'}
+                {copying ? t('spaces:roles.copying') : t('spaces:roles.copy')}
               </button>
-              {!isEveryone && (
+              {offersDelete && (
                 <>
                   <div className="w-px h-5 bg-white/10" />
                   <button
                     onClick={handleDelete}
-                    disabled={deleting}
+                    disabled={deleting || deleteCarriesUnheld}
                     className={`px-3 py-1.5 text-sm font-medium rounded-full transition-colors disabled:opacity-50 ${
                       confirmDelete
                         ? 'bg-accent-rose/15 text-accent-rose'
                         : 'text-accent-rose hover:bg-accent-rose/10'
                     }`}
                   >
-                    {deleting ? 'Deleting...' : confirmDelete ? 'Confirm?' : 'Delete Role'}
+                    {deleting ? t('spaces:roles.deleting') : confirmDelete ? t('spaces:roles.confirmDelete') : t('spaces:roles.delete')}
                   </button>
                 </>
               )}

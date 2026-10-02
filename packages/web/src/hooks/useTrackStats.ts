@@ -12,6 +12,8 @@ export interface AudioTrackStat {
   key: string;
   direction: TrackDirection;
   source: TrackSource;
+  /** LiveKit identity of the publisher; the only safe key to match a track to a participant. */
+  participantIdentity: string | null;
   participantName: string | null;
   bitrate: number;
   codec: string | null;
@@ -23,6 +25,8 @@ export interface VideoTrackStat {
   key: string;
   direction: TrackDirection;
   source: TrackSource;
+  /** LiveKit identity of the publisher; the only safe key to match a track to a participant. */
+  participantIdentity: string | null;
   participantName: string | null;
   bitrate: number;
   codec: string | null;
@@ -32,6 +36,12 @@ export interface VideoTrackStat {
   fps: number | null;
   qualityLimitation: string | null;
   simulcastLayer: string | null;
+  packetLoss: number | null;
+  jitter: number | null;
+  qpSumDelta: number | null;
+  nackCountDelta: number | null;
+  pliCountDelta: number | null;
+  freezeCountDelta: number | null;
 }
 
 /**
@@ -63,6 +73,7 @@ export interface TrackStatsSnapshot {
 interface TrackIdentity {
   source: TrackSource;
   direction: TrackDirection;
+  participantIdentity: string | null;
   participantName: string | null;
 }
 
@@ -72,6 +83,10 @@ interface PrevSample {
   timestamp: number;
   packetsRecv: number;
   packetsLost: number;
+  qpSum: number;
+  nackCount: number;
+  pliCount: number;
+  freezeCount: number;
 }
 
 // ── Helpers ──
@@ -229,6 +244,7 @@ export function useTrackStats(enabled: boolean): TrackStatsSnapshot | null {
           identityMap.set(mst.id, {
             source: mapSource(pub.source),
             direction: 'send',
+            participantIdentity: null,
             participantName: null,
           });
         }
@@ -243,6 +259,7 @@ export function useTrackStats(enabled: boolean): TrackStatsSnapshot | null {
             identityMap.set(mst.id, {
               source: mapSource(pub.source),
               direction: 'recv',
+              participantIdentity: rp.identity,
               participantName: name,
             });
           }
@@ -312,6 +329,10 @@ export function useTrackStats(enabled: boolean): TrackStatsSnapshot | null {
                 timestamp: now,
                 packetsRecv: 0,
                 packetsLost: 0,
+                qpSum: 0,
+                nackCount: report.nackCount ?? 0,
+                pliCount: report.pliCount ?? 0,
+                freezeCount: 0,
               });
 
               if (bitrate > 0) {
@@ -319,6 +340,7 @@ export function useTrackStats(enabled: boolean): TrackStatsSnapshot | null {
                   key: ssrcKey,
                   direction: 'send',
                   source: identity.source,
+                  participantIdentity: null,
                   participantName: null,
                   bitrate,
                   codec,
@@ -333,6 +355,9 @@ export function useTrackStats(enabled: boolean): TrackStatsSnapshot | null {
               const prevFrames = prevEntry?.frames ?? 0;
               const deltaFrames = framesEncoded - prevFrames;
               const fps = (prevEntry && deltaSeconds > 0) ? Math.round(deltaFrames / deltaSeconds) : null;
+              const qpSum = report.qpSum ?? 0;
+              const nackCount = report.nackCount ?? 0;
+              const pliCount = report.pliCount ?? 0;
 
               let width: number | null = report.frameWidth > 0 ? report.frameWidth : null;
               let height: number | null = report.frameHeight > 0 ? report.frameHeight : null;
@@ -353,6 +378,10 @@ export function useTrackStats(enabled: boolean): TrackStatsSnapshot | null {
                 timestamp: now,
                 packetsRecv: 0,
                 packetsLost: 0,
+                qpSum,
+                nackCount,
+                pliCount,
+                freezeCount: 0,
               });
 
               if (bitrate > 0 || (width !== null && height !== null)) {
@@ -360,6 +389,7 @@ export function useTrackStats(enabled: boolean): TrackStatsSnapshot | null {
                   key: ssrcKey,
                   direction: 'send',
                   source: identity.source,
+                  participantIdentity: null,
                   participantName: null,
                   bitrate,
                   codec,
@@ -369,6 +399,12 @@ export function useTrackStats(enabled: boolean): TrackStatsSnapshot | null {
                   fps,
                   qualityLimitation: report.qualityLimitationReason ?? null,
                   simulcastLayer: null,
+                  packetLoss: null,
+                  jitter: null,
+                  qpSumDelta: prevEntry && report.qpSum != null ? qpSum - prevEntry.qpSum : null,
+                  nackCountDelta: prevEntry ? nackCount - prevEntry.nackCount : null,
+                  pliCountDelta: prevEntry ? pliCount - prevEntry.pliCount : null,
+                  freezeCountDelta: null,
                 });
               }
             }
@@ -449,6 +485,10 @@ export function useTrackStats(enabled: boolean): TrackStatsSnapshot | null {
                 timestamp: now,
                 packetsRecv: packetsRecv,
                 packetsLost: packetsLost,
+                qpSum: 0,
+                nackCount: report.nackCount ?? 0,
+                pliCount: report.pliCount ?? 0,
+                freezeCount: 0,
               });
 
               // Set network jitter from first inbound audio
@@ -461,6 +501,7 @@ export function useTrackStats(enabled: boolean): TrackStatsSnapshot | null {
                   key: ssrcKey,
                   direction: 'recv',
                   source: identity.source,
+                  participantIdentity: identity.participantIdentity,
                   participantName: identity.participantName,
                   bitrate,
                   codec,
@@ -475,6 +516,10 @@ export function useTrackStats(enabled: boolean): TrackStatsSnapshot | null {
               const prevFrames = prevEntry?.frames ?? 0;
               const deltaFrames = framesDecoded - prevFrames;
               const fps = (prevEntry && deltaSeconds > 0) ? Math.round(deltaFrames / deltaSeconds) : null;
+              const qpSum = report.qpSum ?? 0;
+              const nackCount = report.nackCount ?? 0;
+              const pliCount = report.pliCount ?? 0;
+              const freezeCount = report.freezeCount ?? 0;
 
               const width: number | null = report.frameWidth > 0 ? report.frameWidth : null;
               const height: number | null = report.frameHeight > 0 ? report.frameHeight : null;
@@ -485,6 +530,10 @@ export function useTrackStats(enabled: boolean): TrackStatsSnapshot | null {
                 timestamp: now,
                 packetsRecv: packetsRecv,
                 packetsLost: packetsLost,
+                qpSum,
+                nackCount,
+                pliCount,
+                freezeCount,
               });
 
               if (bitrate > 0 || (width !== null && height !== null)) {
@@ -492,6 +541,7 @@ export function useTrackStats(enabled: boolean): TrackStatsSnapshot | null {
                   key: ssrcKey,
                   direction: 'recv',
                   source: identity.source,
+                  participantIdentity: identity.participantIdentity,
                   participantName: identity.participantName,
                   bitrate,
                   codec,
@@ -501,6 +551,12 @@ export function useTrackStats(enabled: boolean): TrackStatsSnapshot | null {
                   fps,
                   qualityLimitation: null,
                   simulcastLayer: inferSimulcastLayer(width, height),
+                  packetLoss: perTrackLoss,
+                  jitter,
+                  qpSumDelta: prevEntry && report.qpSum != null ? qpSum - prevEntry.qpSum : null,
+                  nackCountDelta: prevEntry ? nackCount - prevEntry.nackCount : null,
+                  pliCountDelta: prevEntry ? pliCount - prevEntry.pliCount : null,
+                  freezeCountDelta: prevEntry ? freezeCount - prevEntry.freezeCount : null,
                 });
               }
             }
@@ -514,10 +570,7 @@ export function useTrackStats(enabled: boolean): TrackStatsSnapshot | null {
         network.packetLoss = (totalPacketsLost / totalPackets) * 100;
       }
 
-      // ── Step F: Filter paused backup codec tracks ──
-      // With backupCodec enabled, the publisher may have two concurrent outbound
-      // video tracks for the same source (e.g. VP9 + H.264). When one is paused
-      // by dynacast (0 bitrate), hide it if an active sibling exists.
+      // ── Step F: Filter a dynacast-paused simulcast backup codec track ──
       const filteredVideoTracks = videoTracks.filter((track) => {
         if (track.direction !== 'send' || track.bitrate > 0) return true;
         const hasActiveSibling = videoTracks.some(
@@ -541,7 +594,7 @@ export function useTrackStats(enabled: boolean): TrackStatsSnapshot | null {
     };
 
     poll();
-    const interval = setInterval(poll, 1000);
+    const interval = setInterval(poll, 2000);
     return () => clearInterval(interval);
   }, [enabled]);
 

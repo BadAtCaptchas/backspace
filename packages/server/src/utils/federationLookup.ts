@@ -2,6 +2,7 @@ import { eq } from 'drizzle-orm';
 import { getDb } from '../db/index.js';
 import * as schema from '../db/schema.js';
 import { buildFederationHeaders, getOurOrigin } from './federationAuth.js';
+import { federationFetch } from './federationFetch.js';
 import type { FederationUserLookupProfile, FederationUserLookupResponse } from '@backspace/shared';
 
 const LOOKUP_TIMEOUT_MS = 10_000;
@@ -38,12 +39,12 @@ export async function lookupRemoteUser(peerOrigin: string, username: string): Pr
 
   let response: Response;
   try {
-    response = await fetch(`${peerOrigin}/api/federation/users/lookup`, {
+    response = await federationFetch(peerOrigin, '/api/federation/users/lookup', {
       method: 'POST',
       headers,
       body,
       signal: AbortSignal.timeout(LOOKUP_TIMEOUT_MS),
-    });
+    }, 'approved');
   } catch {
     // Network error, timeout, AbortError — all unreachable.
     return { ok: false, reason: 'unreachable' };
@@ -88,14 +89,29 @@ export async function lookupRemoteUser(peerOrigin: string, username: string): Pr
 
 /**
  * Reverse-lookup: ask the peer for a user by homeUserId. Used by the stub
- * backfill worker to translate legacy snowflake-named stubs into realname-named
- * stubs. Mirrors lookupRemoteUser's auth + error semantics.
+ * backfill worker and by `resolveRemoteIdentityForClient` to learn the handle
+ * of a remote user met without one. Same auth and error semantics as
+ * `lookupRemoteUser`: only a missing peer record throws.
  *
- * `not_found` here means "the peer does not host a native non-deleted user
- * with that homeUserId" — including the tombstone case. Caller should leave
- * the local stub untouched and retry on the next peer activation.
+ * - 200 `{ found: true, user }` → ok.
+ * - 200 `{ found: false }` → `not_found`: the peer does not host a native,
+ *   non-deleted user with that homeUserId (including the tombstone case). This
+ *   is the only authoritative "no such user"; callers may act on it.
+ * - 429 → `rate_limited`.
+ * - Network error, timeout, any other status (404 from a peer without the
+ *   route, 403 on an auth desync, 5xx) and any other 200 body (not JSON, `{}`,
+ *   `found: true` without a user) → `unreachable`, logged for operators. None
+ *   of these is an answer about the user.
+ *
+ * `options.timeoutMs` shortens the default 10s wait for callers that hold a
+ * user's request open (`resolveRemoteIdentityForClient`); a timeout is
+ * `unreachable`.
  */
-export async function lookupRemoteUserByHomeId(peerOrigin: string, homeUserId: string): Promise<LookupResult> {
+export async function lookupRemoteUserByHomeId(
+  peerOrigin: string,
+  homeUserId: string,
+  options: { timeoutMs?: number } = {},
+): Promise<LookupResult> {
   const db = getDb();
   const peer = db
     .select()
@@ -112,12 +128,12 @@ export async function lookupRemoteUserByHomeId(peerOrigin: string, homeUserId: s
 
   let response: Response;
   try {
-    response = await fetch(`${peerOrigin}/api/federation/users/by-home-id`, {
+    response = await federationFetch(peerOrigin, '/api/federation/users/by-home-id', {
       method: 'POST',
       headers,
       body,
-      signal: AbortSignal.timeout(LOOKUP_TIMEOUT_MS),
-    });
+      signal: AbortSignal.timeout(options.timeoutMs ?? LOOKUP_TIMEOUT_MS),
+    }, 'approved');
   } catch {
     return { ok: false, reason: 'unreachable' };
   }
@@ -129,15 +145,17 @@ export async function lookupRemoteUserByHomeId(peerOrigin: string, homeUserId: s
   }
 
   if (!response.ok) {
-    throw new Error(`lookupRemoteUserByHomeId: peer ${peerOrigin} returned HTTP ${response.status}`);
+    console.warn(`[federation] lookupRemoteUserByHomeId: peer ${peerOrigin} returned HTTP ${response.status} — treating as unreachable`);
+    return { ok: false, reason: 'unreachable' };
   }
 
-  const json = (await response.json()) as FederationUserLookupResponse;
-  if (!json) {
-    throw new Error(`lookupRemoteUserByHomeId: peer ${peerOrigin} returned empty body`);
-  }
-  if (json.found !== true || !json.user || typeof json.user.homeUserId !== 'string') {
+  const json = (await response.json().catch(() => null)) as FederationUserLookupResponse | null;
+  if (json && json.found === false) {
     return { ok: false, reason: 'not_found' };
+  }
+  if (!json || json.found !== true || !json.user || typeof json.user.homeUserId !== 'string') {
+    console.warn(`[federation] lookupRemoteUserByHomeId: peer ${peerOrigin} returned malformed body — treating as unreachable`);
+    return { ok: false, reason: 'unreachable' };
   }
 
   return {

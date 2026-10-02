@@ -35,6 +35,21 @@ export interface TwoInstanceHarness {
   cleanup: () => Promise<void>;
 }
 
+/**
+ * Ask the kernel for a free port by binding one and letting go of it.
+ *
+ * This is inherently time-of-check-to-time-of-use: the socket is closed before
+ * the spawned instance binds, so anything on the box can take the port in
+ * between — most realistically one of the other vitest workers running this
+ * same dance, since the federation suites boot several instances each in
+ * parallel. The loser's `tsx` exits EADDRINUSE during boot, which surfaces as
+ * "exited during boot (code=1)" and reads like a server crash.
+ *
+ * The window cannot be closed from here (the port is handed to a child process
+ * through the environment, so the listening socket cannot be passed along), so
+ * `spawnInstance` retries instead. Callers that need a SPECIFIC port pass one
+ * and opt out of that retry — see its `port` option.
+ */
 async function allocateEphemeralPort(): Promise<number> {
   return new Promise((resolve, reject) => {
     const srv = createServer();
@@ -51,20 +66,64 @@ async function allocateEphemeralPort(): Promise<number> {
   });
 }
 
-async function waitForReady(origin: string, proc: ChildProcess, logPath: string, timeoutMs = 20_000): Promise<void> {
+// Ceiling on how long a spawned instance may take to answer /api/instance/info.
+// Raised from 20s: the federation e2e suites run several files in parallel, each
+// booting up to four instances, so a shared CI runner can have a dozen `tsx`
+// processes competing during startup. This only bounds how long we wait before
+// declaring failure — a healthy boot still returns as soon as it is ready — so a
+// genuine hang is still caught well inside the 90-180s hook timeouts.
+const READY_TIMEOUT_MS = 60_000;
+
+/** See `FEDERATION_BACKOFF_DIVISOR` in `spawnOnPort`. */
+const HARNESS_BACKOFF_DIVISOR = 30;
+
+/**
+ * How many extra ports a harness-allocated instance may try before giving up.
+ *
+ * Each retry costs one lost boot, and a collision is already rare — this is
+ * sized to absorb an unlucky burst on a loaded runner, not to paper over a port
+ * that is permanently occupied. A genuine boot failure is not retried at all.
+ */
+const PORT_COLLISION_RETRIES = 4;
+
+/**
+ * True when a spawned instance died because something else owned its port.
+ *
+ * Read from the log rather than the exit code: the child exits 1 for every
+ * fatal boot error, so the code alone cannot tell a lost port race from a real
+ * failure, and retrying a real failure would turn one clear error into five.
+ */
+export async function exitedOnPortCollision(logPath: string): Promise<boolean> {
+  try {
+    return /EADDRINUSE/.test(await readFile(logPath, 'utf8'));
+  } catch {
+    // No log to read means no evidence of a collision; treat it as a real failure.
+    return false;
+  }
+}
+
+async function waitForReady(origin: string, proc: ChildProcess, logPath: string, timeoutMs = READY_TIMEOUT_MS): Promise<void> {
   const deadline = Date.now() + timeoutMs;
-  let exited = false;
-  let exitInfo: { code: number | null; signal: NodeJS.Signals | null } | null = null;
+  // Held in one object rather than two `let`s: TypeScript's control-flow
+  // analysis does not track assignments made inside a callback, so a `let`
+  // read after the loop narrows to its initializer and the fields below become
+  // `never`. Property reads are not narrowed that way.
+  const exit: { happened: boolean; code: number | null; signal: NodeJS.Signals | null } = {
+    happened: false,
+    code: null,
+    signal: null,
+  };
   const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
-    exited = true;
-    exitInfo = { code, signal };
+    exit.happened = true;
+    exit.code = code;
+    exit.signal = signal;
   };
   proc.once('exit', onExit);
   try {
     while (Date.now() < deadline) {
-      if (exited) {
+      if (exit.happened) {
         throw new Error(
-          `Instance ${origin} exited during boot (code=${exitInfo?.code}, signal=${exitInfo?.signal}). ` +
+          `Instance ${origin} exited during boot (code=${exit.code}, signal=${exit.signal}). ` +
           `See log at ${logPath}`,
         );
       }
@@ -82,9 +141,17 @@ async function waitForReady(origin: string, proc: ChildProcess, logPath: string,
   }
 }
 
-export async function spawnInstance(opts: {
+export interface SpawnInstanceOptions {
   domain: string;
-  port: number;
+  /**
+   * Bind this exact port instead of letting the harness allocate one.
+   *
+   * Supplying a port also opts out of collision retry: a caller that names a
+   * port needs THAT port — `simulateReset` respawns an instance at the origin
+   * its peers already address — and quietly moving to a different one would
+   * break the contract it is relying on rather than fix anything.
+   */
+  port?: number;
   dbPath: string;
   storagePath: string;
   jwtSecret: string;
@@ -99,23 +166,90 @@ export async function spawnInstance(opts: {
    * are unaffected. See realHandshake.ts and federationAuth.ts:187.
    */
   publicOriginAsTransport?: boolean;
-}): Promise<SpawnedInstance> {
-  const origin = `http://127.0.0.1:${opts.port}`;
+  /**
+   * When true, omit `DISABLE_FEDERATION_WORKERS` so the spawned instance runs
+   * the real background workers — most importantly the outbox delivery loop
+   * (1s tick), which is what actually POSTs queued DM relay events to peers.
+   * Required by any test that asserts a relay *arrived* rather than merely that
+   * it was queued. Default off — existing suites keep the quiet profile.
+   */
+  enableFederationWorkers?: boolean;
+  /**
+   * LiveKit credentials for this instance. `generateFederatedCallToken` mints a
+   * JWT locally with `livekit-server-sdk`'s `AccessToken` and never contacts a
+   * LiveKit server, so a synthetic key/secret is enough to exercise the whole
+   * federated call-start path offline. Default: LiveKit blanked (voice off).
+   */
+  livekit?: { url: string; apiKey: string; apiSecret: string };
+  /**
+   * Base URL of a space-directory hub for this instance's pinger. Unset (the
+   * default) disables the pinger: the child gets `DIRECTORY_ENDPOINT=''`,
+   * which is the pinger's own guard. Only the directory e2e test points this
+   * at its local stub hub.
+   */
+  directoryEndpoint?: string;
+}
+
+/**
+ * Boot one instance, retrying on a lost port race.
+ *
+ * With an explicit `port` this is a single attempt, exactly as before. Without
+ * one, a boot that died on EADDRINUSE is re-attempted on a freshly allocated
+ * port; every other boot failure propagates on the first try.
+ */
+export async function spawnInstance(opts: SpawnInstanceOptions): Promise<SpawnedInstance> {
+  if (opts.port !== undefined) return spawnOnPort(opts.port, opts);
+
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= PORT_COLLISION_RETRIES; attempt++) {
+    const port = await allocateEphemeralPort();
+    try {
+      return await spawnOnPort(port, opts);
+    } catch (err) {
+      if (!(await exitedOnPortCollision(opts.logPath))) throw err;
+      lastError = err;
+    }
+  }
+  throw new Error(
+    `Instance ${opts.domain} lost the port race ${PORT_COLLISION_RETRIES + 1} times in a row. ` +
+    `Last failure: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
+  );
+}
+
+async function spawnOnPort(port: number, opts: SpawnInstanceOptions): Promise<SpawnedInstance> {
+  const origin = `http://127.0.0.1:${port}`;
   const env: Record<string, string> = {
     ...process.env,
     NODE_ENV: 'test',
     ENABLE_TEST_ROUTES: '1',
-    DISABLE_FEDERATION_WORKERS: '1',
-    PORT: String(opts.port),
+    PORT: String(port),
     HOST: '127.0.0.1',
     DOMAIN: opts.domain,
     DB_PATH: opts.dbPath,
     STORAGE_PATH: opts.storagePath,
     JWT_SECRET: opts.jwtSecret,
-    LIVEKIT_URL: '',
-    LIVEKIT_API_KEY: '',
-    LIVEKIT_API_SECRET: '',
+    LIVEKIT_URL: opts.livekit?.url ?? '',
+    LIVEKIT_API_KEY: opts.livekit?.apiKey ?? '',
+    LIVEKIT_API_SECRET: opts.livekit?.apiSecret ?? '',
+    // Every instance in this harness binds 127.0.0.1, which is exactly the
+    // LAN-only shape the flag exists for: an origin a caller asserted (a friend
+    // handle, a peering callback) is otherwise required to resolve to a public
+    // address before this instance will send anything to it. Set here and only
+    // here — the shipped default is off, and .env.example documents it that way.
+    FEDERATION_ALLOW_PRIVATE_PEERS: 'true',
   };
+  // Explicit in BOTH branches: `env` starts as a copy of `process.env`, so an
+  // inherited DISABLE_FEDERATION_WORKERS would otherwise silently re-disable the
+  // workers a caller asked for.
+  env.DISABLE_FEDERATION_WORKERS = opts.enableFederationWorkers ? '0' : '1';
+  // Shortened retry waits for every harness instance. Why: docs/systems/
+  // federation.md, "Retry backoff divisor (test only)".
+  env.FEDERATION_BACKOFF_DIVISOR = String(HARNESS_BACKOFF_DIVISOR);
+  // Same reason: the directory pinger starts OUTSIDE the workers guard, so a
+  // developer's own DIRECTORY_ENDPOINT would otherwise reach every spawned
+  // instance and start a live pinger at the real hub from unrelated tests. The
+  // pinger's own guard is an empty endpoint, so that is the default here.
+  env.DIRECTORY_ENDPOINT = opts.directoryEndpoint ?? '';
   // Default: bypass rate limits so unrelated tests don't exhaust the per-IP
   // bucket on 127.0.0.1. Test #15 (rate-limit assertion) opts out via
   // bootTwoInstancesWithRateLimits().
@@ -135,10 +269,18 @@ export async function spawnInstance(opts: {
   const logStream = createWriteStream(opts.logPath);
   proc.stdout!.pipe(logStream);
   proc.stderr!.pipe(logStream);
-  await waitForReady(origin, proc, opts.logPath);
+  try {
+    await waitForReady(origin, proc, opts.logPath);
+  } catch (err) {
+    // Never leave a half-booted child behind: a survivor holds its port and
+    // makes the next allocation likelier to collide, and on CI it outlives the
+    // suite.
+    if (proc.exitCode === null && proc.signalCode === null) proc.kill('SIGKILL');
+    throw err;
+  }
   return {
     proc,
-    port: opts.port,
+    port,
     origin,
     domain: opts.domain,
     dbPath: opts.dbPath,
@@ -162,7 +304,36 @@ export interface BootOptions {
    * handshake yields one reachable peer row per direction. Default: false.
    */
   publicOriginAsTransport?: boolean;
+  /**
+   * Run the real federation background workers (outbox delivery, recovery,
+   * health check) on every instance. Needed only by tests that assert a queued
+   * relay actually *arrives* at the peer. Default: false. See
+   * `spawnInstance`'s option of the same name.
+   */
+  enableFederationWorkers?: boolean;
+  /**
+   * Give every instance the same synthetic LiveKit credentials, enabling the
+   * federated call-start path (tokens are minted locally, no LiveKit server is
+   * contacted). Default: false → LiveKit stays unconfigured.
+   */
+  enableLiveKit?: boolean;
+  /**
+   * Point every instance's directory pinger at this hub base URL. Default:
+   * unset, which spawns every instance with `DIRECTORY_ENDPOINT=''` so no
+   * pinger runs. See `spawnInstance`'s option of the same name.
+   */
+  directoryEndpoint?: string;
 }
+
+/**
+ * Synthetic LiveKit credentials used when `BootOptions.enableLiveKit` is set.
+ * `AccessToken` only needs a key/secret pair to sign; nothing dials `url`.
+ */
+const TEST_LIVEKIT = {
+  url: 'wss://livekit.test.local',
+  apiKey: 'devkey',
+  apiSecret: 'test-only-livekit-secret-not-for-production-use',
+} as const;
 
 /** Boot home + N remotes. All instances ready before the function returns. */
 export async function bootHomePlusRemotes(
@@ -172,36 +343,41 @@ export async function bootHomePlusRemotes(
   if (remoteCount < 1) throw new Error('remoteCount must be >= 1');
   const disableRateLimits = !options.enableRateLimits;
   const publicOriginAsTransport = options.publicOriginAsTransport ?? false;
+  const enableFederationWorkers = options.enableFederationWorkers ?? false;
+  const livekit = options.enableLiveKit ? { ...TEST_LIVEKIT } : undefined;
+  const directoryEndpoint = options.directoryEndpoint;
   const runId = crypto.randomBytes(4).toString('hex');
   // From packages/server/test/helpers → repo root is up four levels: helpers → test → server → packages → repo-root.
   const runDir = path.resolve(__dirname, `../../../../tests/.tmp/${runId}`);
   await mkdir(`${runDir}/home-uploads`, { recursive: true });
 
-  const homePort = await allocateEphemeralPort();
   const home = await spawnInstance({
     domain: 'home.test.local',
-    port: homePort,
     dbPath: `${runDir}/home.db`,
     storagePath: `${runDir}/home-uploads`,
     jwtSecret: crypto.randomBytes(32).toString('hex'),
     logPath: `${runDir}/home.log`,
     disableRateLimits,
     publicOriginAsTransport,
+    enableFederationWorkers,
+    livekit,
+    directoryEndpoint,
   });
 
   const remotes: SpawnedInstance[] = [];
   for (let i = 0; i < remoteCount; i++) {
     await mkdir(`${runDir}/remote${i}-uploads`, { recursive: true });
-    const port = await allocateEphemeralPort();
     const r = await spawnInstance({
       domain: `remote${i}.test.local`,
-      port,
       dbPath: `${runDir}/remote${i}.db`,
       storagePath: `${runDir}/remote${i}-uploads`,
       jwtSecret: crypto.randomBytes(32).toString('hex'),
       logPath: `${runDir}/remote${i}.log`,
       disableRateLimits,
       publicOriginAsTransport,
+      enableFederationWorkers,
+      livekit,
+      directoryEndpoint,
     });
     remotes.push(r);
   }
@@ -228,7 +404,8 @@ export async function bootTwoInstances(options: BootOptions = {}): Promise<TwoIn
   const m = await bootHomePlusRemotes(1, options);
   return {
     home: m.home,
-    remote: m.remotes[0],
+    // bootHomePlusRemotes(1) always yields exactly one remote.
+    remote: m.remotes[0]!,
     remotes: m.remotes,
     runDir: m.runDir,
     cleanup: m.cleanup,

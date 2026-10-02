@@ -3,6 +3,8 @@ import type { BrowserWindow, MenuItemConstructorOptions } from 'electron';
 import type { AppUpdater } from 'electron-updater';
 import path from 'path';
 import { loadInstanceUrl, clearInstanceUrl, getPickerPath } from './instanceUrl';
+import { RELEASES_URL } from './updateStatus';
+import { getDesktopLanguage, translateDesktop, type DesktopLanguage } from './l10n';
 
 export type RecoveryReasonCode =
   | 'load-failed'
@@ -14,6 +16,14 @@ export type UpdateState =
   | 'idle'
   | 'checking'
   | 'downloading'
+  // An update exists but this build cannot install it in place (an ad-hoc
+  // signed macOS build, where Squirrel.Mac can never satisfy the running app's
+  // cdhash-literal designated requirement). The only useful action is a manual
+  // download, so the recovery surface offers that instead of a Restart button
+  // that would do nothing. See updateCapability.ts.
+  | 'available-manual'
+  // Flatpak owns updates. No updater action belongs in recovery or menus.
+  | 'external'
   | 'downloaded'
   | 'error';
 
@@ -96,53 +106,99 @@ interface MenuActions {
   onChangeInstance: () => void;
   onCheckForUpdates: () => void;
   onRestartToInstall: () => void;
+  // Manual-download path: opens the releases page for builds that cannot
+  // install their own updates.
+  onOpenReleases: () => void;
   // AGPL-3.0 § 13: open the Corresponding Source of the running instance.
   onOpenSource: () => void;
   onQuit: () => void;
 }
 
-function checkForUpdatesItem(state: RecoveryState, click: () => void): MenuItemConstructorOptions {
+function checkForUpdatesItem(
+  state: RecoveryState,
+  click: () => void,
+  language: DesktopLanguage,
+): MenuItemConstructorOptions | null {
+  const t = (key: Parameters<typeof translateDesktop>[1]) => translateDesktop(language, key);
   switch (state.updateState) {
+    case 'external':
+      return null;
     case 'checking':
-      return { id: 'check-for-updates', label: 'Checking for Updates…', enabled: false };
+      return { id: 'check-for-updates', label: t('update.checking'), enabled: false };
     case 'downloading':
-      return { id: 'check-for-updates', label: 'Downloading Update…', enabled: false };
+      return { id: 'check-for-updates', label: t('update.downloading'), enabled: false };
     case 'downloaded':
-      return { id: 'check-for-updates', label: 'Update Ready', enabled: false };
+      return { id: 'check-for-updates', label: t('update.ready'), enabled: false };
+    case 'available-manual':
+      return { id: 'check-for-updates', label: t('update.available'), enabled: false };
     case 'error':
-      return { id: 'check-for-updates', label: 'Check for Updates… (last attempt failed)', enabled: true, click };
+      return { id: 'check-for-updates', label: t('update.checkAfterFailure'), enabled: true, click };
     case 'idle':
     default:
-      return { id: 'check-for-updates', label: 'Check for Updates…', enabled: true, click };
+      return { id: 'check-for-updates', label: t('update.check'), enabled: true, click };
   }
 }
 
+/**
+ * The action item that sits under "Check for Updates" once an update is known.
+ *
+ * Which action that is depends on whether the build can install in place. A
+ * build that cannot must never show "Restart to Install Update", because that
+ * is precisely the dead button this work exists to remove.
+ */
+function updateActionItem(
+  state: RecoveryState,
+  actions: Partial<MenuActions> | undefined,
+  language: DesktopLanguage,
+): MenuItemConstructorOptions | null {
+  if (state.updateState === 'downloaded') {
+    return {
+      id: 'restart-to-install',
+      label: translateDesktop(language, 'update.restartToInstall'),
+      enabled: true,
+      click: actions?.onRestartToInstall,
+    };
+  }
+  if (state.updateState === 'available-manual') {
+    return {
+      id: 'download-update',
+      label: state.updateVersion
+        ? translateDesktop(language, 'update.downloadVersion', { version: state.updateVersion })
+        : translateDesktop(language, 'update.download'),
+      enabled: true,
+      click: actions?.onOpenReleases,
+    };
+  }
+  return null;
+}
+
+/**
+ * `language` defaults to English so the pure template builders stay usable
+ * without Electron; main.ts passes the resolved desktop language.
+ */
 export function buildTrayMenuTemplate(
   state: RecoveryState,
   actions?: Partial<MenuActions>,
+  language: DesktopLanguage = 'en',
 ): MenuItemConstructorOptions[] {
+  const t = (key: Parameters<typeof translateDesktop>[1]) => translateDesktop(language, key);
   const items: MenuItemConstructorOptions[] = [
-    { label: 'Show Backspace', click: actions?.onShow },
-    { label: 'Hide', click: actions?.onHide },
-    { type: 'separator' },
-    checkForUpdatesItem(state, () => actions?.onCheckForUpdates?.()),
+    { label: t('tray.show'), click: actions?.onShow },
+    { label: t('tray.hide'), click: actions?.onHide },
   ];
 
-  if (state.updateState === 'downloaded') {
-    items.push({
-      id: 'restart-to-install',
-      label: 'Restart to Install Update',
-      enabled: true,
-      click: actions?.onRestartToInstall,
-    });
-  }
+  const checkItem = checkForUpdatesItem(state, () => actions?.onCheckForUpdates?.(), language);
+  if (checkItem) items.push({ type: 'separator' }, checkItem);
+
+  const updateAction = updateActionItem(state, actions, language);
+  if (updateAction) items.push(updateAction);
 
   items.push(
     { type: 'separator' },
-    { label: 'Change Instance', click: actions?.onChangeInstance },
-    { label: 'Source code (AGPL)', click: actions?.onOpenSource },
+    { label: t('tray.changeInstance'), click: actions?.onChangeInstance },
+    { label: t('tray.sourceCode'), click: actions?.onOpenSource },
     { type: 'separator' },
-    { label: 'Quit', click: actions?.onQuit },
+    { label: t('tray.quit'), click: actions?.onQuit },
   );
 
   return items;
@@ -152,26 +208,23 @@ export function buildAppMenuTemplate(
   appName: string,
   state: RecoveryState,
   actions?: Partial<MenuActions>,
+  language: DesktopLanguage = 'en',
 ): MenuItemConstructorOptions[] {
+  const t = (key: Parameters<typeof translateDesktop>[1]) => translateDesktop(language, key);
   const appSubmenu: MenuItemConstructorOptions[] = [
     { role: 'about' },
-    { label: 'Source code (AGPL)', click: () => actions?.onOpenSource?.() },
-    { type: 'separator' },
-    checkForUpdatesItem(state, () => actions?.onCheckForUpdates?.()),
+    { label: t('tray.sourceCode'), click: () => actions?.onOpenSource?.() },
   ];
 
-  if (state.updateState === 'downloaded') {
-    appSubmenu.push({
-      id: 'restart-to-install',
-      label: 'Restart to Install Update',
-      enabled: true,
-      click: actions?.onRestartToInstall,
-    });
-  }
+  const checkItem = checkForUpdatesItem(state, () => actions?.onCheckForUpdates?.(), language);
+  if (checkItem) appSubmenu.push({ type: 'separator' }, checkItem);
+
+  const updateAction = updateActionItem(state, actions, language);
+  if (updateAction) appSubmenu.push(updateAction);
 
   appSubmenu.push(
     { type: 'separator' },
-    { label: 'Change Instance', click: actions?.onChangeInstance },
+    { label: t('tray.changeInstance'), click: actions?.onChangeInstance },
     { type: 'separator' },
     { role: 'hide' },
     { role: 'hideOthers' },
@@ -183,7 +236,7 @@ export function buildAppMenuTemplate(
   return [
     { label: appName, submenu: appSubmenu },
     {
-      label: 'Edit',
+      label: t('menu.edit'),
       submenu: [
         { role: 'undo' },
         { role: 'redo' },
@@ -195,7 +248,7 @@ export function buildAppMenuTemplate(
       ],
     },
     {
-      label: 'Window',
+      label: t('menu.window'),
       submenu: [
         { role: 'minimize' },
         { role: 'zoom' },
@@ -348,7 +401,9 @@ export function enterRecoveryMode(reason: { code: RecoveryReasonCode; detail: st
 
   if (!mainWindowRef || mainWindowRef.isDestroyed()) return;
 
-  mainWindowRef.loadFile(path.join(__dirname, '..', 'resources', 'recovery.html'));
+  mainWindowRef.loadFile(path.join(__dirname, '..', 'resources', 'recovery.html'), {
+    query: { lang: getDesktopLanguage() },
+  });
   // Force-show even when launched hidden (--hidden via autostart) — recovery
   // must be visible regardless of prior visibility state.
   mainWindowRef.show();
@@ -400,13 +455,14 @@ export function handleRecoveryAction(action: RecoveryAction): void {
       recoveryStore.update({ mode: 'normal', reason: null });
       console.log('[recovery] exited (reload)');
       if (!url) {
-        mainWindowRef?.loadFile(getPickerPath());
+        mainWindowRef?.loadFile(getPickerPath(), { query: { lang: getDesktopLanguage() } });
         return;
       }
       mainWindowRef?.loadURL(url);
       return;
     }
     case 'check-update': {
+      if (recoveryStore.get().updateState === 'external') return;
       recoveryStore.update({ updateState: 'checking', lastCheckResult: null });
       autoUpdaterRef?.checkForUpdates().catch(() => { /* check-phase errors stay silent */ });
       return;
@@ -430,7 +486,7 @@ export function handleRecoveryAction(action: RecoveryAction): void {
       recoveryStore.markRecoveryExited();
       recoveryStore.update({ mode: 'normal', reason: null });
       console.log('[recovery] exited (change-instance)');
-      mainWindowRef?.loadFile(getPickerPath());
+      mainWindowRef?.loadFile(getPickerPath(), { query: { lang: getDesktopLanguage() } });
       // Ensure visible — tray clicks may happen with window hidden, and the
       // recovery surface should also remain visible during the navigation.
       // When invoked from recovery.html (window already showing), these are
@@ -440,7 +496,7 @@ export function handleRecoveryAction(action: RecoveryAction): void {
       return;
     }
     case 'open-releases': {
-      shell.openExternal('https://github.com/TheZwiss/backspace/releases/latest');
+      shell.openExternal(RELEASES_URL);
       return;
     }
     case 'quit': {

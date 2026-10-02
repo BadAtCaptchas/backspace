@@ -1,33 +1,71 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { useUIStore } from '../../stores/uiStore';
 import { useAuthStore } from '../../stores/authStore';
-import { AccountPanel } from '../modals/settingsPanels/AccountPanel';
-import { VoicePanel } from '../modals/settingsPanels/VoicePanel';
-import { ConnectionsPanel } from '../modals/settingsPanels/ConnectionsPanel';
-import { PrivacyPanel } from '../modals/settingsPanels/PrivacyPanel';
-import { KeybindsPanel } from '../modals/settingsPanels/KeybindsPanel';
-import { DesktopPanel } from '../modals/settingsPanels/DesktopPanel';
+import { api } from '../../api/client';
+import {
+  AccountPanel,
+  AppearancePanel,
+  VoicePanel,
+  ConnectionsPanel,
+  PrivacyPanel,
+  KeybindsPanel,
+  DesktopPanel,
+  DesktopDownloadPanel,
+  SettingsPanelSuspense,
+} from '../modals/lazySettingsPanels';
 import { MobileScreenHeader } from './MobileScreenHeader';
 import { TransferIndicator } from './TransferIndicator';
 import { isElectron } from '../../platform/platform';
+import { useInstanceUpdateBadge } from '../../hooks/useInstanceUpdateBadge';
 
 interface MobileSettingsScreenProps {
   initialPanel?: string;
 }
 
-const panelConfig: Record<string, { title: string; component: React.ReactNode }> = {
-  account: { title: 'Account', component: <AccountPanel /> },
-  voice: { title: 'Voice & Video', component: <VoicePanel /> },
-  privacy: { title: 'Privacy', component: <PrivacyPanel /> },
-  connections: { title: 'Connections', component: <ConnectionsPanel /> },
-  keybinds: { title: 'Keybinds', component: <KeybindsPanel /> },
-  desktop: { title: 'Desktop', component: <DesktopPanel /> },
+type PanelTitleKey =
+  | 'settings:nav.tabs.account'
+  | 'settings:nav.tabs.appearance'
+  | 'settings:nav.tabs.voice'
+  | 'settings:nav.tabs.privacy'
+  | 'settings:nav.tabs.connections'
+  | 'settings:nav.tabs.keybinds'
+  | 'settings:nav.tabs.desktop';
+
+/**
+ * Every panel this screen can open directly: its header title and its body. The
+ * body is a function so Desktop can decide at render time, the one entry that
+ * depends on where the client runs. Inside the app it is the app's own
+ * settings, in a browser it is the download offer, which is the same wiring the
+ * settings modal uses. `instanceVersion` is null until the instance info
+ * request lands, and stays null if it failed.
+ */
+const panelConfig: Record<
+  string,
+  { titleKey: PanelTitleKey; body: (instanceVersion: string | null) => React.ReactNode }
+> = {
+  account: { titleKey: 'settings:nav.tabs.account', body: () => <AccountPanel /> },
+  appearance: { titleKey: 'settings:nav.tabs.appearance', body: () => <AppearancePanel /> },
+  voice: { titleKey: 'settings:nav.tabs.voice', body: () => <VoicePanel /> },
+  privacy: { titleKey: 'settings:nav.tabs.privacy', body: () => <PrivacyPanel /> },
+  connections: { titleKey: 'settings:nav.tabs.connections', body: () => <ConnectionsPanel /> },
+  keybinds: { titleKey: 'settings:nav.tabs.keybinds', body: () => <KeybindsPanel /> },
+  desktop: {
+    titleKey: 'settings:nav.tabs.desktop',
+    body: (instanceVersion) =>
+      isElectron() ? <DesktopPanel /> : <DesktopDownloadPanel version={instanceVersion} />,
+  },
 };
 
 const sectionIcons: Record<string, React.ReactNode> = {
   account: (
     <svg className="w-5 h-5 text-txt-secondary" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
       <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 6a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0zM4.501 20.118a7.5 7.5 0 0114.998 0A17.933 17.933 0 0112 21.75c-2.676 0-5.216-.584-7.499-1.632z" />
+    </svg>
+  ),
+  appearance: (
+    <svg className="w-5 h-5 text-txt-secondary" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M4.098 19.902a3.75 3.75 0 005.304 0l6.401-6.402M6.75 21A3.75 3.75 0 013 17.25V4.125C3 3.504 3.504 3 4.125 3h5.25c.621 0 1.125.504 1.125 1.125v4.072M6.75 21a3.75 3.75 0 003.75-3.75V8.197M6.75 21h13.125c.621 0 1.125-.504 1.125-1.125v-5.25c0-.621-.504-1.125-1.125-1.125h-4.072M10.5 8.197l2.88-2.88c.438-.439 1.15-.439 1.59 0l3.712 3.713c.44.439.44 1.151 0 1.59l-2.879 2.879M6.75 17.25h.008v.008H6.75v-.008z" />
     </svg>
   ),
   voice: (
@@ -63,8 +101,25 @@ const sectionIcons: Record<string, React.ReactNode> = {
 };
 
 export function MobileSettingsScreen({ initialPanel }: MobileSettingsScreenProps) {
+  const { t } = useTranslation(['mobile', 'settings', 'common']);
   const pushMobileScreen = useUIStore((s) => s.pushMobileScreen);
   const isAdmin = useAuthStore((s) => s.user?.isAdmin);
+  const updateBadge = useInstanceUpdateBadge();
+
+  // The browser's Desktop panel builds its download links from the instance
+  // version, the same source the settings modal reads them from. Nothing else
+  // on this screen needs it, so no other panel starts the request.
+  const needsInstanceVersion = initialPanel === 'desktop' && !isElectron();
+  const [instanceVersion, setInstanceVersion] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!needsInstanceVersion) return;
+    let cancelled = false;
+    api.instance.info()
+      .then((info) => { if (!cancelled) setInstanceVersion(info.version); })
+      .catch(() => { /* Non-critical: without a version every link falls back to the releases listing. */ });
+    return () => { cancelled = true; };
+  }, [needsInstanceVersion]);
 
   // If initialPanel is set, render that panel directly
   if (initialPanel) {
@@ -74,32 +129,36 @@ export function MobileSettingsScreen({ initialPanel }: MobileSettingsScreenProps
 
     return (
       <div className="flex flex-col h-full bg-surface-base">
-        <MobileScreenHeader title={panel.title} rightActions={<TransferIndicator />} />
+        <MobileScreenHeader title={t(panel.titleKey)} rightActions={<TransferIndicator />} />
         <div className="flex-1 overflow-y-auto p-4">
-          {panel.component}
+          <SettingsPanelSuspense key={initialPanel}>{panel.body(instanceVersion)}</SettingsPanelSuspense>
         </div>
       </div>
     );
   }
 
-  // Settings section list. Desktop and Keybinds are Electron-only — global
-  // shortcuts and auto-launch/update controls are meaningless on the iOS PWA
-  // and on web mobile. The desktop UserSettings modal also gates Desktop on
-  // isElectron(); we mirror that here, plus apply the same gate to Keybinds
-  // since the panel's only-when-tab-focused web fallback isn't a useful
-  // mobile feature (no global hooks, no recording flow on touch keyboards).
+  // Settings section list. Desktop is listed everywhere, mirroring the settings
+  // modal: inside the app it opens the app's own settings, in a browser it
+  // opens the download offer, which is worth reaching from a phone because the
+  // visitor may be downloading for another machine. Keybinds stays
+  // Electron-only: its value comes from the desktop app's global keybind
+  // manager, and the web fallback (only while the tab has focus, no recording
+  // flow on touch keyboards) would mislead a mobile-web user into recording a
+  // binding that can never fire.
   const sections = [
-    { id: 'account', label: 'Account' },
-    { id: 'voice', label: 'Voice & Video' },
-    { id: 'privacy', label: 'Privacy' },
-    { id: 'connections', label: 'Connections' },
-    ...(isElectron() ? [{ id: 'keybinds', label: 'Keybinds' }, { id: 'desktop', label: 'Desktop' }] : []),
-    ...(isAdmin ? [{ id: 'instance', label: 'Instance' }] : []),
+    { id: 'account', label: t('settings:nav.tabs.account') },
+    { id: 'appearance', label: t('settings:nav.tabs.appearance') },
+    { id: 'voice', label: t('settings:nav.tabs.voice') },
+    { id: 'privacy', label: t('settings:nav.tabs.privacy') },
+    { id: 'connections', label: t('settings:nav.tabs.connections') },
+    ...(isElectron() ? [{ id: 'keybinds', label: t('settings:nav.tabs.keybinds') }] : []),
+    { id: 'desktop', label: t('settings:nav.tabs.desktop') },
+    ...(isAdmin ? [{ id: 'instance', label: t('settings:nav.tabs.instance'), dot: updateBadge }] : []),
   ];
 
   return (
     <div className="flex flex-col h-full bg-surface-base">
-      <MobileScreenHeader title="Settings" rightActions={<TransferIndicator />} />
+      <MobileScreenHeader title={t('common:labels.settings')} rightActions={<TransferIndicator />} />
       <div className="flex-1 overflow-y-auto">
         {sections.map((section) => (
           <button
@@ -109,6 +168,7 @@ export function MobileSettingsScreen({ initialPanel }: MobileSettingsScreenProps
           >
             {sectionIcons[section.id]}
             <span className="text-sm text-txt-primary flex-1">{section.label}</span>
+            {section.dot && <span className="w-1.5 h-1.5 rounded-full bg-accent-amber" />}
             <svg className="w-4 h-4 text-txt-tertiary" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M8.25 4.5l7.5 7.5-7.5 7.5" />
             </svg>

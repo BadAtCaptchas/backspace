@@ -1,8 +1,11 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import ReactDOM from 'react-dom';
+import { useTranslation } from 'react-i18next';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { useSpaceStore, getMyUserIdForOrigin } from '../../stores/spaceStore';
 import type { TaggedSpace } from '../../stores/spaceStore';
+import { resolveSpaceLayout, type ResolvedSpaceLayoutItem } from '../../utils/spaceLayout';
+import { activeHomeNavItem } from '../../utils/homeNav';
 import { useChatStore } from '../../stores/chatStore';
 import { useUIStore } from '../../stores/uiStore';
 import { useInstanceStore } from '../../stores/instanceStore';
@@ -18,21 +21,18 @@ import { useFloatingPosition } from '../../hooks/useFloatingPosition';
 
 // ─── Resolved layout types ─────────────────────────────────────────────────
 
-type ResolvedItem =
-  | { type: 'space'; space: TaggedSpace }
-  | { type: 'folder'; folder: SpaceFolder; spaces: TaggedSpace[] };
 
 // ─── Folder color presets ─────────────────────────────────────────────────
 
 const FOLDER_COLORS = [
-  { name: 'mint', value: '#86efac' },
-  { name: 'peach', value: '#fbbf93' },
-  { name: 'lavender', value: '#c4b5fd' },
-  { name: 'sky', value: '#7dd3fc' },
-  { name: 'amber', value: '#fcd34d' },
-  { name: 'rose', value: '#fda4af' },
-  { name: 'coral', value: '#fb7185' },
-];
+  { name: 'mint', value: '#86efac', labelKey: 'common:colors.mint' },
+  { name: 'peach', value: '#fbbf93', labelKey: 'common:colors.peach' },
+  { name: 'lavender', value: '#c4b5fd', labelKey: 'common:colors.lavender' },
+  { name: 'sky', value: '#7dd3fc', labelKey: 'common:colors.sky' },
+  { name: 'amber', value: '#fcd34d', labelKey: 'common:colors.amber' },
+  { name: 'rose', value: '#fda4af', labelKey: 'common:colors.rose' },
+  { name: 'coral', value: '#fb7185', labelKey: 'common:colors.coral' },
+] as const;
 
 // ─── SidebarItem ─────────────────────────────────────────────────────────
 
@@ -61,6 +61,7 @@ interface SidebarItemProps {
 }
 
 function SidebarItem({ id, name, icon, avatarColor, active, onClick, onContextMenu, type = 'space', actionType, hasUnread, dimmed, federationBadge, federationDisconnected, tooltipText, draggable, onDragStart, onDragOver, onDragEnd, onDrop, isDragging, dropIndicator }: SidebarItemProps) {
+  const { t } = useTranslation(['spaces', 'common']);
   const [isHovered, setIsHovered] = useState(false);
   const firstLetter = name.charAt(0).toUpperCase();
 
@@ -109,9 +110,9 @@ function SidebarItem({ id, name, icon, avatarColor, active, onClick, onContextMe
   };
 
   const buttonContent = (
-    <button onClick={onClick} className={`${getButtonClasses()} ${dimmed ? 'opacity-40 saturate-50' : ''}`} style={backgroundStyle} title={tooltipText ? undefined : name}>
+    <button onClick={onClick} className={`${getButtonClasses()} ${dimmed ? 'opacity-40 saturate-50' : ''}`} style={backgroundStyle} title={tooltipText ? undefined : name} aria-current={active ? 'page' : undefined}>
       {type === 'dm' ? (
-        <img src="/icons/logo-mark.svg" alt="Backspace" className="w-[25px] h-auto" />
+        <img src="/icons/logo-mark.svg" alt={t('common:appName')} className="w-5 h-auto" />
       ) : type === 'action' ? (
         actionType === 'add' ? (
           <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
@@ -527,6 +528,7 @@ function FolderSlot({
   onDrop: (e: React.DragEvent) => void;
   anchorRef: (el: HTMLDivElement | null) => void;
 }) {
+  const { t } = useTranslation(['spaces', 'common']);
   const [isHovered, setIsHovered] = useState(false);
 
   const getPillHeight = () => {
@@ -576,7 +578,7 @@ function FolderSlot({
       {isFlyoutOpen ? (
         iconContent
       ) : (
-        <Tooltip content={folder.name || `Folder (${folderSpaces.length})`} position="right" delay={300}>
+        <Tooltip content={folder.name || t('spaces:sidebar.folder.tooltip', { count: folderSpaces.length })} position="right" delay={300}>
           {iconContent}
         </Tooltip>
       )}
@@ -587,6 +589,7 @@ function FolderSlot({
 // ─── SpaceSidebar (main component) ────────────────────────────────────────
 
 export function SpaceSidebar() {
+  const { t } = useTranslation(['spaces', 'common']);
   const spaces = useSpaceStore((s) => s.spaces);
   const currentSpaceId = useSpaceStore((s) => s.currentSpaceId);
   const setCurrentSpace = useSpaceStore((s) => s.setCurrentSpace);
@@ -602,6 +605,7 @@ export function SpaceSidebar() {
   const openModal = useUIStore((s) => s.openModal);
   const addToast = useUIStore((s) => s.addToast);
   const floatingPanelHeight = useUIStore((s) => s.floatingPanelHeight);
+  const currentChannelId = useChatStore((s) => s.currentChannelId);
   const setCurrentChannel = useChatStore((s) => s.setCurrentChannel);
   const unreadChannels = useChatStore((s) => s.unreadChannels);
   const instances = useInstanceStore((s) => s.instances);
@@ -634,7 +638,7 @@ export function SpaceSidebar() {
       {
         key: 'invite',
         type: 'action',
-        label: 'Invite People',
+        label: t('common:actions.invitePeople'),
         icon: (
           <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
             <path d="M15 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm-9-2V7H4v3H1v2h3v3h2v-3h3v-2H6zm9 4c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z" />
@@ -646,16 +650,16 @@ export function SpaceSidebar() {
             const origin = (space as TaggedSpace)._instanceOrigin || window.location.origin;
             const url = `${origin}/invite/${code}`;
             await navigator.clipboard.writeText(url);
-            useUIStore.getState().addToast('Invite link copied to clipboard', 'success', 3000);
+            useUIStore.getState().addToast(t('spaces:sidebar.space.inviteCopied'), 'success', 3000);
           } catch {
-            useUIStore.getState().addToast('Failed to generate invite', 'warning', 3000);
+            useUIStore.getState().addToast(t('spaces:sidebar.space.inviteFailed'), 'warning', 3000);
           }
         },
       },
       {
         key: 'transfer',
         type: 'action',
-        label: 'Transfer Ownership',
+        label: t('spaces:sidebar.space.transferOwnership'),
         hidden: !isOwner,
         icon: (
           <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
@@ -667,7 +671,7 @@ export function SpaceSidebar() {
       {
         key: 'leave',
         type: 'action',
-        label: 'Leave Space',
+        label: t('spaces:sidebar.space.leave'),
         hidden: isOwner,
         danger: true,
         icon: (
@@ -680,7 +684,7 @@ export function SpaceSidebar() {
     ];
 
     openContextMenu({ x: e.clientX, y: e.clientY }, items);
-  }, [openContextMenu]);
+  }, [openContextMenu, t]);
 
   // Set of disconnected origins
   const disconnectedOrigins = useMemo(() => {
@@ -700,56 +704,11 @@ export function SpaceSidebar() {
     return map;
   }, [spaces]);
 
-  // Build folder lookup map
-  const folderMap = useMemo(() => {
-    const map = new Map<string, SpaceFolder>();
-    for (const f of folders) map.set(f.id, f);
-    return map;
-  }, [folders]);
-
   // Reconciled layout: merge spaceLayout with actual spaces and folders
-  const resolvedLayout = useMemo((): ResolvedItem[] => {
-    const memberSpaceIds = new Set(spaces.map(s => s.id));
-    const result: ResolvedItem[] = [];
-    const accountedSpaceIds = new Set<string>();
-
-    if (spaceLayout && spaceLayout.length > 0) {
-      for (const item of spaceLayout) {
-        if (item.t === 's') {
-          const space = spaceMap.get(item.id);
-          if (space) {
-            result.push({ type: 'space', space });
-            accountedSpaceIds.add(item.id);
-          }
-        } else if (item.t === 'f') {
-          const folder = folderMap.get(item.id);
-          if (folder) {
-            const folderSpaces = folder.spaceIds
-              .map(sid => spaceMap.get(sid))
-              .filter((s): s is TaggedSpace => !!s);
-            if (folderSpaces.length > 0) {
-              result.push({
-                type: 'folder',
-                folder,
-                spaces: folderSpaces,
-              });
-              for (const s of folderSpaces) accountedSpaceIds.add(s.id);
-            }
-          }
-        }
-      }
-    }
-
-    // Append any spaces not in the layout (newly joined, etc.)
-    for (const space of spaces) {
-      if (!accountedSpaceIds.has(space.id)) {
-        result.push({ type: 'space', space });
-        accountedSpaceIds.add(space.id);
-      }
-    }
-
-    return result;
-  }, [spaceLayout, spaces, spaceMap, folderMap]);
+  const resolvedLayout = useMemo(
+    () => resolveSpaceLayout(spaces, spaceLayout, folders),
+    [spaces, spaceLayout, folders],
+  );
 
   // Compute which spaces have unread channels
   const unreadSpaceIds = useMemo(() => {
@@ -774,13 +733,13 @@ export function SpaceSidebar() {
     const origin = space?._instanceOrigin;
     if (origin && disconnectedOrigins.has(origin)) {
       const inst = instances.find(i => i.origin === origin);
-      addToast(`Reconnecting to ${inst?.label || 'remote instance'}...`, 'warning', 4000);
+      addToast(t('spaces:sidebar.space.reconnecting', { instance: inst?.label || t('spaces:sidebar.space.remoteInstance') }), 'warning', 4000);
       return;
     }
     setCurrentSpace(spaceId);
     setShowDms(false);
     navigate(`/channels/${spaceId}`);
-  }, [spaceMap, disconnectedOrigins, instances, addToast, setCurrentSpace, setShowDms, navigate]);
+  }, [spaceMap, disconnectedOrigins, instances, addToast, setCurrentSpace, setShowDms, navigate, t]);
 
   const handleDmClick = () => {
     setShowDms(true);
@@ -859,7 +818,7 @@ export function SpaceSidebar() {
   }, []);
 
   // Build layout items and folder payload from resolvedLayout for persistence
-  const buildLayoutPayload = useCallback((resolved: ResolvedItem[]) => {
+  const buildLayoutPayload = useCallback((resolved: ResolvedSpaceLayoutItem[]) => {
     const items: SpaceLayoutItem[] = [];
     const folderPayload: Record<string, { name: string | null; color: string | null; spaceIds: string[] }> = {};
 
@@ -879,7 +838,7 @@ export function SpaceSidebar() {
     return { items, folderPayload };
   }, []);
 
-  const persistLayout = useCallback((resolved: ResolvedItem[]) => {
+  const persistLayout = useCallback((resolved: ResolvedSpaceLayoutItem[]) => {
     const { items, folderPayload } = buildLayoutPayload(resolved);
     updateSpaceLayout(items, folderPayload);
   }, [buildLayoutPayload, updateSpaceLayout]);
@@ -897,7 +856,7 @@ export function SpaceSidebar() {
         };
       }
       return item;
-    }) as ResolvedItem[];
+    }) as ResolvedSpaceLayoutItem[];
     persistLayout(newLayout);
   }, [resolvedLayout, persistLayout]);
 
@@ -925,7 +884,7 @@ export function SpaceSidebar() {
         return { ...item, spaces: [...item.spaces], folder: { ...item.folder } };
       }
       return { ...item };
-    }) as ResolvedItem[];
+    }) as ResolvedSpaceLayoutItem[];
 
     if (dragType === 'space') {
       const dragSpace = spaceMap.get(dragId);
@@ -934,7 +893,7 @@ export function SpaceSidebar() {
       // Remove from source
       if (sourceFolderId) {
         // Remove from folder
-        const folderItem = newLayout.find(i => i.type === 'folder' && i.folder.id === sourceFolderId) as (ResolvedItem & { type: 'folder' }) | undefined;
+        const folderItem = newLayout.find(i => i.type === 'folder' && i.folder.id === sourceFolderId) as (ResolvedSpaceLayoutItem & { type: 'folder' }) | undefined;
         if (folderItem) {
           folderItem.spaces = folderItem.spaces.filter(s => s.id !== dragId);
           folderItem.folder = { ...folderItem.folder, spaceIds: folderItem.spaces.map(s => s.id) };
@@ -958,7 +917,7 @@ export function SpaceSidebar() {
         if (targetItem.type === 'space') {
           // Create new folder with both spaces
           const tempId = `new:${Date.now()}`;
-          const newFolder: ResolvedItem = {
+          const newFolder: ResolvedSpaceLayoutItem = {
             type: 'folder',
             folder: {
               id: tempId,
@@ -985,7 +944,7 @@ export function SpaceSidebar() {
         if (targetIdx === -1) { handleDragEnd(); return; }
 
         const insertIdx = position === 'before' ? targetIdx : targetIdx + 1;
-        const newItem: ResolvedItem = { type: 'space', space: dragSpace };
+        const newItem: ResolvedSpaceLayoutItem = { type: 'space', space: dragSpace };
         newLayout.splice(insertIdx, 0, newItem);
       }
 
@@ -1092,11 +1051,13 @@ export function SpaceSidebar() {
   }, [openFolderId, resolvedLayout]);
 
   return (
-    <nav data-pip-obstacle="left" className="w-[72px] bg-surface-base flex flex-col items-center py-3 overflow-y-auto flex-shrink-0 no-scrollbar select-none md:fixed md:inset-y-0 md:left-0 md:z-[100] md:glass-strip" style={{ paddingBottom: floatingPanelHeight + 24, ...(isElectron() ? { top: '33px' } : {}) }} onDragOver={(e) => { if (dragState) e.preventDefault(); }} onDrop={handleDrop}>
+    <nav data-pip-obstacle="left" className="w-[72px] bg-surface-base flex flex-col items-center py-3 overflow-y-auto flex-shrink-0 no-scrollbar select-none desktop:fixed desktop:inset-y-0 desktop:left-0 desktop:z-[100] desktop:glass-strip" style={{ paddingBottom: floatingPanelHeight + 24, ...(isElectron() ? { top: 'var(--titlebar-inset)' } : {}) }} onDragOver={(e) => { if (dragState) e.preventDefault(); }} onDrop={handleDrop}>
       <SidebarItem
         id="@me"
-        name="Direct Messages"
-        active={showDms}
+        name={t('spaces:sidebar.directMessages')}
+        // The Backspace page is reached from the DM sidebar, so `@me` stays
+        // lit there; `showDms` alone is only set on the `@me` route.
+        active={showDms || activeHomeNavItem(location.pathname, currentChannelId) === 'backspace'}
         onClick={handleDmClick}
         type="dm"
         hasUnread={hasDmUnread}
@@ -1158,7 +1119,7 @@ export function SpaceSidebar() {
                 {
                   key: 'rename',
                   type: 'action',
-                  label: 'Rename Folder',
+                  label: t('spaces:sidebar.folder.rename'),
                   icon: (
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
                       <path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z" />
@@ -1174,12 +1135,12 @@ export function SpaceSidebar() {
                   type: 'custom',
                   render: () => (
                     <div className="px-3 py-1.5">
-                      <p className="text-[11px] text-txt-tertiary mb-1.5">Folder Color</p>
+                      <p className="text-[11px] text-txt-tertiary mb-1.5">{t('spaces:sidebar.folder.color')}</p>
                       <div className="flex gap-1.5">
                         <button
                           className={`w-5 h-5 rounded-full border-2 ${!folderRef.color ? 'border-white/40' : 'border-transparent'} bg-white/10`}
                           onClick={() => { handleFolderColorChange(folderRef.id, null); useContextMenuStore.getState().close(); }}
-                          title="Default"
+                          title={t('common:states.default')}
                         />
                         {FOLDER_COLORS.map((c) => (
                           <button
@@ -1187,7 +1148,7 @@ export function SpaceSidebar() {
                             className={`w-5 h-5 rounded-full border-2 ${folderRef.color === c.value ? 'border-white/40' : 'border-transparent'}`}
                             style={{ background: c.value }}
                             onClick={() => { handleFolderColorChange(folderRef.id, c.value); useContextMenuStore.getState().close(); }}
-                            title={c.name}
+                            title={t(c.labelKey)}
                           />
                         ))}
                       </div>
@@ -1201,7 +1162,7 @@ export function SpaceSidebar() {
                 {
                   key: 'ungroup',
                   type: 'action',
-                  label: 'Ungroup',
+                  label: t('spaces:sidebar.folder.ungroup'),
                   danger: true,
                   icon: (
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
@@ -1229,7 +1190,7 @@ export function SpaceSidebar() {
 
       <SidebarItem
         id="add-space"
-        name="Add a Space"
+        name={t('spaces:sidebar.addSpace')}
         active={false}
         onClick={() => openModal('createSpace')}
         type="action"
@@ -1238,7 +1199,7 @@ export function SpaceSidebar() {
 
       <SidebarItem
         id="join-space"
-        name="Join a Space"
+        name={t('spaces:sidebar.joinSpace')}
         active={false}
         onClick={() => openModal('joinSpace')}
         type="action"
@@ -1247,7 +1208,7 @@ export function SpaceSidebar() {
 
       <SidebarItem
         id="explore"
-        name="Explore Spaces"
+        name={t('spaces:sidebar.exploreSpaces')}
         active={location.pathname === '/explore'}
         onClick={handleExploreClick}
         type="action"
@@ -1275,17 +1236,17 @@ export function SpaceSidebar() {
               leaveSpace(leaveConfirmSpaceId);
               setLeaveConfirmSpaceId(null);
             }}
-            title={`Leave ${space?.name ?? 'Space'}`}
-            description="Are you sure you want to leave this space? You'll need a new invite to rejoin."
+            title={space ? t('spaces:sidebar.space.leaveConfirm.titleNamed', { name: space.name }) : t('spaces:sidebar.space.leaveConfirm.title')}
+            description={t('spaces:sidebar.space.leaveConfirm.description')}
             variant="danger"
-            confirmLabel="Leave"
+            confirmLabel={t('common:actions.leave')}
           />
         );
       })()}
 
       {openFolderId && (() => {
         const folderItem = resolvedLayout.find(
-          (i): i is ResolvedItem & { type: 'folder' } =>
+          (i): i is ResolvedSpaceLayoutItem & { type: 'folder' } =>
             i.type === 'folder' && i.folder.id === openFolderId
         );
         const anchor = folderAnchorRefs.current.get(openFolderId);

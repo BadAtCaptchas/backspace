@@ -1,4 +1,5 @@
 import '@testing-library/jest-dom/vitest';
+import { initI18n } from '../i18n';
 
 // Node 20+ ships a built-in `localStorage`/`sessionStorage` stub on globalThis
 // that has no methods unless `--localstorage-file=PATH` is provided. Vitest's
@@ -70,6 +71,25 @@ if (typeof ClipboardItem === 'undefined') {
   };
 }
 
+// jsdom's Blob implementation has no `.stream()` method on Node 20 (Node 25+
+// happens to provide one, which is why this only surfaces on the pinned target
+// runtime). undici's `Response` constructor extracts a Blob body by calling
+// `blob.stream()`, so `new Response(blob)` throws "object.stream is not a
+// function" without this. Back it with the blob's own arrayBuffer().
+if (typeof Blob !== 'undefined' && typeof Blob.prototype.stream !== 'function') {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (Blob.prototype as any).stream = function stream(this: Blob): ReadableStream<Uint8Array> {
+    const blob = this;
+    return new ReadableStream<Uint8Array>({
+      async start(controller) {
+        const buffer = await blob.arrayBuffer();
+        controller.enqueue(new Uint8Array(buffer));
+        controller.close();
+      },
+    });
+  };
+}
+
 // Patch globalThis.Response to preserve Blob content-type in jsdom.
 // jsdom's fetch Response.blob() drops the Blob's MIME type; this shim
 // restores it so tests that construct `new Response(blob)` behave correctly.
@@ -93,3 +113,25 @@ const OriginalResponse = globalThis.Response;
     return b;
   }
 };
+
+// jsdom does not implement ResizeObserver. Floating surfaces (tooltips,
+// popovers, the profile card) observe their own box so they can re-place
+// themselves when their content grows. Provide an inert stub — tests drive
+// layout explicitly by stubbing getBoundingClientRect.
+if (!('ResizeObserver' in globalThis)) {
+  class NoopResizeObserver implements ResizeObserver {
+    observe(): void {}
+    unobserve(): void {}
+    disconnect(): void {}
+  }
+  Object.defineProperty(globalThis, 'ResizeObserver', {
+    value: NoopResizeObserver,
+    configurable: true,
+    writable: true,
+  });
+}
+
+// Components read their strings through i18next. Start it in English before
+// any test renders, so `t()` returns real text rather than keys. Tests that
+// exercise another language call `setLanguage` themselves.
+await initI18n({ browserLanguages: ['en'] });

@@ -14,6 +14,7 @@ import {
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
+import { pathToFileURL } from 'url';
 import { startActivityDetection, stopActivityDetection, getCurrentActivity } from './activityDetector';
 import { KeybindManager } from './keybindManager';
 import { deriveStartMinimizedFromArgs, parseExecPathFromDesktopFile, shouldReapplyAppImage } from './autoLaunch';
@@ -23,6 +24,16 @@ import {
   clearInstanceUrl,
   getPickerPath,
 } from './instanceUrl';
+import { getUpdateCapability, isSandboxed } from './updateCapability';
+import { loadDismissedVersion, setDismissedVersion } from './updateDismissal';
+import { purgeUpdaterCache } from './updaterCache';
+import {
+  UpdateStatusStore,
+  RELEASES_URL,
+  shouldPromptForUpdate,
+  statusVersion,
+  type UpdateSnapshot,
+} from './updateStatus';
 import {
   recoveryStore,
   attachRecoveryHandlers,
@@ -38,6 +49,15 @@ import {
   type RecoveryState,
 } from './recovery';
 import { migrateUserData } from './userDataMigration';
+import { isNavigationAllowed } from './navigationPolicy';
+import {
+  screenSharePickerMode,
+  isPendingSelectionFresh,
+  screenEnumerationDecision,
+  type PendingScreenSelection,
+  type ScreenSharePickerMode,
+} from './screenSharePolicy';
+import { getDesktopLanguage, isDesktopLanguage, saveStoredLanguage, translateDesktop } from './l10n';
 
 // Override Electron's package.json-derived app name so userData lives at
 // "<appData>/Backspace" instead of leaking the monorepo's "@backspace/desktop"
@@ -279,9 +299,9 @@ function generateFallbackTrayIcon(): Electron.NativeImage {
       const dist = Math.sqrt((x - cx) ** 2 + (y - cy) ** 2);
       if (dist <= r) {
         // NativeImage raw buffer uses BGRA on most platforms
-        canvas[idx] = 0xf2;     // B (blurple #5865f2)
-        canvas[idx + 1] = 0x65; // G
-        canvas[idx + 2] = 0x58; // R
+        canvas[idx] = 0xf6;     // B (#7c6cf6)
+        canvas[idx + 1] = 0x6c; // G
+        canvas[idx + 2] = 0x7c; // R
         canvas[idx + 3] = 0xff; // A
       } else {
         canvas[idx] = 0;
@@ -381,7 +401,7 @@ function createWindow(): void {
     if (savedUrl) {
       mainWindow.loadURL(savedUrl);
     } else {
-      mainWindow.loadFile(getPickerPath());
+      mainWindow.loadFile(getPickerPath(), { query: { lang: getDesktopLanguage() } });
     }
   }
 
@@ -468,6 +488,24 @@ function createWindow(): void {
     }
     return { action: 'deny' };
   });
+
+  // Deny foreign top-level navigations. See navigationPolicy.ts for the
+  // mechanism note on why this is safe for the initial instance load, the
+  // file:// picker, and cross-instance switching (none of them are
+  // `will-navigate` events). setWindowOpenHandler above is unaffected — this
+  // only covers same-window top-level navigation, not new-window/tab opens.
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    const allowed = isNavigationAllowed({
+      targetUrl: url,
+      currentUrl: mainWindow?.webContents.getURL() ?? null,
+      pickerFileUrl: pathToFileURL(getPickerPath()).href,
+      knownInstanceOrigins,
+    });
+    if (!allowed) {
+      console.warn(`[main] Blocked will-navigate to disallowed target: ${url}`);
+      event.preventDefault();
+    }
+  });
 }
 
 function createTray(): void {
@@ -502,9 +540,73 @@ function showNotification(title: string, body: string, onClick?: () => void): vo
 
 // ─── IPC Handlers ───────────────────────────────────────────────────────────
 
+// ---------------------------------------------------------------------------
+// Screen share sources
+// ---------------------------------------------------------------------------
+
+interface SerializedScreenSource {
+  id: string;
+  name: string;
+  thumbnailDataUrl: string;
+  appIconDataUrl: string | null;
+  isScreen: boolean;
+}
+
+let pendingScreenSelection: PendingScreenSelection | null = null;
+/** Loopback preference for system-picker captures (no preselection carries it there). */
+let lastSystemPickerShareAudio: boolean | null = null;
+/** Last enumeration, so a preselected id resolves to its DesktopCapturerSource without a second scan. */
+let lastScreenSources: Electron.DesktopCapturerSource[] = [];
+/** Last list handed to the renderer, and when: what a throttled or unfocused caller gets back. */
+let lastServedScreenSources: SerializedScreenSource[] = [];
+let lastScreenEnumerationAt: number | null = null;
+
+async function enumerateScreenSources(): Promise<Electron.DesktopCapturerSource[]> {
+  const sources = await desktopCapturer.getSources({
+    types: ['screen', 'window'],
+    thumbnailSize: { width: 320, height: 180 },
+    fetchWindowIcons: true,
+  });
+  lastScreenSources = sources;
+  return sources;
+}
+
+function serializeScreenSources(sources: Electron.DesktopCapturerSource[]): SerializedScreenSource[] {
+  return sources.map((source) => ({
+    id: source.id,
+    name: source.name,
+    thumbnailDataUrl: source.thumbnail.toDataURL(),
+    appIconDataUrl: source.appIcon && !source.appIcon.isEmpty() ? source.appIcon.toDataURL() : null,
+    isScreen: source.id.startsWith('screen:'),
+  }));
+}
+
+function currentPickerMode(): ScreenSharePickerMode {
+  return screenSharePickerMode(process.platform, process.env);
+}
+
+/** One-shot: returns and clears the pending preselection, or null when absent or stale. */
+function takePendingScreenSelection(): PendingScreenSelection | null {
+  const pending = pendingScreenSelection;
+  pendingScreenSelection = null;
+  return isPendingSelectionFresh(pending, Date.now()) ? pending : null;
+}
+
 function registerIpcHandlers(): void {
-  ipcMain.on('show-notification', (_event, data: { title: string; body: string }) => {
-    showNotification(data.title, data.body);
+  ipcMain.on('show-notification', (event, data: { title: string; body: string; options?: { channelId?: string; spaceId?: string; userId?: string } }) => {
+    if (event.sender !== mainWindow?.webContents) return;
+    const sender = event.sender;
+    const origin = new URL(sender.getURL()).origin;
+    showNotification(data.title, data.body, () => {
+      if (!mainWindow || mainWindow.isDestroyed() || sender.isDestroyed()) return;
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.show();
+      mainWindow.focus();
+      // A toast from a previous home instance must not open IDs on the new one.
+      if (sender === mainWindow.webContents && new URL(sender.getURL()).origin === origin && data.options) {
+        sender.send('notification-click', data.options);
+      }
+    });
   });
 
   ipcMain.on('set-badge-count', (_event, count: number) => {
@@ -560,7 +662,7 @@ function registerIpcHandlers(): void {
   ipcMain.handle('clear-instance-url', () => {
     clearInstanceUrl();
     if (mainWindow) {
-      mainWindow.loadFile(getPickerPath());
+      mainWindow.loadFile(getPickerPath(), { query: { lang: getDesktopLanguage() } });
       // Force Electron to re-evaluate drag regions after navigation
       mainWindow.webContents.once('did-finish-load', () => {
         if (mainWindow && !mainWindow.isDestroyed()) {
@@ -574,21 +676,72 @@ function registerIpcHandlers(): void {
 
   // Auto-update IPC
   ipcMain.on('install-update', () => {
+    const store = getUpdateStore();
+    const snapshot = store.get();
+
+    // A build that cannot install in place has no in-place install to run. Send
+    // the user to the download instead of calling a method that returns without
+    // doing anything, which is the defect this whole path exists to remove.
+    if (snapshot.capability === 'external') return;
+    if (snapshot.capability === 'manual') {
+      void shell.openExternal(RELEASES_URL);
+      return;
+    }
+
     try {
       const { autoUpdater } = require('electron-updater');
       autoUpdater.quitAndInstall();
     } catch {
-      // Auto-updater not available
+      store.setStatus({
+        phase: 'failed',
+        version: statusVersion(snapshot.status),
+        message: 'The updater is not available in this build.',
+      });
+      return;
     }
+
+    // If the install started, the app is gone before this fires. If it did not,
+    // the user is still looking at a Restart button that appears to have done
+    // nothing, and now the app says so instead of leaving them guessing.
+    setTimeout(() => {
+      const current = getUpdateStore().get();
+      if (current.status.phase !== 'ready') return;
+      getUpdateStore().setStatus({
+        phase: 'failed',
+        version: statusVersion(current.status),
+        message: 'Restarting to install the update did not start.',
+      });
+    }, INSTALL_WATCHDOG_MS);
   });
 
   ipcMain.on('check-for-updates', () => {
+    if (getUpdateCapability() === 'external') return;
     try {
       const { autoUpdater } = require('electron-updater');
       autoUpdater.checkForUpdates().catch(() => {});
     } catch {
       // Auto-updater not available
     }
+  });
+
+  ipcMain.handle('get-update-status', () => getUpdateStore().get());
+
+  // Sandbox restrictions are independent of update capability. A package may
+  // delegate updates while still supporting host login-item registration.
+  ipcMain.handle('is-sandboxed', () => isSandboxed());
+
+  ipcMain.on('dismiss-update', (_event, payload: { version?: unknown }) => {
+    const version = typeof payload?.version === 'string' ? payload.version.trim() : '';
+    if (version === '') return;
+    setDismissedVersion(version);
+    // Read back rather than assume. If the write failed, the store keeps the old
+    // value and the prompt honestly reappears next launch instead of silently
+    // vanishing from a user who would then never see the update again.
+    getUpdateStore().setDismissedVersion(loadDismissedVersion());
+  });
+
+  ipcMain.on('open-release-page', () => {
+    void shell.openExternal(RELEASES_URL);
   });
 
   ipcMain.handle('get-app-version', () => app.getVersion());
@@ -598,9 +751,52 @@ function registerIpcHandlers(): void {
     // Handled via ipcMain.once in the display media handler — this is just
     // a safety net to prevent unhandled-message warnings
   });
+  // Setup-screen flow: the renderer lists sources up front, and preselects one
+  // right before it calls getDisplayMedia(); the handler answers from that.
+  // Thumbnails of every open window are pixel data, and the renderer runs the
+  // instance's web client — remote code. `screenEnumerationDecision` states the
+  // policy: the app's own window only, focused only, and no faster than the
+  // cache window, so a page polling on a timer cannot quietly photograph
+  // whatever the user switched to.
+  ipcMain.handle('get-screen-sources', async (event): Promise<SerializedScreenSource[]> => {
+    const decision = screenEnumerationDecision({
+      fromMainWindow: event.sender === mainWindow?.webContents,
+      windowFocused: mainWindow?.isFocused() ?? false,
+      lastEnumeratedAt: lastScreenEnumerationAt,
+      now: Date.now(),
+    });
+    if (decision === 'deny') return [];
+    if (decision === 'serve-cache') return lastServedScreenSources;
+    lastServedScreenSources = serializeScreenSources(await enumerateScreenSources());
+    lastScreenEnumerationAt = Date.now();
+    return lastServedScreenSources;
+  });
+  ipcMain.handle('get-screen-share-picker-mode', (event) => {
+    if (event.sender !== mainWindow?.webContents) return 'app';
+    return currentPickerMode();
+  });
+  // handle, not on: the renderer awaits this before calling getDisplayMedia(),
+  // so the selection is guaranteed to be armed when the display-media handler
+  // runs. Fire-and-forget left the two unordered — the handler could win, fall
+  // back to the prompted flow, and leave this armed to hijack the next share.
+  ipcMain.handle('screen-share-preselect', (event, sourceId: string, shareAudio?: boolean) => {
+    if (event.sender !== mainWindow?.webContents) return;
+    if (typeof sourceId !== 'string' || !sourceId) return;
+    pendingScreenSelection = { sourceId, shareAudio: shareAudio === true, at: Date.now() };
+  });
+  // System-picker sessions have no tile to preselect; the renderer only tells
+  // us whether loopback audio should ride along with whatever the portal returns.
+  ipcMain.on('screen-share-audio-preference', (event, shareAudio?: boolean) => {
+    if (event.sender !== mainWindow?.webContents) return;
+    lastSystemPickerShareAudio = shareAudio === true;
+  });
 
   // Auto-launch settings
   ipcMain.handle('get-auto-launch-settings', (): { openAtLogin: boolean; startMinimized: boolean } => {
+    if (isSandboxed()) {
+      return { openAtLogin: false, startMinimized: false };
+    }
+
     if (process.platform === 'win32') {
       // Pass path/args so getLoginItemSettings can find the matching launchItems[] entry.
       // We can't know in advance whether the user's saved choice was minimized or not,
@@ -635,6 +831,10 @@ function registerIpcHandlers(): void {
   });
 
   ipcMain.handle('set-auto-launch-settings', (_event, settings: { openAtLogin?: boolean; startMinimized?: boolean }) => {
+    if (isSandboxed()) {
+      return { openAtLogin: false, startMinimized: false };
+    }
+
     // Read current truth from the OS (not from disk) so a partial update preserves
     // whatever the user (or Task Manager / System Settings) most recently set.
     let currentOpenAtLogin: boolean;
@@ -676,9 +876,15 @@ function registerIpcHandlers(): void {
   });
 
   // Keybinds
-  ipcMain.on('keybinds-sync', (_event, keybinds) => {
+  ipcMain.handle('keybinds-sync', (_event, keybinds) => {
     keybindManager.updateKeybinds(keybinds);
+    return keybindManager.isHookRunning();
   });
+  ipcMain.handle('keybind-portal-status', () => {
+    keybindManager.refreshPortal();
+    return keybindManager.getPortalStatus();
+  });
+  ipcMain.on('keybind-portal-retry', () => keybindManager.retryPortal());
 
   ipcMain.handle('check-accessibility', () => {
     return keybindManager.checkAccessibility();
@@ -702,52 +908,182 @@ function registerIpcHandlers(): void {
 
 // ─── Auto-Update ────────────────────────────────────────────────────────────
 
+/**
+ * How long to wait for `quitAndInstall()` to actually take the app down before
+ * concluding it silently did nothing.
+ *
+ * electron-updater's `quitAndInstall()` can return normally without starting an
+ * install. On macOS this is the documented shape of MacUpdater.quitAndInstall():
+ * when Squirrel never staged the update it registers a listener for an event
+ * that will never fire and returns. No error, no exception, no restart. That is
+ * exactly the dead button this watchdog exists to catch on any platform where
+ * the same thing can happen.
+ */
+const INSTALL_WATCHDOG_MS = 4_000;
+
+let updateStore: UpdateStatusStore | null = null;
+
+/**
+ * The update status store, built on first use.
+ *
+ * Construction needs `app.getPath('userData')` and the signature probe, so it
+ * cannot run at module load. Every caller is post-`whenReady`, and the lazy
+ * getter means the IPC handlers (registered before the updater starts) and the
+ * updater itself share one instance without ordering constraints.
+ */
+function getUpdateStore(): UpdateStatusStore {
+  if (updateStore === null) {
+    updateStore = new UpdateStatusStore(getUpdateCapability(), loadDismissedVersion());
+    updateStore.subscribe((snapshot) => {
+      mainWindow?.webContents.send('update-status-changed', snapshot);
+    });
+  }
+  return updateStore;
+}
+
+/**
+ * Fires the native update notification, if this snapshot warrants one.
+ *
+ * Asks `shouldPromptForUpdate` rather than deciding for itself, so the toast and
+ * the notification cannot disagree about whether the user already said "later".
+ *
+ * The body branches on capability. Telling a macOS user to "click to restart and
+ * install" when the build physically cannot install is the same lie as the dead
+ * Restart button, just delivered by the OS instead of the app.
+ */
+function notifyAboutUpdate(
+  snapshot: UpdateSnapshot,
+  updater: { quitAndInstall: () => void },
+): void {
+  if (!shouldPromptForUpdate(snapshot)) return;
+  // A focused user can see the in-app toast. Notifying as well is noise.
+  if (mainWindow?.isFocused()) return;
+
+  const version = statusVersion(snapshot.status);
+  if (version === null) return;
+
+  if (snapshot.status.phase === 'ready' && snapshot.capability === 'auto') {
+    showNotification(
+      'Backspace update ready',
+      `Click to restart and install version ${version}.`,
+      () => updater.quitAndInstall(),
+    );
+    return;
+  }
+
+  showNotification(
+    `Backspace ${version} is available`,
+    'Click to open the download page.',
+    () => { void shell.openExternal(RELEASES_URL); },
+  );
+}
+
 function initAutoUpdater(): void {
+  const capability = getUpdateCapability();
+  const store = getUpdateStore();
+
+  if (capability === 'external') {
+    recoveryStore.update({ updateState: 'external' });
+    console.log('[update] capability=external (updates are managed by Flatpak)');
+    return;
+  }
+
   try {
     const { autoUpdater } = require('electron-updater');
-    autoUpdater.autoDownload = true;
-    autoUpdater.autoInstallOnAppQuit = true;
+
+    // A build that cannot install its own updates must not download them.
+    //
+    // With autoDownload on, an ad-hoc signed macOS build pulls the full release
+    // archive, hands it to Squirrel.Mac, and Squirrel rejects it because the
+    // running app's designated requirement is a literal cdhash that no other
+    // build can satisfy. The archive then sits on disk forever (228 MB measured
+    // on a real machine, since it is stored twice) and the whole cycle repeats
+    // on the next check. Turning the download off removes the wasted transfer,
+    // the wasted disk, and the spurious install error all at once.
+    autoUpdater.autoDownload = capability === 'auto';
+    autoUpdater.autoInstallOnAppQuit = capability === 'auto';
+
+    if (capability === 'manual') {
+      // Reclaim whatever earlier versions of this app already stranded.
+      purgeUpdaterCache(process.resourcesPath);
+    }
 
     setAutoUpdater(autoUpdater);
 
     let updateConfirmed = false;
+    // The version the current check cycle is about. `download-progress` and the
+    // `error` event carry no version of their own, so it is tracked here.
+    let pendingVersion: string | null = null;
+    // Last percent pushed to the renderer. download-progress fires per chunk;
+    // only whole-percent changes are worth an IPC message.
+    let lastPercent = -1;
 
     autoUpdater.on('checking-for-update', () => {
       recoveryStore.update({ updateState: 'checking', lastCheckResult: null });
+      store.setStatus({ phase: 'checking' });
       updateConfirmed = false;
+      lastPercent = -1;
     });
 
     autoUpdater.on('update-available', (info: { version: string }) => {
-      updateConfirmed = true;
-      recoveryStore.update({ updateState: 'downloading', updateVersion: info.version });
-      mainWindow?.webContents.send('update-available', { version: info.version });
+      const version = info.version.slice(0, 32);
+      pendingVersion = version;
+      // Only an auto-capable build is about to attempt anything, so only there
+      // can a later error be an install failure worth reporting.
+      updateConfirmed = capability === 'auto';
+
+      if (capability === 'auto') {
+        recoveryStore.update({ updateState: 'downloading', updateVersion: version });
+        store.setStatus({ phase: 'downloading', version, percent: 0, bytesPerSecond: 0 });
+      } else {
+        recoveryStore.update({ updateState: 'available-manual', updateVersion: version });
+        store.setStatus({ phase: 'available', version });
+      }
+
+      mainWindow?.webContents.send('update-available', { version });
+
+      // In manual mode this is the end of the line, so this is the moment to
+      // tell the user. In auto mode the notification waits for the download.
+      if (capability === 'manual') {
+        notifyAboutUpdate(store.get(), autoUpdater);
+      }
     });
 
     autoUpdater.on('update-not-available', () => {
       updateConfirmed = false;
+      pendingVersion = null;
       recoveryStore.update({ updateState: 'idle', lastCheckResult: 'up-to-date' });
+      store.setStatus({ phase: 'up-to-date', checkedAt: Date.now() });
       setTimeout(() => {
         if (recoveryStore.get().lastCheckResult === 'up-to-date') {
           recoveryStore.update({ lastCheckResult: null });
         }
+        if (store.get().status.phase === 'up-to-date') {
+          store.setStatus({ phase: 'idle' });
+        }
       }, 5_000);
+    });
+
+    autoUpdater.on('download-progress', (progress: { percent?: number; bytesPerSecond?: number }) => {
+      if (pendingVersion === null) return;
+      const percent = Math.max(0, Math.min(100, Math.round(progress.percent ?? 0)));
+      if (percent === lastPercent) return;
+      lastPercent = percent;
+      store.setStatus({
+        phase: 'downloading',
+        version: pendingVersion,
+        percent,
+        bytesPerSecond: Math.max(0, Math.round(progress.bytesPerSecond ?? 0)),
+      });
     });
 
     autoUpdater.on('update-downloaded', (info: { version: string }) => {
       const version = info.version.slice(0, 32);
+      pendingVersion = version;
       recoveryStore.update({ updateState: 'downloaded', updateVersion: version });
+      store.setStatus({ phase: 'ready', version });
       mainWindow?.webContents.send('update-downloaded', { version });
-
-      // Symmetric focus-based suppression: if the user is looking at the
-      // window, the in-app banner (normal mode) or recovery Restart button
-      // (recovery mode) is visible — no need to also fire a native toast.
-      if (!mainWindow?.isFocused()) {
-        showNotification(
-          'Backspace update ready',
-          `Click to restart and install version ${version}.`,
-          () => autoUpdater.quitAndInstall(),
-        );
-      }
+      notifyAboutUpdate(store.get(), autoUpdater);
     });
 
     autoUpdater.on('error', (err: unknown) => {
@@ -763,14 +1099,21 @@ function initAutoUpdater(): void {
           recoveryStore.update({ lastCheckResult: null });
         }
       }, 5_000);
-      // Existing behavior preserved: only push renderer error IPC after
-      // confirmed update. Check-phase errors stay silent.
+
       if (updateConfirmed) {
-        mainWindow?.webContents.send('update-error', {
-          message,
-          releaseUrl: 'https://github.com/TheZwiss/backspace/releases/latest',
-        });
+        // An update was actually being applied. This is news.
+        store.setStatus({ phase: 'failed', version: pendingVersion, message });
+        mainWindow?.webContents.send('update-error', { message, releaseUrl: RELEASES_URL });
+        notifyAboutUpdate(store.get(), autoUpdater);
+        return;
       }
+
+      // A check-phase failure: nothing was attempted, so there is nothing for
+      // the user to act on. Recorded with no version, which keeps it out of the
+      // toast (see shouldPromptForUpdate) while the settings panel still shows
+      // it. Interrupting someone because a background poll hit a flaky network
+      // is exactly the kind of noise this rewrite is removing.
+      store.setStatus({ phase: 'failed', version: null, message });
     });
 
     // Initial check with 10s delay (existing behavior)
@@ -868,14 +1211,23 @@ if (!gotTheLock) {
   // ─── App Lifecycle ──────────────────────────────────────────────────────────
 
   app.whenReady().then(async () => {
+    // Development runs inside the stock Electron.app bundle, whose Dock icon
+    // macOS caches per bundle, so the copied icns in the dev script does not
+    // show. Set it at runtime; packaged builds carry the icon in their own
+    // bundle and skip this.
+    if (process.platform === 'darwin' && !app.isPackaged && app.dock) {
+      app.dock.setIcon(path.join(__dirname, '..', 'build', 'icon.png'));
+    }
+
     // Win/Linux: frameless window has no menu bar, but we still need an
     // application menu so keyboard accelerators (Ctrl+C/V/X/Z/A) work.
     // The macOS app menu is owned by the recoveryStore subscriber below
-    // (so it can re-render with current update/recovery state).
-    if (process.platform !== 'darwin') {
+    // (so it can re-render with current update/recovery state). Rebuilt on a
+    // language change, hence a function rather than a one-off.
+    const applyEditOnlyMenu = (): void => {
       Menu.setApplicationMenu(Menu.buildFromTemplate([
         {
-          label: 'Edit',
+          label: translateDesktop(getDesktopLanguage(), 'menu.edit'),
           submenu: [
             { role: 'undo' },
             { role: 'redo' },
@@ -887,42 +1239,66 @@ if (!gotTheLock) {
           ],
         },
       ]));
+    };
+    if (process.platform !== 'darwin') {
+      applyEditOnlyMenu();
     }
 
     // Purge ALL stale caches so Electron always loads fresh code on launch
     await session.defaultSession.clearStorageData({ storages: ['serviceworkers'] });
     await session.defaultSession.clearCache();
 
-    // Intercept getDisplayMedia() — show custom picker in renderer.
+    // Intercept getDisplayMedia(). Two ways to answer it:
+    //   1. Preselected (current web client): ScreenShareSetup listed the
+    //      sources via get-screen-sources, the user picked a tile, and the
+    //      renderer awaited screen-share-preselect before calling
+    //      getDisplayMedia(). Answer immediately, no prompt.
+    //   2. Prompted (older web clients, or nothing preselected): push the
+    //      sources to the renderer and wait for screen-share-selected.
     // Audio loopback controlled by user's shareAudio toggle.
     session.defaultSession.setDisplayMediaRequestHandler(async (_request, callback) => {
       console.log('[Main:ScreenShare] Handler invoked');
       try {
-        const sources = await desktopCapturer.getSources({
-          types: ['screen', 'window'],
-          thumbnailSize: { width: 320, height: 180 },
-          fetchWindowIcons: true,
-        });
+        const pending = takePendingScreenSelection();
+        if (pending) {
+          let selected = lastScreenSources.find((s) => s.id === pending.sourceId);
+          if (!selected) selected = (await enumerateScreenSources()).find((s) => s.id === pending.sourceId);
+          if (!selected) {
+            console.warn('[Main:ScreenShare] Preselected source vanished:', pending.sourceId);
+            // @ts-ignore — deny the request without crashing
+            callback();
+            return;
+          }
+          console.log('[Main:ScreenShare] Using preselected source:', pending.sourceId, 'audio:', pending.shareAudio);
+          callback({ video: selected, ...(pending.shareAudio ? { audio: 'loopback' } : {}) });
+          return;
+        }
+
+        const sources = await enumerateScreenSources();
         console.log('[Main:ScreenShare] Got', sources.length, 'sources');
 
         if (sources.length === 0) {
-          console.warn('[Main:ScreenShare] No sources — Screen Recording permission may not be granted');
+          console.warn('[Main:ScreenShare] No sources — Screen Recording permission may not be granted, or the system picker was cancelled');
           // @ts-ignore — Electron throws if we pass {} when video was requested; pass nothing to deny
           callback();
           return;
         }
 
-        const serialized = sources.map((source) => ({
-          id: source.id,
-          name: source.name,
-          thumbnailDataUrl: source.thumbnail.toDataURL(),
-          appIconDataUrl: source.appIcon && !source.appIcon.isEmpty()
-            ? source.appIcon.toDataURL() : null,
-          isScreen: source.id.startsWith('screen:'),
-        }));
+        // System picker (Wayland portal): the user already chose in the
+        // portal dialog and this is the only source it returned. Answer
+        // directly instead of showing a one-tile grid.
+        if (currentPickerMode() === 'system' && sources.length === 1) {
+          // Default off: this branch answers without consulting the renderer, so
+          // a web client too old to send a preference must not have its audio
+          // captured against the setting it thinks is in force.
+          const shareAudio = lastSystemPickerShareAudio ?? false;
+          console.log('[Main:ScreenShare] System picker returned one source:', sources[0]!.id, 'audio:', shareAudio);
+          callback({ video: sources[0]!, ...(shareAudio ? { audio: 'loopback' } : {}) });
+          return;
+        }
 
         // Send sources to renderer, wait for user selection
-        mainWindow?.webContents.send('screen-share-sources', serialized);
+        mainWindow?.webContents.send('screen-share-sources', serializeScreenSources(sources));
 
         const { sourceId, shareAudio } = await new Promise<{ sourceId: string | null; shareAudio: boolean }>((resolve) => {
           ipcMain.once('screen-share-selected', (_event, id: string | null, wantAudio?: boolean) => {
@@ -958,6 +1334,14 @@ if (!gotTheLock) {
         console.error('[Main:ScreenShare] Handler error:', err);
         // @ts-ignore — deny the request without crashing
         callback();
+      } finally {
+        // The caches exist only to serve one setup flow: the NativeImage list to
+        // resolve a preselected id within this request, the serialized one to
+        // answer a repeat call without a second scan. Both pin a thumbnail per
+        // open window, so drop them as soon as the request is answered.
+        lastScreenSources = [];
+        lastServedScreenSources = [];
+        lastScreenEnumerationAt = null;
       }
     });
 
@@ -988,16 +1372,18 @@ if (!gotTheLock) {
       onChangeInstance: () => handleRecoveryAction('change-instance'),
       onCheckForUpdates: () => handleRecoveryAction('check-update'),
       onRestartToInstall: () => handleRecoveryAction('install-update'),
+      onOpenReleases: () => handleRecoveryAction('open-releases'),
       onOpenSource: () => openSourceCode(),
       onQuit: () => requestQuit(),
     };
 
     const applyMenusForState = (state: RecoveryState): void => {
+      const language = getDesktopLanguage();
       if (tray) {
-        tray.setContextMenu(Menu.buildFromTemplate(buildTrayMenuTemplate(state, trayActions)));
+        tray.setContextMenu(Menu.buildFromTemplate(buildTrayMenuTemplate(state, trayActions, language)));
       }
       if (process.platform === 'darwin') {
-        Menu.setApplicationMenu(Menu.buildFromTemplate(buildAppMenuTemplate(app.name, state, trayActions)));
+        Menu.setApplicationMenu(Menu.buildFromTemplate(buildAppMenuTemplate(app.name, state, trayActions, language)));
       }
       // Mode-gated push to renderer (recovery.html subscribes to this).
       if (state.mode === 'recovery' && mainWindow && !mainWindow.isDestroyed()) {
@@ -1007,6 +1393,20 @@ if (!gotTheLock) {
 
     recoveryStore.subscribe(applyMenusForState);
     applyMenusForState(recoveryStore.get());  // initial fire — subscribers don't auto-fire on subscribe
+
+    // The renderer owns the language choice (settings → Language). Remember
+    // it so the tray is right from the first paint next launch, and relabel
+    // everything main draws right now.
+    ipcMain.on('set-language', (_event, language: unknown) => {
+      if (!isDesktopLanguage(language)) return;
+      try {
+        saveStoredLanguage(language);
+      } catch (err) {
+        console.warn('[main] Failed to persist language:', err);
+      }
+      if (process.platform !== 'darwin') applyEditOnlyMenu();
+      applyMenusForState(recoveryStore.get());
+    });
 
     initAutoUpdater();
 
